@@ -11,6 +11,25 @@
 
 零第三方 Python 包（仅标准库 `tomllib` / `sqlite3` / `zoneinfo`）。外部 CLI 均为 Apache-2.0：`agent-browser`（已随 WorkBuddy 安装）、可选 `agent-desktop`。不读取、不解密、不导出任何客户端登录态或令牌。
 
+## Git 管理
+
+代码托管于 `https://github.com/timesky/t-buddy-checkin`（`main` 分支），本机通过 SSH key 读写（`~/.ssh/id_rsa_tangming` 与 `lcc_op_rsa`，均为 `timesky` 身份，已验证可推送）。
+
+- 远程为空仓库，首次推送即创建 `main`：`git push -u origin main`。
+- 受 `.gitignore` 控制的本地产物**不入库**：`config.toml`（含机器路径）、`tools/node_modules/`（agent-desktop 依赖）、`login-qr.png`、`last-checkin-result.json`、`discovered.json`、`progress.txt`、`*.command`、`*.sqlite3`、浏览器登录态。
+- 新克隆后：`cp config.example.toml config.toml` 按需改；`tools/node_modules` 仅在使用 agent-desktop 引擎时需另装（`npm install --prefix tools agent-desktop`），当前默认 cua-driver 不需要。
+
+## 免费模型约束（重要）
+
+本技能**依赖 WorkBuddy**：每日签到在 WorkBuddy 客户端内、成长中心是 WorkBuddy 个人中心。作为 WorkBuddy 技能 / 定时任务运行时，会消耗模型额度，**必须运行在「免费模型」下**。
+
+- 每次执行前（含定时器触发），先在 WorkBuddy 模型选择器选「免费模型」。
+- 命令行以环境变量 `BUDDY_FREE_MODEL=1` 显式确认已选免费模型，否则命令**拒绝执行**（退出码 2）。
+- `./run.sh install-launchd` 生成的 plist 已内置 `BUDDY_FREE_MODEL=1`，定时任务无需额外操作。
+- 查看策略：`run.sh model-check`。
+
+说明：脚本无法读取当前选中的模型，故以运维侧显式确认作为放行闸门，避免误在付费模型下运行。
+
 ## 签到通道（2026-11-09 真实跑通）
 
 系统级 TCC 数据库给出决定性答案：`com.trycua.driver` 是 `auth=2`（已授权），而 `com.apple.Terminal` 和 `com.tencent.workbuddy.mac` 都是 `auth=0`。所以正解是 **CuaDriver**（第一轮就提到的 computer use），不是 agent-desktop。
@@ -105,13 +124,15 @@ cd /Users/hy_002/WorkBuddy/2026-11-08-11-27-37/buddy-web-checkin
 | 事项 | 为什么必须人工 | 具体做法 |
 |---|---|---|
 | 网页端扫码登录一次 | 账号归属 | `./run.sh setup` → 扫 `login-qr.png` |
-| 授予 macOS 辅助功能权限 | 读取无障碍树（实测当前为 `denied`） | `tools/node_modules/.bin/agent-desktop permissions --guide`，把启动它的 Terminal/WorkBuddy 拖入辅助功能列表 |
+| 授予 macOS 辅助功能权限 | 读取无障碍树 | CuaDriver（com.trycua.driver）实测已 `auth=2`，无需再授权；仅当改用 agent-desktop 引擎时才需 `tools/node_modules/.bin/agent-desktop permissions --guide` |
 | 确认签到按钮在 AX 树可见 | Electron/Shadow DOM 未必暴露 | 授权后 `./run.sh probe`，看 `desktop.checkin_ref` 有没有值；没有就走 CDP |
 | （可选）CDP 重启客户端 | 必须带 `--remote-debugging-port` 启动，重启会中断当前对话 | 择时退出后执行 `open -a WorkBuddy --args --remote-debugging-port=9222` |
 
 ### 签到后端（优先级）
 
-1. **agent-desktop**（推荐）：Vercel Labs 1.2.0，读 macOS 无障碍树给控件编号，默认 headless 后台按 ref 触发，不截图、不占鼠标键盘，可 `--app WorkBuddy` 定向只读窗口。**已装在项目本地** `tools/node_modules/.bin/agent-desktop`（Apache-2.0，零系统污染），`config.toml` 的 `desktop.bin` 已指向它。真实 CLI 语法已校准：`snapshot --app <app> -i --compact --force-electron-a11y --session <s>`、全限定 ref `@<snapshot_id>:eN`、`click <ref> --session <s>`（click 没有 `--app`）。仍缺 macOS 辅助功能授权。
+> 实测更新（2026-11-09）：当前可用后端是 **CuaDriver**（`com.trycua.driver`，TCC `auth=2`）；agent-desktop 仅作为 `engine` 回退，且需要额外授权。
+
+1. **CuaDriver**（当前默认）：`config.toml` 设 `desktop.engine = "cua-driver"`，走 `com.trycua.driver` 的 AX 通道，不移动光标、不抢焦点，已验证可完成真实签到。
 2. **CDP**：社区已下架的签到技能就是用 CDP 穿透 Shadow DOM。本项目用 `agent-browser --cdp 9222 eval` 递归遍历 `shadowRoot` 按文字点击。需要客户端带调试端口启动。
 3. **computer-use**：会移动物理鼠标，与「不影响人工操作」冲突，`desktop.allow_focus` 默认 `false`，只有显式改 true 才启用。
 

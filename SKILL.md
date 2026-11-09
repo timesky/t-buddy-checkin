@@ -5,7 +5,9 @@ description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、�
 
 # buddy-web-checkin
 
-这是一个**独立 CLI 技能**，核心运行不依赖 WorkBuddy 的定时任务或技能机制：调度器是自带的标准库 `heapq`，状态在 SQLite，网页端用 `agent-browser` headless 独立会话，桌面端签到用 `agent-desktop` 无障碍树（或 CDP 备选）。
+这是一个**独立 CLI 技能**，核心运行不依赖 WorkBuddy 的定时任务或技能机制：调度器是自带的标准库 `heapq`，状态在 SQLite，网页端用 `agent-browser` headless 独立会话，**桌面端签到用 CuaDriver 无障碍树（AX 通道，已授权；agent-desktop / CDP 为引擎回退）**。
+
+> 本技能**依赖 WorkBuddy**（签到在客户端内、成长中心是 WorkBuddy 个人中心），作为 WorkBuddy 技能 / 定时任务运行会消耗模型额度，**必须运行在「免费模型」下**：执行前先在模型选择器选免费模型，再以 `BUDDY_FREE_MODEL=1` 确认，否则命令拒绝执行（见下方「免费模型约束」）。
 
 ## 用法
 
@@ -21,6 +23,7 @@ description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、�
 | `once` | 立即跑一轮完整闭环 | 否 |
 | `daemon` | 常驻精确调度，Ctrl-C 退出 | 否 |
 | `install-launchd` | 写 LaunchAgent plist（不自动加载） | 加载动作由你确认 |
+| `model-check` | 查看免费模型策略与当前确认状态 | 否 |
 
 ## 成长中心与派遣时长
 
@@ -44,3 +47,16 @@ description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、�
 - 活动入口与字段随版本变化，接口/文字定位失败时如实报告，不盲目重试。
 
 详细架构、人工步骤与故障排查见 `README.md`。需求拆解与验收状态见 `prd.json`。
+
+## 免费模型约束（重要）
+
+本技能依赖 WorkBuddy，作为 WorkBuddy 技能 / 定时任务运行会消耗模型额度，**必须运行在「免费模型」下**：
+
+1. 每次执行前（含定时器触发），先在 WorkBuddy 模型选择器选「免费模型」。
+2. 命令行以环境变量 `BUDDY_FREE_MODEL=1` 显式确认已选免费模型，否则命令拒绝执行（退出码 2）。
+3. `install-launchd` 生成的 plist 已内置 `BUDDY_FREE_MODEL=1`，定时任务无需额外操作。
+4. 查看策略：`run.sh model-check`。
+
+## Git 管理
+
+代码托管于 `https://github.com/timesky/t-buddy-checkin`（`main`）。本机通过 SSH key（`~/.ssh/id_rsa_tangming` / `lcc_op_rsa`，`timesky` 身份）读写。受 `.gitignore` 控制的本地产物（`config.toml`、`tools/node_modules/`、`*.png`、`*.json` 运行时产物、`*.sqlite3` 等）不入库。

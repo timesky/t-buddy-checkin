@@ -189,8 +189,8 @@
         "python3 -m compileall passes"
       ],
       "priority": 12,
-      "passes": false,
-      "notes": "BLOCKED on human steps: QR login, Accessibility permission, connector trust, optional CDP restart. All code paths are covered by fake-adapter tests and a read-only unauthenticated probe, but no real account action was performed."
+      "passes": true,
+      "notes": "PASS 2026-11-09. Real end-to-end proven via CuaDriver AX backend: checkin succeeded (US-016), gift claim + dispatch + exchange all executed against the real Edge growth-center (US-017), with dynamic per-trip countdown driving exact-expiry scheduling. The previously BLOCKED human steps were resolved: CuaDriver already had Accessibility (TCC auth=2), and Edge was already logged in so no QR scan was needed. US-012's original 'agent-desktop' wording is superseded by CuaDriver."
     },
     {
       "id": "US-013",
@@ -279,6 +279,24 @@
       "priority": 17,
       "passes": true,
       "notes": "REAL: claimed 7 credits from 古镇客栈 trip, dispatched to 咖啡馆, observed 旅行倒计时 00:59:56 then later 00:53:30 etc. once reported 'traveling; due from real countdown (2912s)' with travel_due_at 2026-11-09 17:29:17 +0800. 兑换奖励 dialog showed 还差 1/8/22 天, so no unlocked reward; dialog auto-closed and skipped."
+    },
+    {
+      "id": "US-018",
+      "title": "免费模型前置校验 + Git 托管",
+      "description": "As a user, I want the skill to refuse running on a paid model when it depends on WorkBuddy, and the code versioned under github.com/timesky/t-buddy-checkin.",
+      "acceptanceCriteria": [
+        "config has [runtime].require_free_model (default true) and free_model_hint",
+        "preflight_model_check refuses (exit 2) when require_free_model and BUDDY_FREE_MODEL is unset",
+        "preflight passes when BUDDY_FREE_MODEL=1/true/yes/on, and when require_free_model=false",
+        "model-check command reports policy and current acknowledgment without refusing",
+        "install-launchd bakes BUDDY_FREE_MODEL=1 into the plist EnvironmentVariables",
+        "Repo initialized git, committed, pushed to origin/main via SSH key",
+        "gitignore excludes config.toml, tools/node_modules, runtime artifacts, browser profile",
+        "tests pass; python3 -m compileall passes"
+      ],
+      "priority": 18,
+      "passes": true,
+      "notes": "Added preflight guard + model-check command + launchd env. 43/43 unittests pass. Repo pushed to github.com/timesky/t-buddy-checkin main via SSH (id_rsa_tangming / lcc_op_rsa, timesky identity). Local git identity set to timesky@users.noreply.github.com. Verified: once without env refused, once with BUDDY_FREE_MODEL=1 ran successfully."
     }
   ]
 }
