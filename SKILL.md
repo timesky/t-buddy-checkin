@@ -9,12 +9,25 @@ description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、�
 
 > 本技能**依赖 WorkBuddy**（签到在客户端内、成长中心是 WorkBuddy 个人中心），作为 WorkBuddy 技能 / 定时任务运行会消耗模型额度，**必须运行在「免费模型」下**：执行前先在模型选择器选免费模型，再以 `BUDDY_FREE_MODEL=1` 确认，否则命令拒绝执行（见下方「免费模型约束」）。
 
+## 安装第三方依赖（安装 / 重新拉取技能时必跑）
+
+本技能除 Python 标准库外，依赖若干**外部 CLI / GUI 应用**（agent-browser、CuaDriver、Microsoft Edge、可选 agent-desktop），它们**不会**随技能仓库自动装好，且 mock 单测测不到、只在真实执行才暴露缺失。**安装（或 `git pull` 重新拉取）本技能后，agent 必须先执行以下两步再首次使用**：
+
+```bash
+./run.sh deps install   # 装经 npm 管理的依赖；GUI 依赖（CuaDriver / Edge）给出手动安装与授权指引
+./run.sh deps check     # 逐项检查，所有必需依赖 OK 才放行；缺失则退出码非 0，必须先补齐
+```
+
+`deps check` 会据 `config.toml` 各通道开关动态判定「必需 / 可选」：growth 通道开启或桌面端用 cua-driver 引擎时，**CuaDriver + Microsoft Edge 为必需**；网页端 headless 驱动 **agent-browser 始终必需**；agent-desktop 仅在使用 agent-desktop 引擎时必需（默认 cua-driver 下为可选回退）。GUI 依赖缺失时，`deps install` 只打印指引，需人工安装并在「系统设置 → 隐私与安全性 → 辅助功能」为 CuaDriver 授权。
+
 ## 用法
 
 所有命令从项目根目录执行 `./run.sh <command>`：
 
 | 命令 | 作用 | 是否需要人工 |
 |---|---|---|
+| `deps install` | 安装经 npm 管理的依赖；GUI 依赖给出手动安装指引 | GUI 依赖需人工安装+授权 |
+| `deps check` | 逐项检查第三方依赖是否就绪（安装技能后必跑） | 否 |
 | `probe` | 只读探测网页端入口与桌面端可用后端，写 `discovered.json` | 否 |
 | `setup` | headless 打开登录页，二维码截图存 `login-qr.png` | 手机扫码一次 |
 | `setup-from-edge` | 只读复制 Edge 已登录 profile 到独立副本，用 Edge 可执行文件验证 | 否（但需在非沙箱终端运行） |

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..config import SENSITIVE_KEYS, profile_path
+from ..deps import resolve_bin
 from .base import ActionResult, WebAdapter
 
 
@@ -28,7 +29,8 @@ def scrub_text(text: str) -> str:
 class AgentBrowser(WebAdapter):
     def __init__(self, cfg: dict, runner: Callable[..., Any] | None = None) -> None:
         web = cfg["web"]
-        self.bin = web["bin"]
+        # 优先 PATH，其次项目本地 tools/node_modules/.bin（自包含、零系统污染）
+        self.bin = str(resolve_bin(web["bin"]) or web["bin"])
         self.session = web["session"]
         self.profile = str(profile_path(cfg))
         self.executable_path = str(web.get("executable_path", "") or "")

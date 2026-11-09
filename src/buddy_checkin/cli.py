@@ -18,6 +18,7 @@ from .actions import Actions
 from .adapters.desktop import CuaDriverSigner, DesktopSigner
 from .adapters.growth import GrowthCenter
 from .adapters.web import AgentBrowser
+from .deps import cmd_deps
 from .scheduler import Scheduler
 from .state import State
 from .timeutil import format_ts, next_daily_at
@@ -303,6 +304,12 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("daemon", help="run the exact-expiry scheduler")
     sub.add_parser("install-launchd", help="write LaunchAgent plist (does not load it)")
     sub.add_parser("model-check", help="show free-model policy and current acknowledgment state")
+    # 第三方依赖：安装技能时必须先 install 再 check，确认外部 CLI/GUI 就绪
+    dep = sub.add_parser("deps", help="第三方依赖检查/安装引导（安装技能时必跑）")
+    dep_sub = dep.add_subparsers(dest="action", required=True)
+    dep_sub.add_parser("check", help="检查所有第三方依赖是否就绪（默认）")
+    dep_sub.add_parser("install", help="安装可经 npm 管理的依赖，并给出 GUI 依赖手动指引")
+    dep_sub.add_parser("list", help="仅列出依赖与路径")
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO,
@@ -310,8 +317,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     cfg = config.load(args.config)
     logging.getLogger().setLevel(getattr(logging, cfg.get("log_level", "INFO"), logging.INFO))
-    # 依赖 WorkBuddy：执行前必须确认运行在免费模型下（model-check 本身用于查看策略，放行）
-    if args.command != "model-check":
+    # 依赖 WorkBuddy：执行前必须确认运行在免费模型下（model-check / deps 属本地运维，
+    # 不消耗模型额度，放行）
+    if args.command not in ("model-check", "deps"):
         rc = preflight_model_check(cfg)
         if rc:
             return rc
@@ -325,6 +333,7 @@ def main(argv: list[str] | None = None) -> int:
         "daemon": cmd_daemon,
         "install-launchd": cmd_install_launchd,
         "model-check": cmd_model_check,
+        "deps": cmd_deps,
     }
     return handlers[args.command](cfg, args)
 

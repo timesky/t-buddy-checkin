@@ -9,7 +9,7 @@
 
 独立的每日签到 / 礼物兑换 / 派遣自动化技能。**只有每日签到依赖 WorkBuddy 桌面客户端**，其余全部在网页端完成；两条通道都在后台隔离执行，**不弹窗、不激活窗口、不抢鼠标键盘、不碰你正在用的浏览器**。
 
-零第三方 Python 包（仅标准库 `tomllib` / `sqlite3` / `zoneinfo`）。外部 CLI 均为 Apache-2.0：`agent-browser`（已随 WorkBuddy 安装）、可选 `agent-desktop`。不读取、不解密、不导出任何客户端登录态或令牌。
+零第三方 Python 包（仅标准库 `tomllib` / `sqlite3` / `zoneinfo`）。外部 CLI 依赖：`agent-browser`（网页端 headless 驱动，已随 WorkBuddy 安装或在 `tools/` 本地安装）、可选 `agent-desktop`（桌面端回退引擎，Apache-2.0）；GUI 应用依赖：**CuaDriver**（成长中心 + 桌面签到 AX 通道，已授权 `com.trycua.driver`）与 **Microsoft Edge**（成长中心已登录窗口来源）。不读取、不解密、不导出任何客户端登录态或令牌。安装与核查见下方「第三方依赖安装」一节。
 
 ## Git 管理
 
@@ -29,6 +29,31 @@
 - 查看策略：`run.sh model-check`。
 
 说明：脚本无法读取当前选中的模型，故以运维侧显式确认作为放行闸门，避免误在付费模型下运行。
+
+## 第三方依赖安装（安装技能时必跑）
+
+本技能除 Python 标准库外，依赖若干**外部 CLI / GUI 应用**。它们**不会**随技能仓库自动装好，
+且 mock 单测测不到、只在真实执行才暴露缺失。因此 **安装（或重新拉取）本技能后，agent 必须先跑
+下面两步**，确认第三方依赖已安装并在 PATH / 指定路径可用，再首次运行 `once` / `daemon`：
+
+```bash
+./run.sh deps install   # 装经 npm 管理的依赖；GUI 依赖给出手动安装指引
+./run.sh deps check     # 逐项检查，全部 OK 才放行；缺失则返回非 0 退出码
+```
+
+`deps check` 的依赖矩阵（2026-11-09 按实际调用核对）：
+
+| 依赖 | 类型 | 必需 | 用途 | 安装方式 |
+|---|---|---|---|---|
+| Python ≥ 3.11（推荐 3.13） | 运行时 | ✅ | 标准库 tomllib/sqlite3/zoneinfo | 系统自带 / python.org |
+| agent-browser | npm-cli | ✅ | 网页端 headless 会话（web 通道） | `cd tools && npm install`，或 `npm install -g agent-browser` |
+| CuaDriver | GUI 应用 | ✅（growth 或 cua-driver 引擎时） | 成长中心 + 桌面签到 AX 通道 | 安装 CuaDriver.app，并在系统设置→隐私与安全性→辅助功能 授权其驱动 |
+| Microsoft Edge | GUI 应用 | ✅（growth 通道时） | 成长中心 AX 窗口来源（已登录个人中心） | 下载安装 Edge |
+| agent-desktop | npm-cli | 仅 agent-desktop 引擎时 | 桌面端回退引擎 | `cd tools && npm install` |
+
+> 说明：CuaDriver / Microsoft Edge 是 GUI 应用，`deps install` 只打印手动安装与授权指引，不会
+> 自动下载；agent-desktop 在默认 cua-driver 引擎下非必需（回退用）。`deps check` 会区分
+> `required`（缺失即报错）与 `optional`（缺失仅警告），并据 `config.toml` 里各通道开关动态判定。
 
 ## 签到通道（2026-11-09 真实跑通）
 
@@ -93,6 +118,9 @@
 cd /path/to/buddy-web-checkin
 cp config.example.toml config.toml      # 按需修改
 chmod +x run.sh
+
+./run.sh deps install  # 安装第三方依赖（agent-browser / agent-desktop 经 npm，GUI 给指引）
+./run.sh deps check    # 必跑：确认所有必需依赖已就绪，否则后续命令会在真实环境才暴露缺失
 
 ./run.sh probe        # 只读探测：网页端入口 + 桌面端可用后端，写 discovered.json
 ./run.sh setup        # headless 打开登录页，把二维码截图存到 login-qr.png，手机扫码
