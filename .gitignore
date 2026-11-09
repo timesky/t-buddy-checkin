@@ -1,0 +1,26 @@
+# ---- 运行时产物（含机器相关路径，不可提交） ----
+config.toml
+login-qr.png
+last-checkin-result.json
+discovered.json
+progress.txt
+*.command
+*.sqlite3
+*.db
+
+# ---- 依赖（agent-desktop 本地安装，30M+） ----
+tools/node_modules/
+tools/package-lock.json
+tools/agent-desktop/
+
+# ---- Python ----
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ---- 浏览器登录态 ----
+browser-profile/
+*.browser-profile/
+
+# ---- 编辑器 ----
+.DS_Store

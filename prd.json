@@ -1,0 +1,284 @@
+{
+  "project": "buddy-web-checkin",
+  "branchName": "ralph/buddy-web-checkin",
+  "description": "独立签到/派遣自动化技能：仅每日签到依赖 WorkBuddy 桌面客户端，其余走网页端；网页端操作与桌面端操作均在后台隔离执行，不干扰人工操作；按派遣到期时间精确领礼物并再次派遣。",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "重写配置层为零依赖 TOML 双通道配置",
+      "description": "As a developer, I want a dependency-free config layer so that the tool runs on stock Python with no pip installs.",
+      "acceptanceCriteria": [
+        "config.py uses tomllib only and has no yaml import",
+        "config.example.toml documents web/desktop/scheduler/gifts sections",
+        "load() deep-merges user config over DEFAULTS and expands ~ paths",
+        "scrub() redacts token/secret/cookie/authorization keys recursively",
+        "python3 -m compileall passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "实现北京时间口径的时间与到期解析工具",
+      "description": "As a developer, I want deterministic time parsing so that dispatch expiry is scheduled precisely.",
+      "acceptanceCriteria": [
+        "parse_timestamp handles epoch seconds, epoch milliseconds, ISO with Z, and naive strings interpreted as Asia/Shanghai",
+        "parse_countdown handles numeric seconds and HH:MM:SS strings",
+        "find_field recursively locates end/remaining fields in nested JSON",
+        "travel_due returns an absolute epoch from end field, else from countdown plus server_now",
+        "next_daily_at returns the next Beijing-time HH:MM occurrence",
+        "skew_from_http_date computes server minus local clock offset",
+        "Tests pass",
+        "python3 -m compileall passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "实现 SQLite 状态层与幂等领取记录",
+      "description": "As a developer, I want persistent idempotent state so that restarts never double-claim a reward.",
+      "acceptanceCriteria": [
+        "State creates kv, claims and runs tables on first use",
+        "claim_once returns True only for the first call with the same day/kind/item triple",
+        "kv_get/kv_set round-trips floats and strings",
+        "day_key uses Beijing calendar date",
+        "Tests pass",
+        "python3 -m compileall passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-004",
+      "title": "实现精确到期的堆调度器与启动补偿",
+      "description": "As a user, I want the tool to wake exactly when a trip ends so that no travel reward is left unclaimed.",
+      "acceptanceCriteria": [
+        "initial_jobs includes a daily job and a travel job",
+        "An overdue travel due is clamped to now so missed rewards are caught up on startup",
+        "Executing a job returns its next scheduled Job",
+        "run_forever respects injected now/sleep and stops on a stop event",
+        "Tests pass",
+        "python3 -m compileall passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "实现网页端 agent-browser 隔离适配器",
+      "description": "As a user, I want web automation in an isolated headless session so that my normal browser is untouched.",
+      "acceptanceCriteria": [
+        "Every command includes --session and --profile and never --headed by default",
+        "Adapter exposes snapshot, eval_js, click_text, get_text and close",
+        "Command construction is testable with an injected runner, no browser started",
+        "A credentials scrubber is applied to captured output",
+        "Tests pass",
+        "python3 -m compileall passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-006",
+      "title": "实现桌面端签到适配器（agent-desktop / CDP / 兜底）",
+      "description": "As a user, I want daily checkin to use a background accessibility-tree backend with a CDP fallback.",
+      "acceptanceCriteria": [
+        "probe() is read-only and reports which backend is available",
+        "agent-desktop backend targets only the WorkBuddy app window",
+        "CDP backend uses eval to pierce shadow roots",
+        "No backend moves the mouse or activates a window unless explicitly allowed",
+        "Tests pass",
+        "python3 -m compileall passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-007",
+      "title": "实现业务编排：签到、礼物兑换、派遣、到期领奖、再派遣",
+      "description": "As a user, I want one reconcile pass to close the full loop idempotently.",
+      "acceptanceCriteria": [
+        "daily_checkin skips when already claimed today",
+        "claim_gifts filters allow/deny keywords and never claims the same item twice per day",
+        "travel_tick dispatches when idle, records due when traveling, claims and re-dispatches when due",
+        "reconcile_all returns a structured summary",
+        "Full loop passes with fake adapters",
+        "Tests pass",
+        "python3 -m compileall passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-008",
+      "title": "实现 CLI 与 macOS launchd 托管",
+      "description": "As a user, I want explicit commands and an optional LaunchAgent so the loop runs unattended.",
+      "acceptanceCriteria": [
+        "CLI exposes probe, setup, once, status, daemon, install-launchd",
+        "status is read-only and prints next due times",
+        "launchd plist template uses absolute paths and KeepAlive",
+        "install-launchd writes the plist but does not load it without user action",
+        "python3 -m compileall passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-009",
+      "title": "网页端只读探测（headless 独立会话）",
+      "description": "As a developer, I want a no-login read-only probe to record the real page shape before writing selectors.",
+      "acceptanceCriteria": [
+        "Probe runs headless in an isolated session and does not touch the default browser profile",
+        "Output is written to discovered.json with credentials scrubbed",
+        "Browser sessions started by the probe are closed afterwards",
+        "python3 -m compileall passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-010",
+      "title": "补齐文档、SKILL.md 与人工步骤清单",
+      "description": "As a user, I want to know exactly which steps need my hands (scan login, permissions, trust).",
+      "acceptanceCriteria": [
+        "README documents the two-lane architecture, exact-expiry logic and boundaries",
+        "SKILL.md exists with trigger phrases",
+        "Manual steps list QR login, accessibility permission, connector trust and optional CDP restart",
+        "License note states zero third-party dependencies and Apache-2.0 external CLIs",
+        "python3 -m compileall passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-011",
+      "title": "全量校验与进程巡检",
+      "description": "As a developer, I want a green final check and no leftover background processes.",
+      "acceptanceCriteria": [
+        "python3 -m compileall passes for all source files",
+        "Full unittest suite passes",
+        "pgrep shows no leftover browser/daemon processes started by this task",
+        "prd.json stories that are fully verified are marked passes true",
+        "python3 -m compileall passes"
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": "compileall OK; 24/24 tests OK; pgrep showed no leftover browser/daemon processes"
+    },
+    {
+      "id": "US-012",
+      "title": "真实账号端到端验证（等待人工授权）",
+      "description": "As a user, I want the loop proven against my real account before enabling the daemon unattended.",
+      "acceptanceCriteria": [
+        "setup completes QR login and the isolated profile keeps the session",
+        "agent-desktop is installed, granted Accessibility permission and trusted as a connector",
+        "desktop.probe shows the checkin button ref, or CDP is enabled after a planned client restart",
+        "once reports a real checkin and a real gift claim",
+        "A travel cycle is observed: dispatch, exact-expiry claim, re-dispatch",
+        "python3 -m compileall passes"
+      ],
+      "priority": 12,
+      "passes": false,
+      "notes": "BLOCKED on human steps: QR login, Accessibility permission, connector trust, optional CDP restart. All code paths are covered by fake-adapter tests and a read-only unauthenticated probe, but no real account action was performed."
+    },
+    {
+      "id": "US-013",
+      "title": "真实环境执行与按真实 CLI 校准",
+      "description": "As a user, I want the tool proven against the real page and real CLI instead of only fake-adapter mocks.",
+      "acceptanceCriteria": [
+        "once is executed against the real unauthenticated page and reports login_required",
+        "setup produces a scannable QR image instead of a loading skeleton",
+        "agent-desktop 1.2.0 is installed locally and permissions are reported read-only",
+        "desktop adapter matches real snapshot/click JSON envelope and qualified ref syntax",
+        "run.sh loads config.toml from the project root regardless of caller cwd",
+        "probe waits for redirect before reporting the URL",
+        "28 unittests pass including regressions for all six real bugs",
+        "python3 -m compileall passes"
+      ],
+      "priority": 13,
+      "passes": true,
+      "notes": "Six real bugs found and fixed by executing rather than mocking. agent-desktop installed to tools/ (v1.2.0, Apache-2.0). Accessibility remains denied, so no real desktop action was possible. QR generated and handed to the user for scanning."
+    },
+    {
+      "id": "US-014",
+      "title": "支持复用 Edge 已登录状态（免扫码）",
+      "description": "As a user, I want to reuse my existing Edge login instead of scanning a QR code.",
+      "acceptanceCriteria": [
+        "setup-from-edge copies the Edge profile read-only into the isolated profile",
+        "web adapter supports --executable-path and cold_restart of the singleton daemon",
+        "config.toml points executable_path at the Edge binary",
+        "Command runs end to end and reports a precise diagnosis on failure",
+        "30 unittests pass including copy_edge_profile and executable-path construction",
+        "python3 -m compileall passes"
+      ],
+      "priority": 14,
+      "passes": true,
+      "notes": "Code path verified in sandbox; real login reuse is BLOCKED here by Keychain access (security -w SIGTERM), so httpOnly v10 cookies are dropped and the URL lands on /login. User must run ./run.sh setup-from-edge in a normal macOS Terminal. Source Edge profile confirmed untouched (10 auth cookies intact)."
+    },
+    {
+      "id": "US-015",
+      "title": "提供单命令只签到，优先保住当天不断签",
+      "description": "As a user, I want to complete today's checkin immediately without running the whole web loop.",
+      "acceptanceCriteria": [
+        "checkin-now runs only the desktop lane and never touches the web adapter",
+        "Command is registered in CLI help",
+        "Real run reports the exact blocker instead of a vague failure",
+        "30 unittests pass",
+        "python3 -m compileall passes"
+      ],
+      "priority": 15,
+      "passes": true,
+      "notes": "Real run: PERM_DENIED Accessibility permission not granted (backend=agent-desktop). Code path correct; blocked by macOS TCC. Manual or normal-Terminal execution is required today."
+    },
+    {
+      "id": "US-016",
+      "title": "改用已授权的 CuaDriver AX 通道完成真实签到",
+      "description": "As a user, I want the daily checkin to actually succeed using a backend that already has Accessibility permission.",
+      "acceptanceCriteria": [
+        "TCC investigation identifies com.trycua.driver as auth=2 while Terminal/WorkBuddy are auth=0",
+        "CuaDriverSigner locates the WorkBuddy main window and the AXButton 立即领取",
+        "Click uses element_index AX path with no cursor move or focus steal",
+        "Post-click snapshot verifies the checkin card and button disappeared",
+        "Button absence is treated as already checked in and is idempotent",
+        "Real checkin-now returns ok=true and persists last_checkin_day",
+        "32 unittests pass",
+        "python3 -m compileall passes"
+      ],
+      "priority": 16,
+      "passes": true,
+      "notes": "REAL CHECKIN SUCCEEDED 2026-11-09. window_id=66 pid=452 element_index=65. After the AX click the Buddy加油站 card and 立即领取 button vanished from the AX tree; checkin-now then returned ok=true/already=true and state shows last_checkin_day=2026-11-09."
+    },
+    {
+      "id": "US-017",
+      "title": "领礼物、派遣、签到兑换，并按每次真实派遣时长动态调度",
+      "description": "As a user, I want gifts claimed, Buddy dispatched and rewards exchanged, with the next check scheduled from the real per-trip duration.",
+      "acceptanceCriteria": [
+        "GrowthCenter reads the logged-in Edge growth-center AX tree via CuaDriver",
+        "idle/traveling/claimable/gift_dialog/scene_dialog states are parsed from real buttons",
+        "Claim flow opens the return dialog, clicks 领取 N 积分 and verifies 已领取",
+        "Dispatch flow clicks 派猫猫旅行 then 确定派出 and re-reads the countdown",
+        "due_at is computed from the real HH:MM:SS countdown, not a fixed interval",
+        "Each new dispatch produces a new due based on that trip's own duration",
+        "Exchange scan is conservative: only unlocked milestones, N>0 lottery, full-energy blindbox",
+        "Makeup cards and date buttons are never auto-consumed; exchanges are idempotent per Beijing day",
+        "Real once returns ok=true with gift/exchange/travel all handled",
+        "39 unittests pass",
+        "python3 -m compileall passes"
+      ],
+      "priority": 17,
+      "passes": true,
+      "notes": "REAL: claimed 7 credits from 古镇客栈 trip, dispatched to 咖啡馆, observed 旅行倒计时 00:59:56 then later 00:53:30 etc. once reported 'traveling; due from real countdown (2912s)' with travel_due_at 2026-11-09 17:29:17 +0800. 兑换奖励 dialog showed 还差 1/8/22 天, so no unlocked reward; dialog auto-closed and skipped."
+    }
+  ]
+}

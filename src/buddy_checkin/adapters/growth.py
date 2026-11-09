@@ -1,0 +1,357 @@
+"""成长中心适配器：用 CuaDriver 的 AX 通道操作已登录的 Edge「个人中心」。
+
+真实页面 https://www.workbuddy.cn/profile/growth-center 的 AX 状态（2026-11-09 实测）：
+
+  idle      : AXButton "派猫猫旅行"
+  traveling : AXButton "旅行倒计时 00:59:56" + "Buddy 正在咖啡馆采风中..."
+  claimable : AXButton "领取礼物" -> 弹窗 -> AXButton "领取 7 积分" -> "已领取"
+
+派遣前只提示「预计出行时间为1～4小时」，**实际时长每次不同**，必须派遣后
+从倒计时文本读取真实剩余秒数，再换算成北京时间的绝对到期时间戳。
+"""
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+from .base import ActionResult
+
+CUA_DRIVER_BIN = "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
+
+# "旅行倒计时 00:59:56" / "00:59:57"
+_COUNTDOWN = re.compile(r"(\d{1,2}):([0-5]\d):([0-5]\d)")
+
+
+def parse_hms(text: str) -> int | None:
+    """从任意文本里抽 HH:MM:SS 并返回总秒数。"""
+    m = _COUNTDOWN.search(text or "")
+    if not m:
+        return None
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+
+
+class GrowthCenter:
+    def __init__(self, cfg: dict, runner: Callable[..., Any] | None = None) -> None:
+        growth = cfg.get("growth", {})
+        self.bin = growth.get("cua_driver_bin") or CUA_DRIVER_BIN
+        self.browser_app = growth.get("browser_app", "Microsoft Edge")
+        self.title_hint = growth.get("title_hint", "个人中心")
+        self.claim_offset_sec = float(growth.get("claim_offset_sec", 3))
+        self.scene = growth.get("scene", "")  # 留空 = 用页面默认场景
+        self.runner = runner or subprocess.run
+        self.commands: list[list[str]] = []
+
+    # ---- CuaDriver 调用 -----------------------------------------------------
+    def _call(self, tool: str, payload: dict) -> dict:
+        cmd = [self.bin, "call", tool, json.dumps(payload, ensure_ascii=False)]
+        self.commands.append(cmd)
+        try:
+            proc = self.runner(cmd, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"error": str(exc)}
+        raw = getattr(proc, "stdout", "") or ""
+        i = raw.find("{")
+        if i < 0:
+            return {"error": (raw or getattr(proc, "stderr", "") or "empty output")[:200]}
+        try:
+            return json.loads(raw[i:])
+        except ValueError:
+            return {"error": "invalid JSON from cua-driver"}
+
+    def _window(self) -> tuple[int, int] | None:
+        """找已登录的成长中心浏览器窗口，返回 (pid, window_id)。"""
+        data = self._call("list_windows", {})
+        wins = [
+            w for w in data.get("windows", [])
+            if w.get("app_name") == self.browser_app
+            and self.title_hint in str(w.get("title") or "")
+            and (w.get("bounds") or {}).get("width", 0) > 400
+        ]
+        if not wins:
+            # 标题可能滞后，退而求其次取该浏览器最大的可见窗口
+            wins = [
+                w for w in data.get("windows", [])
+                if w.get("app_name") == self.browser_app
+                and (w.get("bounds") or {}).get("width", 0) > 400
+            ]
+        if not wins:
+            return None
+        w = max(wins, key=lambda x: x["bounds"]["width"] * x["bounds"]["height"])
+        return int(w["pid"]), int(w["window_id"])
+
+    def snapshot(self, pid: int | None = None, wid: int | None = None) -> dict:
+        if pid is None or wid is None:
+            win = self._window()
+            if not win:
+                return {"error": "growth-center window not found"}
+            pid, wid = win
+        return self._call("get_window_state", {
+            "pid": pid, "window_id": wid,
+            "include_screenshot": False, "max_elements": 3000,
+        })
+
+    def _click(self, snap: dict, predicate, pid: int, wid: int) -> tuple[bool, str]:
+        for el in snap.get("elements", []):
+            if el.get("role") != "AXButton":
+                continue
+            label = str(el.get("label") or "")
+            if predicate(label):
+                idx = el.get("element_index")
+                if idx is None:
+                    continue
+                out = self._call("click", {"pid": pid, "window_id": wid, "element_index": idx})
+                if "error" in out:
+                    return False, out["error"]
+                return True, label
+        return False, "button not found"
+
+    # ---- 状态解析 -----------------------------------------------------------
+    @staticmethod
+    def read_state(snap: dict) -> dict[str, Any]:
+        """从 AX 快照读真实旅行状态与剩余秒数。"""
+        labels: list[str] = []
+        for el in snap.get("elements", []):
+            lab = str(el.get("label") or "")
+            if lab and lab != "None":
+                labels.append(lab)
+        joined = " | ".join(labels[:250])
+        state = "unknown"
+        remaining = None
+        if "旅行倒计时" in joined:
+            state = "traveling"
+            for lab in labels:
+                if "旅行倒计时" in lab:
+                    remaining = parse_hms(lab)
+                    if remaining is not None:
+                        break
+            if remaining is None:
+                remaining = parse_hms(joined)
+        elif any("领取" in lab and "积分" in lab for lab in labels):
+            state = "gift_dialog"
+        elif any(lab.strip() == "领取礼物" for lab in labels):
+            state = "claimable"
+        elif any("确定派出" in lab for lab in labels):
+            state = "scene_dialog"
+        elif any("派猫猫旅行" in lab for lab in labels):
+            state = "idle"
+        return {"state": state, "remaining_sec": remaining, "raw": joined[:1500]}
+
+    # ---- 动作 ---------------------------------------------------------------
+    def claim_gift(self) -> ActionResult:
+        win = self._window()
+        if not win:
+            return ActionResult(False, "gift", "growth-center window not found")
+        pid, wid = win
+        snap = self.snapshot(pid, wid)
+        st = self.read_state(snap)["state"]
+
+        # 弹窗已经打开：直接点「领取 N 积分」
+        if st == "gift_dialog":
+            ok, label = self._click(snap, lambda s: "领取" in s and "积分" in s and "已领取" not in s, pid, wid)
+            if not ok:
+                return ActionResult(False, "gift", label)
+            after = self.snapshot(pid, wid)
+            confirmed = "已领取" in self.read_state(after)["raw"]
+            return ActionResult(confirmed, "gift", f"claimed {label}", {"confirmed": confirmed})
+
+        if st != "claimable":
+            return ActionResult(True, "gift", f"nothing claimable (state={st})", {"state": st})
+
+        ok, label = self._click(snap, lambda s: s.strip() == "领取礼物", pid, wid)
+        if not ok:
+            return ActionResult(False, "gift", label)
+        dialog = self.snapshot(pid, wid)
+        ok2, label2 = self._click(dialog, lambda s: "领取" in s and "积分" in s and "已领取" not in s, pid, wid)
+        if not ok2:
+            return ActionResult(False, "gift", f"gift dialog: {label2}")
+        after = self.snapshot(pid, wid)
+        confirmed = "已领取" in self.read_state(after)["raw"]
+        return ActionResult(confirmed, "gift", f"claimed {label2}", {"confirmed": confirmed, "label": label2})
+
+    @staticmethod
+    def scan_exchanges(snap: dict) -> list[tuple[str, str]]:
+        """只读扫描当前确实可兑的项，返回 (按钮文案, 类型)。
+
+        保守规则：
+          - 兑换奖励：连登里程碑，页面显示按钮即可兑
+          - 抽奖(N)：N > 0 才兑
+          - 开启盲盒 a/b：a >= b（能量满）才兑，避免空点
+          - 补登卡/日期按钮：有限资源，永不自动点
+        """
+        found: list[tuple[str, str]] = []
+        for el in snap.get("elements", []):
+            if el.get("role") != "AXButton":
+                continue
+            lab = str(el.get("label") or "").strip()
+            if lab == "兑换奖励":
+                found.append((lab, "milestone"))
+                continue
+            m = re.search(r"抽奖\((\d+)\)", lab)
+            if m and int(m.group(1)) > 0:
+                found.append((lab, "lottery"))
+                continue
+            m = re.search(r"开启盲盒\s*(\d+)\s*/\s*(\d+)", lab)
+            if m and int(m.group(1)) >= int(m.group(2)):
+                found.append((lab, "blindbox"))
+        return found
+
+    @staticmethod
+    def _close_dialog(snap: dict, call, pid: int, wid: int) -> bool:
+        """关闭页面内的浮层（只认弹窗区域的「关闭」，不碰浏览器标签页）。"""
+        for el in snap.get("elements", []):
+            lab = str(el.get("label") or "").strip()
+            idx = el.get("element_index") or 0
+            if el.get("role") == "AXButton" and lab == "关闭" and idx > 150:
+                call("click", {"pid": pid, "window_id": wid, "element_index": idx})
+                return True
+        return False
+
+    def claim_exchanges(self, claimed_before: Callable[[str], bool] | None = None) -> list[ActionResult]:
+        """自动兑换可兑项；claimed_before 由调用方提供，保证同一天每项只兑一次。"""
+        win = self._window()
+        if not win:
+            return [ActionResult(False, "exchange", "growth-center window not found")]
+        pid, wid = win
+        snap = self.snapshot(pid, wid)
+        # 自愈：上一轮遗留的「选择奖励」弹窗先关掉
+        if "选择奖励" in self.read_state(snap)["raw"]:
+            self._close_dialog(snap, self._call, pid, wid)
+            snap = self.snapshot(pid, wid)
+        candidates = self.scan_exchanges(snap)
+        if not candidates:
+            return [ActionResult(True, "exchange", "nothing exchangeable", {"count": 0})]
+        results: list[ActionResult] = []
+        for label, kind in candidates:
+            key = f"{kind}:{label}"
+            if claimed_before is not None and claimed_before(key):
+                results.append(ActionResult(
+                    True, "exchange", f"already claimed today: {key}",
+                    {"kind": kind, "label": label, "key": key, "skipped": True},
+                ))
+                continue
+            current = self.snapshot(pid, wid)  # 每次点击前重建索引
+            ok, clicked = self._click(current, lambda s, t=label: s.strip() == t, pid, wid)
+            if not ok:
+                results.append(ActionResult(False, "exchange", f"{kind}: {clicked}",
+                                           {"kind": kind, "key": key}))
+                continue
+            after = self.snapshot(pid, wid)
+
+            if kind == "milestone":
+                # 「兑换奖励」会打开选择奖励弹窗；只有不含「还差/未解锁/已领取」的才是真可兑
+                unlocked = [
+                    str(e.get("label") or "").strip()
+                    for e in after.get("elements", [])
+                    if e.get("role") == "AXButton"
+                    and any(k in str(e.get("label") or "") for k in ("领取", "兑换"))
+                    and not any(k in str(e.get("label") or "") for k in
+                                ("还差", "未解锁", "已领取", "兑换奖励"))
+                ]
+                if not unlocked:
+                    self._close_dialog(after, self._call, pid, wid)
+                    results.append(ActionResult(
+                        True, "exchange", "milestone: no unlocked reward yet",
+                        {"kind": kind, "key": key, "skipped": True},
+                    ))
+                    continue
+                target = unlocked[0]
+                ok2, _ = self._click(after, lambda s, t=target: s.strip() == t, pid, wid)
+                final = self.snapshot(pid, wid)
+                self._close_dialog(final, self._call, pid, wid)
+                results.append(ActionResult(
+                    ok2, "exchange", f"milestone claimed: {target}",
+                    {"kind": kind, "key": key, "label": target},
+                ))
+                continue
+
+            still = any(
+                str(e.get("label") or "").strip() == label
+                for e in after.get("elements", [])
+            )
+            results.append(ActionResult(
+                ok and not still, "exchange", f"{kind}: {clicked}",
+                {"kind": kind, "label": label, "key": key, "changed": not still},
+            ))
+        return results
+
+    def dispatch(self) -> ActionResult:
+        win = self._window()
+        if not win:
+            return ActionResult(False, "travel_dispatch", "growth-center window not found")
+        pid, wid = win
+        snap = self.snapshot(pid, wid)
+        st = self.read_state(snap)["state"]
+
+        if st == "idle":
+            ok, label = self._click(snap, lambda s: "派猫猫旅行" in s, pid, wid)
+            if not ok:
+                return ActionResult(False, "travel_dispatch", label)
+            snap = self.snapshot(pid, wid)
+            st = self.read_state(snap)["state"]
+
+        if st == "scene_dialog":
+            if self.scene:
+                self._click(snap, lambda s: "切换到" in s and self.scene in s, pid, wid)
+                snap = self.snapshot(pid, wid)
+            ok, label = self._click(snap, lambda s: "确定派出" in s, pid, wid)
+            if not ok:
+                return ActionResult(False, "travel_dispatch", label)
+
+        after = self.snapshot(pid, wid)
+        info = self.read_state(after)
+        if info["state"] != "traveling" or info["remaining_sec"] is None:
+            return ActionResult(
+                False, "travel_dispatch",
+                f"dispatch not confirmed (state={info['state']})",
+                {"state": info["state"]},
+            )
+        due = time.time() + info["remaining_sec"] + self.claim_offset_sec
+        return ActionResult(
+            True, "travel_dispatch",
+            f"dispatched; real duration {info['remaining_sec']}s",
+            {"remaining_sec": info["remaining_sec"], "due_at": due, "scene": self.scene or "default"},
+        )
+
+    def tick(self, force: bool = False) -> ActionResult:
+        """一轮：旅行中->记录真实到期；可领->领奖并再派遣；空闲->派遣。"""
+        win = self._window()
+        if not win:
+            return ActionResult(False, "travel", "growth-center window not found")
+        pid, wid = win
+        snap = self.snapshot(pid, wid)
+        info = self.read_state(snap)
+        state = info["state"]
+
+        if state == "traveling" and not force:
+            if info["remaining_sec"] is None:
+                return ActionResult(False, "travel", "countdown unreadable", info)
+            due = time.time() + info["remaining_sec"] + self.claim_offset_sec
+            return ActionResult(
+                True, "travel", f"traveling; due from real countdown ({info['remaining_sec']}s)",
+                {"state": state, "due_at": due, "remaining_sec": info["remaining_sec"]},
+            )
+
+        if state in ("claimable", "gift_dialog") or force:
+            claimed = self.claim_gift()
+            dispatched = self.dispatch()
+            due = dispatched.data.get("due_at")
+            ok = dispatched.ok and (claimed.ok or claimed.data.get("state") == "traveling")
+            return ActionResult(
+                ok, "travel",
+                f"claim={claimed.detail}; dispatch={dispatched.detail}",
+                {"state": state, "due_at": due, "claim": claimed.as_dict(), "dispatch": dispatched.as_dict()},
+            )
+
+        if state == "idle":
+            dispatched = self.dispatch()
+            return ActionResult(
+                dispatched.ok, "travel", dispatched.detail,
+                {"state": state, "due_at": dispatched.data.get("due_at"),
+                 "dispatch": dispatched.as_dict()},
+            )
+
+        return ActionResult(False, "travel", f"unknown growth-center state: {state}", info)
