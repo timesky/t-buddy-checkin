@@ -73,7 +73,8 @@ class Actions:
         snapshot = self.web.snapshot()
         if any(marker in snapshot for marker in LOGIN_MARKERS):
             return [
-                ActionResult(False, "gift", "web session not logged in; run ./run.sh setup first")
+                ActionResult(False, "gift",
+                             "网页未登录：请在浏览器登录 WorkBuddy 后重试（本技能不自动登录）")
             ]
         allow = self.cfg["gifts"]["allow_keywords"]
         deny = self.cfg["gifts"]["deny_keywords"]
@@ -166,7 +167,7 @@ class Actions:
             return ActionResult(
                 False,
                 "travel",
-                "web session not logged in; run ./run.sh setup first",
+                "网页未登录：请在浏览器登录 WorkBuddy 后重试（本技能不自动登录）",
                 {"status": status},
             )
 

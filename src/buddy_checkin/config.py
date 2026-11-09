@@ -67,11 +67,12 @@ DEFAULTS: dict[str, Any] = {
         "re_dispatch": True,
         "fallback_interval_sec": 3600,
     },
-    # 成长中心：CuaDriver AX 通道操作已登录的 Edge「个人中心」页面
+    # 成长中心：CuaDriver AX 通道操作已登录的成长中心页面（任意浏览器，不限定 Edge）
     "growth": {
         "enabled": True,
         "cua_driver_bin": "/Applications/CuaDriver.app/Contents/MacOS/cua-driver",
-        "browser_app": "Microsoft Edge",
+        # auto = 探测任意浏览器里已打开的成长中心窗口；如需限定某浏览器可填其 app 名
+        "browser_app": "auto",
         "title_hint": "个人中心",
         "scene": "",              # 留空用页面默认场景
         "claim_offset_sec": 3,    # 倒计时归零后再等 3 秒，避免服务端未结算

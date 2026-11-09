@@ -50,8 +50,10 @@ class DepsTests(unittest.TestCase):
         self.assertIn("ok", report)
         self.assertIn("dependencies", report)
         names = [d["name"] for d in report["dependencies"]]
-        for expected in ("Python", "agent-browser", "CuaDriver", "Microsoft Edge", "agent-desktop"):
+        for expected in ("Python", "agent-browser", "CuaDriver", "agent-desktop"):
             self.assertIn(expected, names)
+        # 浏览器依赖不再限定 Edge，名称体现「任一浏览器」
+        self.assertTrue(any("浏览器" in n for n in names))
 
     def test_cua_driver_required_only_when_growth_or_auto(self):
         cfg_auto = {"desktop": {"engine": "auto"}, "growth": {"enabled": True}}

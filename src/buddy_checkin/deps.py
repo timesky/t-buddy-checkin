@@ -117,23 +117,30 @@ def cua_driver_dep(cfg: dict) -> dict:
 
 
 def edge_dep(cfg: dict) -> dict:
+    # 成长中心现在不限定浏览器（browser_app=auto 时任意浏览器皆可），
+    # 因此 Edge 不再是必需依赖，仅作「已安装其一即可」的提示。
     growth_on = bool((cfg.get("growth") or {}).get("enabled", True))
-    app_name = (cfg.get("growth") or {}).get("browser_app", "Microsoft Edge")
+    configured = (cfg.get("growth") or {}).get("browser_app", "auto")
+    explicit_edge = configured not in ("auto", "", None)
     candidates = [
-        f"/Applications/{app_name}.app/Contents/MacOS/{app_name}",
-        f"/Applications/{app_name}.app",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Microsoft Edge.app",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Safari.app",
     ]
     resolved = next((Path(c) for c in candidates if Path(c).exists()), None)
     return {
-        "name": "Microsoft Edge",
+        "name": "浏览器 (Chrome/Edge/Safari 任一)",
         "kind": "gui-app",
-        "required": growth_on,
-        "critical": growth_on,
+        "required": False,
+        "critical": False,
         "present": resolved is not None,
         "version": None,
-        "path": str(resolved) if resolved else candidates[0],
-        "install": "下载安装 Microsoft Edge（成长中心 AX 通道需要其已登录的个人中心窗口）。",
-        "note": f"growth.browser_app = {app_name}",
+        "path": str(resolved) if resolved else "未检测到常见浏览器",
+        "install": "成长中心不限定浏览器：用你惯用的浏览器从 WorkBuddy 点开「个人中心」即可，"
+                   "无需专门安装 Edge。",
+        "note": f"growth.browser_app = {configured}"
+                + ("" if not explicit_edge else "（已显式指定，仅作提示）"),
     }
 
 

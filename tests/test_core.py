@@ -402,8 +402,8 @@ class ActionsTests(unittest.TestCase):
         web = FakeWeb(["微信扫码登录 Iframe wechat-qrcode 其他登录方式"])
         actions = Actions(self.cfg, self.state, web, FakeDesktop())
         summary = actions.reconcile_all()
-        self.assertIn("not logged in", summary["gifts"][0]["detail"])
-        self.assertIn("not logged in", summary["travel"]["detail"])
+        self.assertIn("未登录", summary["gifts"][0]["detail"])
+        self.assertIn("未登录", summary["travel"]["detail"])
         self.assertFalse(summary["ok"])
 
 

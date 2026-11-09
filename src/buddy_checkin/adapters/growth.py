@@ -1,4 +1,8 @@
-"""成长中心适配器：用 CuaDriver 的 AX 通道操作已登录的 Edge「个人中心」。
+"""成长中心适配器：用 CuaDriver 的 AX 通道操作已登录的成长中心页面。
+
+**不限定浏览器**：从 WorkBuddy 点开进入哪个浏览器（Chrome / Edge / Safari 等），
+就在哪个浏览器操作；默认 browser_app="auto"，按页面内容（而非固定 app）探测窗口。
+如页面未登录，只提示用户先登录，不做任何自动登录尝试。
 
 真实页面 https://www.workbuddy.cn/profile/growth-center 的 AX 状态（2026-11-09 实测）：
 
@@ -25,6 +29,17 @@ CUA_DRIVER_BIN = "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
 # "旅行倒计时 00:59:56" / "00:59:57"
 _COUNTDOWN = re.compile(r"(\d{1,2}):([0-5]\d):([0-5]\d)")
 
+# 登录页特征：命中即判定为「未登录」，提示用户登录，绝不自动登录
+LOGIN_MARKERS = (
+    "微信扫码登录", "wechat-qrcode", "扫码登录", "立即登录", "请登录",
+    "登录 WorkBuddy", "登录后", "账号密码登录", "短信登录",
+)
+# 成长中心页面特征：命中即判定为目标窗口（与具体浏览器无关）
+GROWTH_MARKERS = (
+    "派猫猫旅行", "领取礼物", "旅行倒计时", "个人中心", "Buddy 正在",
+    "兑换奖励", "连签", "我的积分",
+)
+
 
 def parse_hms(text: str) -> int | None:
     """从任意文本里抽 HH:MM:SS 并返回总秒数。"""
@@ -38,12 +53,15 @@ class GrowthCenter:
     def __init__(self, cfg: dict, runner: Callable[..., Any] | None = None) -> None:
         growth = cfg.get("growth", {})
         self.bin = growth.get("cua_driver_bin") or CUA_DRIVER_BIN
-        self.browser_app = growth.get("browser_app", "Microsoft Edge")
+        # 默认 auto：探测任意浏览器里已打开的成长中心窗口，不限定 Edge
+        self.browser_app = growth.get("browser_app", "auto") or "auto"
         self.title_hint = growth.get("title_hint", "个人中心")
         self.claim_offset_sec = float(growth.get("claim_offset_sec", 3))
         self.scene = growth.get("scene", "")  # 留空 = 用页面默认场景
         self.runner = runner or subprocess.run
         self.commands: list[list[str]] = []
+        # 上一次 _window 探窗结论：("login_required"|"not_found", detail)
+        self._block: tuple[str, str] | None = None
 
     # ---- CuaDriver 调用 -----------------------------------------------------
     def _call(self, tool: str, payload: dict) -> dict:
@@ -62,32 +80,79 @@ class GrowthCenter:
         except ValueError:
             return {"error": "invalid JSON from cua-driver"}
 
+    @staticmethod
+    def _classify(snap: dict) -> str:
+        """判定快照属于 成长中心页面 / 登录页 / 其他。"""
+        if not isinstance(snap, dict):
+            return "other"
+        labels = " ".join(str(e.get("label") or "") for e in snap.get("elements", []))
+        text = f"{snap.get('raw', '')} {labels}"
+        if any(m in text for m in LOGIN_MARKERS):
+            return "login"
+        if any(m in text for m in GROWTH_MARKERS):
+            return "growth"
+        return "other"
+
     def _window(self) -> tuple[int, int] | None:
-        """找已登录的成长中心浏览器窗口，返回 (pid, window_id)。"""
+        """找已打开的成长中心窗口（任意浏览器），返回 (pid, window_id)。
+
+        不限定浏览器：browser_app="auto" 时扫描所有可见窗口，按页面内容（而非
+        app 名）判定是否为成长中心；命中登录页则记为 login_required 并提示用户登录。
+        """
+        self._block = None
         data = self._call("list_windows", {})
-        wins = [
-            w for w in data.get("windows", [])
-            if w.get("app_name") == self.browser_app
-            and self.title_hint in str(w.get("title") or "")
-            and (w.get("bounds") or {}).get("width", 0) > 400
-        ]
+        wins = data.get("windows", [])
+        if self.browser_app != "auto":
+            # 用户显式指定浏览器时才按 app 过滤，否则任意浏览器皆可
+            wins = [w for w in wins if w.get("app_name") == self.browser_app]
+        wins = [w for w in wins if (w.get("bounds") or {}).get("width", 0) > 400]
         if not wins:
-            # 标题可能滞后，退而求其次取该浏览器最大的可见窗口
-            wins = [
-                w for w in data.get("windows", [])
-                if w.get("app_name") == self.browser_app
-                and (w.get("bounds") or {}).get("width", 0) > 400
-            ]
-        if not wins:
+            self._block = ("not_found",
+                           "未找到任何浏览器窗口：请从 WorkBuddy 点开「个人中心」"
+                           "(www.workbuddy.cn/profile/growth-center) 再运行")
             return None
-        w = max(wins, key=lambda x: x["bounds"]["width"] * x["bounds"]["height"])
-        return int(w["pid"]), int(w["window_id"])
+        # 粗筛排序：标题含 title_hint 或 WorkBuddy 的优先，其次按窗口面积
+        title_hint = self.title_hint
+        ranked = sorted(
+            wins,
+            key=lambda w: (
+                (title_hint in str(w.get("title") or "")
+                 or "workbuddy" in str(w.get("title") or "").lower()),
+                w["bounds"]["width"] * w["bounds"]["height"],
+            ),
+            reverse=True,
+        )
+        # 逐个用 AX 内容精筛（最多前 4 个候选），同时识别登录页
+        for w in ranked[:4]:
+            pid, wid = int(w["pid"]), int(w["window_id"])
+            snap = self._call("get_window_state", {
+                "pid": pid, "window_id": wid,
+                "include_screenshot": False, "max_elements": 1500,
+            })
+            if "error" in snap:
+                continue
+            cls = self._classify(snap)
+            if cls == "growth":
+                return pid, wid
+            if cls == "login":
+                self._block = ("login_required",
+                               "成长中心页面未登录：请在浏览器登录 WorkBuddy 后，"
+                               "重新打开个人中心页面，再运行本命令")
+                return None
+        self._block = ("not_found",
+                       "已找到浏览器窗口，但其中没有成长中心页面：请确认已打开 "
+                       "www.workbuddy.cn/profile/growth-center 且已登录")
+        return None
+
+    def _block_result(self, action: str) -> ActionResult:
+        kind, detail = self._block or ("not_found", "growth-center window not found")
+        return ActionResult(False, action, detail, {"block": kind})
 
     def snapshot(self, pid: int | None = None, wid: int | None = None) -> dict:
         if pid is None or wid is None:
             win = self._window()
             if not win:
-                return {"error": "growth-center window not found"}
+                return {"error": (self._block or ("not_found", "growth-center window not found"))[1]}
             pid, wid = win
         return self._call("get_window_state", {
             "pid": pid, "window_id": wid,
@@ -144,7 +209,7 @@ class GrowthCenter:
     def claim_gift(self) -> ActionResult:
         win = self._window()
         if not win:
-            return ActionResult(False, "gift", "growth-center window not found")
+            return self._block_result("gift")
         pid, wid = win
         snap = self.snapshot(pid, wid)
         st = self.read_state(snap)["state"]
@@ -214,7 +279,7 @@ class GrowthCenter:
         """自动兑换可兑项；claimed_before 由调用方提供，保证同一天每项只兑一次。"""
         win = self._window()
         if not win:
-            return [ActionResult(False, "exchange", "growth-center window not found")]
+            return [self._block_result("exchange")]
         pid, wid = win
         snap = self.snapshot(pid, wid)
         # 自愈：上一轮遗留的「选择奖励」弹窗先关掉
@@ -281,7 +346,7 @@ class GrowthCenter:
     def dispatch(self) -> ActionResult:
         win = self._window()
         if not win:
-            return ActionResult(False, "travel_dispatch", "growth-center window not found")
+            return self._block_result("travel_dispatch")
         pid, wid = win
         snap = self.snapshot(pid, wid)
         st = self.read_state(snap)["state"]
@@ -320,7 +385,7 @@ class GrowthCenter:
         """一轮：旅行中->记录真实到期；可领->领奖并再派遣；空闲->派遣。"""
         win = self._window()
         if not win:
-            return ActionResult(False, "travel", "growth-center window not found")
+            return self._block_result("travel")
         pid, wid = win
         snap = self.snapshot(pid, wid)
         info = self.read_state(snap)

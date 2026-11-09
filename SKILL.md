@@ -11,14 +11,14 @@ description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、�
 
 ## 安装第三方依赖（安装 / 重新拉取技能时必跑）
 
-本技能除 Python 标准库外，依赖若干**外部 CLI / GUI 应用**（agent-browser、CuaDriver、Microsoft Edge、可选 agent-desktop），它们**不会**随技能仓库自动装好，且 mock 单测测不到、只在真实执行才暴露缺失。**安装（或 `git pull` 重新拉取）本技能后，agent 必须先执行以下两步再首次使用**：
+本技能除 Python 标准库外，依赖若干**外部 CLI / GUI 应用**（CuaDriver、agent-browser、可选 agent-desktop），它们**不会**随技能仓库自动装好，且 mock 单测测不到、只在真实执行才暴露缺失。**安装（或 `git pull` 重新拉取）本技能后，agent 必须先执行以下两步再首次使用**：
 
 ```bash
-./run.sh deps install   # 装经 npm 管理的依赖；GUI 依赖（CuaDriver / Edge）给出手动安装与授权指引
+./run.sh deps install   # 装经 npm 管理的依赖；GUI 依赖（CuaDriver）给出手动安装与授权指引
 ./run.sh deps check     # 逐项检查，所有必需依赖 OK 才放行；缺失则退出码非 0，必须先补齐
 ```
 
-`deps check` 会据 `config.toml` 各通道开关动态判定「必需 / 可选」：growth 通道开启或桌面端用 cua-driver 引擎时，**CuaDriver + Microsoft Edge 为必需**；网页端 headless 驱动 **agent-browser 始终必需**；agent-desktop 仅在使用 agent-desktop 引擎时必需（默认 cua-driver 下为可选回退）。GUI 依赖缺失时，`deps install` 只打印指引，需人工安装并在「系统设置 → 隐私与安全性 → 辅助功能」为 CuaDriver 授权。
+`deps check` 会据 `config.toml` 各通道开关动态判定「必需 / 可选」：**CuaDriver 始终必需**（它是本技能唯一实际可用的自动化后端，负责桌面签到 + 成长中心任意浏览器的 AX 操作）；**agent-browser 仅 `setup` 扫码脚手架用、仍为必需**；**浏览器不限定**（Chrome/Edge/Safari 任一即可，无需专门装 Edge）；agent-desktop 仅在使用 agent-desktop 引擎时必需（默认 cua-driver 下为可选回退，且实测 TCC 未授权）。GUI 依赖缺失时，`deps install` 只打印指引，需人工安装并在「系统设置 → 隐私与安全性 → 辅助功能」为 CuaDriver 授权。
 
 ## 用法
 
@@ -40,8 +40,10 @@ description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、�
 
 ## 成长中心与派遣时长
 
-领礼物、派遣、签到兑换走 `growth` 通道：CuaDriver 读已登录 Edge「个人中心」的 AX 树，
-不注入 cookie、不需要 Bearer token。状态由真实按钮判定（派猫猫旅行 / 旅行倒计时 / 领取礼物）。
+领礼物、派遣、签到兑换走 `growth` 通道：CuaDriver 读已登录成长中心页面的 AX 树（**不限定浏览器**——
+从 WorkBuddy 点开进入哪个浏览器就在哪个浏览器操作，默认 `growth.browser_app="auto"` 按页面内容探测），
+不注入 cookie、不需要 Bearer token。页面未登录时只提示用户先登录，不自动登录。状态由真实按钮判定
+（派猫猫旅行 / 旅行倒计时 / 领取礼物）。
 
 **派遣时长每次不同**：页面事前只提示「预计出行时间为1～4小时」。派遣后必须重新读
 `旅行倒计时 HH:MM:SS`，用真实剩余秒数算 `due_at`，写入 SQLite；到期唤醒后领礼物、

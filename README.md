@@ -9,7 +9,7 @@
 
 独立的每日签到 / 礼物兑换 / 派遣自动化技能。**只有每日签到依赖 WorkBuddy 桌面客户端**，其余全部在网页端完成；两条通道都在后台隔离执行，**不弹窗、不激活窗口、不抢鼠标键盘、不碰你正在用的浏览器**。
 
-零第三方 Python 包（仅标准库 `tomllib` / `sqlite3` / `zoneinfo`）。外部 CLI 依赖：`agent-browser`（网页端 headless 驱动，已随 WorkBuddy 安装或在 `tools/` 本地安装）、可选 `agent-desktop`（桌面端回退引擎，Apache-2.0）；GUI 应用依赖：**CuaDriver**（成长中心 + 桌面签到 AX 通道，已授权 `com.trycua.driver`）与 **Microsoft Edge**（成长中心已登录窗口来源）。不读取、不解密、不导出任何客户端登录态或令牌。安装与核查见下方「第三方依赖安装」一节。
+零第三方 Python 包（仅标准库 `tomllib` / `sqlite3` / `zoneinfo`）。外部 CLI 依赖：`agent-browser`（仅 `setup` 扫码脚手架用，已随 WorkBuddy 安装或在 `tools/` 本地安装）、可选 `agent-desktop`（桌面端回退引擎，Apache-2.0，实测 TCC 未授权故未启用）；GUI 应用依赖：**CuaDriver**（成长中心 + 桌面签到 AX 通道，已授权 `com.trycua.driver`，是本技能唯一实际可用的自动化后端）。**成长中心不限定浏览器**：从 WorkBuddy 点开进入哪个浏览器（Chrome / Edge / Safari 等），就在哪个浏览器操作，不需要 Edge。不读取、不解密、不导出任何客户端登录态或令牌。安装与核查见下方「第三方依赖安装」一节。
 
 ## Git 管理
 
@@ -46,14 +46,14 @@
 | 依赖 | 类型 | 必需 | 用途 | 安装方式 |
 |---|---|---|---|---|
 | Python ≥ 3.11（推荐 3.13） | 运行时 | ✅ | 标准库 tomllib/sqlite3/zoneinfo | 系统自带 / python.org |
-| agent-browser | npm-cli | ✅ | 网页端 headless 会话（web 通道） | `cd tools && npm install`，或 `npm install -g agent-browser` |
-| CuaDriver | GUI 应用 | ✅（growth 或 cua-driver 引擎时） | 成长中心 + 桌面签到 AX 通道 | 安装 CuaDriver.app，并在系统设置→隐私与安全性→辅助功能 授权其驱动 |
-| Microsoft Edge | GUI 应用 | ✅（growth 通道时） | 成长中心 AX 窗口来源（已登录个人中心） | 下载安装 Edge |
-| agent-desktop | npm-cli | 仅 agent-desktop 引擎时 | 桌面端回退引擎 | `cd tools && npm install` |
+| CuaDriver | GUI 应用 | ✅ | 成长中心（任意浏览器 AX）+ 桌面签到 AX 通道，**本技能唯一实际可用的自动化后端** | 安装 CuaDriver.app，并在系统设置→隐私与安全性→辅助功能 授权其驱动 |
+| 浏览器（Chrome/Edge/Safari 任一） | GUI 应用 | 否（已有其一即可） | 成长中心页面载体；不限定，用你惯用的浏览器从 WorkBuddy 点开即可 | 无需专门安装 Edge |
+| agent-browser | npm-cli | ✅ | 仅 `setup` 扫码脚手架；功能运行不经此 | `cd tools && npm install`，或 `npm install -g agent-browser` |
+| agent-desktop | npm-cli | 仅 agent-desktop 引擎时 | 桌面端回退引擎（实测 TCC 未授权，未启用） | `cd tools && npm install` |
 
-> 说明：CuaDriver / Microsoft Edge 是 GUI 应用，`deps install` 只打印手动安装与授权指引，不会
-> 自动下载；agent-desktop 在默认 cua-driver 引擎下非必需（回退用）。`deps check` 会区分
-> `required`（缺失即报错）与 `optional`（缺失仅警告），并据 `config.toml` 里各通道开关动态判定。
+> 说明：CuaDriver 是 GUI 应用，`deps install` 只打印手动安装与授权指引，不会自动下载。
+> 成长中心不限定浏览器，故 Edge 不再是必需依赖。`deps check` 会区分 `required`（缺失即报错）
+> 与 `optional`（缺失仅警告），并据 `config.toml` 里各通道开关动态判定。
 
 ## 签到通道（2026-11-09 真实跑通）
 
@@ -79,7 +79,7 @@
 
 ## 成长中心：领礼物 / 派遣 / 签到兑换（2026-11-09 真实跑通）
 
-通道：用 CuaDriver 的 AX 能力读**已登录的 Edge「个人中心」**（`/profile/growth-center`）。不用注入 cookie，也不碰需要 Bearer token 的签到接口。
+通道：用 CuaDriver 的 AX 能力读**已登录的成长中心页面**（`/profile/growth-center`）。**不限定浏览器**——你从 WorkBuddy 点开链接进入哪个浏览器，就在哪个浏览器操作（默认 `growth.browser_app = "auto"`，按页面内容而非固定 app 探测窗口）；如需限定可填浏览器 app 名。不用注入 cookie，也不碰需要 Bearer token 的签到接口。**页面未登录时只提示你先登录，绝不自动登录。**
 
 | AX 状态 | 页面按钮 | 工具动作 |
 |---|---|---|
