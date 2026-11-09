@@ -1,5 +1,6 @@
 {
-  "dependencies": {
-    "agent-desktop": "^1.2.0"
-  }
+  "name": "buddy-web-checkin-tools",
+  "version": "1.0.0",
+  "private": true,
+  "description": "占位：本技能无 npm 依赖，唯一外部工具是 CuaDriver（GUI 应用）。保留此文件仅为未来可能的工具链预留。"
 }

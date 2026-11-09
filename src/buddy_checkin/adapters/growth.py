@@ -29,16 +29,21 @@ CUA_DRIVER_BIN = "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
 # "旅行倒计时 00:59:56" / "00:59:57"
 _COUNTDOWN = re.compile(r"(\d{1,2}):([0-5]\d):([0-5]\d)")
 
-# 登录页特征：命中即判定为「未登录」，提示用户登录，绝不自动登录
+# 登录页特征：命中即判定为「未登录」，提示用户登录，绝不自动登录。
+# 注意只保留强特征——「请登录 / 登录后」等泛化文案在已登录页面也会出现
+# （实测 2026-11-09：侧栏「用户配置 1 个人资料，请登录」曾造成误判），不列入。
 LOGIN_MARKERS = (
-    "微信扫码登录", "wechat-qrcode", "扫码登录", "立即登录", "请登录",
-    "登录 WorkBuddy", "登录后", "账号密码登录", "短信登录",
+    "微信扫码登录", "wechat-qrcode", "扫码登录", "立即登录",
+    "账号密码登录", "短信登录", "login",
 )
-# 成长中心页面特征：命中即判定为目标窗口（与具体浏览器无关）
-GROWTH_MARKERS = (
-    "派猫猫旅行", "领取礼物", "旅行倒计时", "个人中心", "Buddy 正在",
-    "兑换奖励", "连签", "我的积分",
+# 成长中心页面的强内容特征（真实按钮/文案，登录页不会有）：
+# 判定时优先于登录标记——已登录页面上夹杂的登录类文案不能否决成长内容。
+GROWTH_CONTENT_MARKERS = (
+    "派猫猫旅行", "领取礼物", "旅行倒计时", "兑换奖励", "Buddy 正在",
+    "开启盲盒", "确定派出",
 )
+# 弱特征（窗口标题等）：仅用于候选窗口排序，不参与内容判定
+GROWTH_MARKERS = GROWTH_CONTENT_MARKERS + ("个人中心", "连签", "我的积分")
 
 
 def parse_hms(text: str) -> int | None:
@@ -82,15 +87,20 @@ class GrowthCenter:
 
     @staticmethod
     def _classify(snap: dict) -> str:
-        """判定快照属于 成长中心页面 / 登录页 / 其他。"""
+        """判定快照属于 成长中心页面 / 登录页 / 其他。
+
+        强成长内容（派猫猫旅行 / 领取礼物 / 旅行倒计时 等真实按钮）**优先**：
+        已登录的成长中心页面可能夹杂「请登录」之类的泛化文案（实测侧栏就有），
+        不能因此误判为未登录。只有页面没有成长内容、且出现登录特征时才算登录页。
+        """
         if not isinstance(snap, dict):
             return "other"
         labels = " ".join(str(e.get("label") or "") for e in snap.get("elements", []))
         text = f"{snap.get('raw', '')} {labels}"
+        if any(m in text for m in GROWTH_CONTENT_MARKERS):
+            return "growth"
         if any(m in text for m in LOGIN_MARKERS):
             return "login"
-        if any(m in text for m in GROWTH_MARKERS):
-            return "growth"
         return "other"
 
     def _window(self) -> tuple[int, int] | None:

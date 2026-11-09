@@ -16,55 +16,55 @@ class DepsTests(unittest.TestCase):
         self.assertTrue(d["present"])
         self.assertTrue(d["required"] and d["critical"])
 
-    def test_try_version_extracts_semver(self):
-        # 模拟 --version 输出带程序名前缀
+    def test_try_version_extracts_semver_only(self):
+        from unittest.mock import patch
+
         class _P:
-            stdout = "agent-browser 0.27.0\n"
+            stdout = "cua-driver 0.14.1\n"
             stderr = ""
             returncode = 0
 
-        class _R:
-            def __init__(self, *a, **k):
-                pass
-
-            def __call__(self, *a, **k):
-                return _P()
-
-        ver = deps._try_version("agent-browser", "--version", timeout=1) if False else None
-        # 直接验证正则提取逻辑
-        import re
-
-        m = re.search(r"\d+\.\d+(?:\.\d+)?", "agent-browser 0.27.0")
-        self.assertEqual(m.group(0), "0.27.0")
-        self.assertIsNone(ver)  # 上面的 if False 分支跳过，保持占位
+        with patch.object(deps.subprocess, "run", return_value=_P()):
+            ver = deps._try_version("/fake/cua-driver", "--version", timeout=1)
+        self.assertEqual(ver, "0.14.1")  # 只取版本号，不带程序名前缀
 
     def test_evaluate_returns_ok_flag(self):
         cfg = {
-            "web": {"bin": "agent-browser"},
-            "desktop": {"engine": "auto", "bin": "agent-desktop",
-                        "cua_driver_bin": "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"},
-            "growth": {"enabled": True, "browser_app": "Microsoft Edge",
+            "desktop": {"cua_driver_bin": "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"},
+            "growth": {"enabled": True, "browser_app": "auto",
                        "cua_driver_bin": "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"},
         }
         report = deps.evaluate(cfg)
         self.assertIn("ok", report)
         self.assertIn("dependencies", report)
         names = [d["name"] for d in report["dependencies"]]
-        for expected in ("Python", "agent-browser", "CuaDriver", "agent-desktop"):
-            self.assertIn(expected, names)
-        # 浏览器依赖不再限定 Edge，名称体现「任一浏览器」
-        self.assertTrue(any("浏览器" in n for n in names))
+        # 唯一外部工具是 CuaDriver；agent-browser / agent-desktop 均已移除
+        self.assertEqual(names, ["Python", "CuaDriver", "浏览器（任意已装）"])
+        self.assertNotIn("agent-browser", " ".join(names))
+        self.assertNotIn("agent-desktop", " ".join(names))
 
-    def test_cua_driver_required_only_when_growth_or_auto(self):
-        cfg_auto = {"desktop": {"engine": "auto"}, "growth": {"enabled": True}}
-        self.assertTrue(deps.cua_driver_dep(cfg_auto)["required"])
-        cfg_desktop_only = {"desktop": {"engine": "agent-desktop"}, "growth": {"enabled": False}}
-        self.assertFalse(deps.cua_driver_dep(cfg_desktop_only)["required"])
+    def test_cua_driver_is_the_only_required_external(self):
+        """CuaDriver 是唯一必需外部工具：缺它则整体 not ok。"""
+        from unittest.mock import patch
 
-    def test_resolve_bin_falls_back_to_local(self):
-        # agent-browser 本机在 PATH；确认能解析到
-        resolved = deps.resolve_bin("agent-browser")
-        self.assertIsNotNone(resolved)
+        cfg = {"desktop": {"cua_driver_bin": "/nonexistent/cua-driver"},
+               "growth": {"enabled": True}}
+        # 屏蔽 PATH 回退（本机 cua-driver 就在 PATH 上，会误判 present）
+        with patch.object(deps, "_which", return_value=None):
+            report = deps.evaluate(cfg)
+        cua = next(d for d in report["dependencies"] if d["name"] == "CuaDriver")
+        self.assertTrue(cua["required"])
+        self.assertFalse(cua["present"])
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["required_missing"], ["CuaDriver"])
+        # 浏览器为可选信息项，缺失不阻塞
+        browser = next(d for d in report["dependencies"] if "浏览器" in d["name"])
+        self.assertFalse(browser["required"])
+
+    def test_browser_dep_is_informational(self):
+        d = deps.browser_dep({"growth": {"browser_app": "auto"}})
+        self.assertFalse(d["required"])
+        self.assertFalse(d["critical"])
 
 
 if __name__ == "__main__":

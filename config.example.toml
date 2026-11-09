@@ -1,36 +1,15 @@
 # 复制为 config.toml 后按需修改。时间口径统一北京时间。
-# 依赖：零第三方 Python 包；外部 CLI 仅 agent-browser（Apache-2.0）、可选 agent-desktop（Apache-2.0）。
+# 依赖：零第三方 Python 包；唯一外部工具是 CuaDriver（trycua AX 驱动，GUI 应用）。
 
 base_url = "https://www.workbuddy.cn/app"
 state_db = "~/.local/share/buddy-web-checkin/state.sqlite3"
 log_level = "INFO"
 
-[web]
-# 网页端：独立 headless 会话，不接管你正在用的浏览器
-engine = "agent-browser"
-bin = "agent-browser"
-session = "buddy-checkin"
-profile = "~/.local/share/buddy-web-checkin/browser-profile"
-headless = true
-timeout_sec = 30
-login_wait_sec = 600   # setup 等待扫码的窗口（秒）
-# 复用 Edge 登录态时填 Edge 可执行文件（setup-from-edge）；留空用自带 Chrome 走扫码
-executable_path = ""
-edge_profile_source = "~/Library/Application Support/Microsoft Edge"
-# 可选：填写网页端旅行状态接口后，优先用结构化 end_at / remaining_seconds 精确到期；
-# 留空则从页面可见倒计时（如 00:17:55）解析。
-status_endpoint = ""
-
 [desktop]
-# 桌面端：仅每日签到。engine = auto | cua-driver | agent-desktop | cdp | computer-use
-# cua-driver 推荐：走已授权的 com.trycua.driver AX 路径，不移动光标、不抢焦点
-engine = "auto"
-bin = "agent-desktop"
+# 桌面端：仅每日签到。唯一后端 CuaDriver（已授权 com.trycua.driver AX 路径，
+# 不移动光标、不抢焦点）
 cua_driver_bin = "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
 app = "WorkBuddy"
-cdp_port = 9222
-# 永远为 false：不激活窗口、不移动物理鼠标。computer-use 后端只有在显式改 true 才可用。
-allow_focus = false
 
 [daily_checkin]
 enabled = true

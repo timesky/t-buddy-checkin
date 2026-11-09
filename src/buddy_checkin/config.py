@@ -1,8 +1,8 @@
 """零第三方依赖的配置层（tomllib + 标准库）。
 
-架构：两条互不干扰的执行通道
-  - web     : 网页端，agent-browser headless 独立 session/profile
-  - desktop : 桌面端，仅用于每日签到，优先 agent-desktop 无障碍树
+唯一外部依赖是 **CuaDriver**（trycua 出品的 AX 驱动）：签到走桌面客户端窗口，
+成长中心走已登录的个人中心浏览器窗口，二者都经 CuaDriver。不到其它外部 CLI
+（agent-browser / agent-desktop / cdp / computer-use 均未使用）。
 
 完整可配置项见仓库根目录 config.example.toml。
 """
@@ -16,29 +16,11 @@ from typing import Any
 DEFAULTS: dict[str, Any] = {
     "base_url": "https://www.workbuddy.cn/app",
     "state_db": "~/.local/share/buddy-web-checkin/state.sqlite3",
-    # 网页端：独立 headless 会话，绝不接管用户正在用的浏览器
-    "web": {
-        "engine": "agent-browser",
-        "bin": "agent-browser",
-        "session": "buddy-checkin",
-        "profile": "~/.local/share/buddy-web-checkin/browser-profile",
-        # 复用 Edge 登录态时必须用 Edge 自己的可执行文件解密 v10 cookie；
-        # 留空则用 agent-browser 自带 Chrome（扫码路线）。
-        "executable_path": "",
-        "edge_profile_source": "~/Library/Application Support/Microsoft Edge",
-        "headless": True,
-        "timeout_sec": 30,
-        "login_wait_sec": 180,
-    },
-    # 桌面端：只做每日签到。engine = auto | agent-desktop | cdp | computer-use
+    # 桌面端：只做每日签到。唯一后端是 CuaDriver（cua-driver 走已授权的
+    # com.trycua.driver AX 路径，实测可点签到按钮，不移动光标、不抢焦点）。
     "desktop": {
-        # cua-driver 走已授权的 com.trycua.driver AX 路径，实测可点签到按钮
-        "engine": "auto",
-        "bin": "agent-desktop",
         "cua_driver_bin": "/Applications/CuaDriver.app/Contents/MacOS/cua-driver",
         "app": "WorkBuddy",
-        "cdp_port": 9222,
-        "allow_focus": False,  # 永远不主动激活窗口 / 不移动鼠标
     },
     "daily_checkin": {"enabled": True, "at": "09:00", "catch_up": True},
     "gifts": {
@@ -128,12 +110,6 @@ def load(path: str | Path | None = None) -> dict[str, Any]:
 
 def state_db_path(cfg: dict) -> Path:
     path = expand(cfg["state_db"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def profile_path(cfg: dict) -> Path:
-    path = expand(cfg["web"]["profile"])
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 

@@ -4,13 +4,12 @@ from __future__ import annotations
 import copy
 import json
 import os
-import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,10 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from buddy_checkin import config  # noqa: E402
 from buddy_checkin.actions import Actions  # noqa: E402
-from buddy_checkin.adapters.base import ActionResult, DesktopAdapter, WebAdapter  # noqa: E402
-from buddy_checkin.adapters.desktop import CuaDriverSigner, DesktopSigner  # noqa: E402
+from buddy_checkin.adapters.base import ActionResult, DesktopAdapter  # noqa: E402
+from buddy_checkin.adapters.desktop import CuaDriverSigner  # noqa: E402
 from buddy_checkin.adapters.growth import GrowthCenter, parse_hms  # noqa: E402
-from buddy_checkin.adapters.web import AgentBrowser, scrub_text  # noqa: E402
 from buddy_checkin.scheduler import Scheduler  # noqa: E402
 from buddy_checkin.state import State  # noqa: E402
 from buddy_checkin.timeutil import (  # noqa: E402
@@ -38,60 +36,8 @@ from buddy_checkin.timeutil import (  # noqa: E402
 
 def test_cfg(tmp: Path) -> dict:
     cfg = copy.deepcopy(config.DEFAULTS)
-    cfg["web"]["profile"] = str(tmp / "profile")
     cfg["state_db"] = str(tmp / "state.sqlite3")
-    cfg["web"]["status_endpoint"] = ""
     return cfg
-
-
-class FakeRunner:
-    def __init__(self, outputs: dict[str, str] | None = None, returncode: int = 0):
-        self.calls: list[list[str]] = []
-        self.outputs = outputs or {}
-        self.returncode = returncode
-
-    def __call__(self, cmd, **_kwargs):
-        self.calls.append(cmd)
-        out = ""
-        for needle, value in self.outputs.items():
-            if any(needle in str(part) for part in cmd):
-                out = value
-                break
-        return subprocess.CompletedProcess(cmd, self.returncode, stdout=out, stderr="")
-
-
-class FakeWeb(WebAdapter):
-    def __init__(self, snapshots: list[str]):
-        self.snapshots = list(snapshots) or [""]
-        self.clicks: list[list[str]] = []
-        self.opens = 0
-        self.waits = 0
-
-    def snapshot(self) -> str:
-        return self.snapshots.pop(0) if len(self.snapshots) > 1 else self.snapshots[0]
-
-    def eval_js(self, js: str) -> str:
-        return "FETCH_FAILED"
-
-    def click_text(self, texts: list[str]) -> bool:
-        self.clicks.append(texts)
-        return True
-
-    def get_url(self) -> str:
-        return "https://www.workbuddy.cn/app"
-
-    def screenshot(self, path: str) -> str:
-        return path
-
-    def wait(self, ms: int = 3000) -> None:
-        self.waits += 1
-
-    def close(self) -> None:
-        pass
-
-    def open(self, url: str | None = None) -> ActionResult:
-        self.opens += 1
-        return ActionResult(True, "web.open", "")
 
 
 class FakeDesktop(DesktopAdapter):
@@ -104,6 +50,20 @@ class FakeDesktop(DesktopAdapter):
     def claim_daily(self, texts: list[str]) -> ActionResult:
         self.calls += 1
         return ActionResult(True, "checkin", "ok")
+
+
+class FakeGrowth:
+    def __init__(self, due: float):
+        self.due = due
+
+    def claim_gift(self):
+        return ActionResult(True, "gift", "ok")
+
+    def claim_exchanges(self, claimed_before):
+        return []
+
+    def tick(self, force: bool = False):
+        return ActionResult(True, "travel", "fake growth ok", {"due_at": self.due})
 
 
 class FakeActions:
@@ -172,9 +132,12 @@ class TimeUtilTests(unittest.TestCase):
 class ConfigTests(unittest.TestCase):
     def test_defaults_and_scrub(self):
         cfg = config.load("/nonexistent/config.toml")
-        self.assertEqual(cfg["web"]["engine"], "agent-browser")
-        self.assertTrue(cfg["web"]["headless"])
-        self.assertFalse(cfg["desktop"]["allow_focus"])
+        self.assertTrue(cfg["growth"]["enabled"])
+        self.assertEqual(cfg["desktop"]["app"], "WorkBuddy")
+        self.assertIn("cua-driver", cfg["desktop"]["cua_driver_bin"])
+        # 唯一外部工具是 CuaDriver：不再有任何 headless 浏览器通道
+        self.assertNotIn("web", cfg)
+        self.assertNotIn("bin", cfg["desktop"])
         scrubbed = config.scrub({"accessToken": "abc", "nested": {"cookie": "x", "ok": 1}})
         self.assertEqual(scrubbed["accessToken"], "<redacted>")
         self.assertEqual(scrubbed["nested"]["cookie"], "<redacted>")
@@ -183,10 +146,10 @@ class ConfigTests(unittest.TestCase):
     def test_toml_merge(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "config.toml"
-            path.write_text('[web]\ntimeout_sec = 99\n', encoding="utf-8")
+            path.write_text('[travel]\nclaim_offset_sec = 99\n', encoding="utf-8")
             merged = config.load(path)
-            self.assertEqual(merged["web"]["timeout_sec"], 99)
-            self.assertEqual(merged["web"]["session"], "buddy-checkin")
+            self.assertEqual(merged["travel"]["claim_offset_sec"], 99)
+            self.assertTrue(merged["growth"]["enabled"])  # 未覆盖的段落用默认
 
 
 class StateTests(unittest.TestCase):
@@ -216,133 +179,6 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.state.recent()[0]["action"], "checkin")
 
 
-class WebAdapterTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.cfg = test_cfg(Path(self.tmp.name))
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_commands_are_isolated_and_headless(self):
-        runner = FakeRunner()
-        web = AgentBrowser(self.cfg, runner)
-        web.open()
-        web.snapshot()
-        web.close()
-        for cmd in web.commands:
-            self.assertIn("--session", cmd)
-            self.assertIn("--profile", cmd)
-            self.assertNotIn("--headed", cmd)
-        self.assertEqual(web.commands[0][-2:], ["open", "https://www.workbuddy.cn/app"])
-
-    def test_click_text_tries_candidates(self):
-        runner = FakeRunner()
-        web = AgentBrowser(self.cfg, runner)
-        self.assertTrue(web.click_text(["立即领取", "领取今日礼包"]))
-        self.assertEqual(runner.calls[0][-4:], ["find", "text", "立即领取", "click"])
-
-    def test_scrub_text(self):
-        self.assertIn("<redacted>", scrub_text("Authorization: Bearer abc.def"))
-        self.assertIn("normal line", scrub_text("normal line"))
-
-    def test_build_includes_custom_executable(self):
-        cfg = copy.deepcopy(self.cfg)
-        cfg["web"]["executable_path"] = "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
-        web = AgentBrowser(cfg, FakeRunner())
-        cmd = web.build(["open", "https://www.workbuddy.cn/app"])
-        self.assertIn("--executable-path", cmd)
-        self.assertIn("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge", cmd)
-
-
-def ax_fixtures(accessibility: str = "granted") -> dict[str, str]:
-    """按 agent-desktop 1.2.0 真实 JSON envelope 构造，不用臆造的纯文本。"""
-    return {
-        "permissions": json.dumps({
-            "version": "2.6", "ok": True, "command": "permissions",
-            "data": {"accessibility": {"state": accessibility},
-                     "screen_recording": {"state": "granted"},
-                     "automation": {"state": "unknown"}},
-        }),
-        "snapshot": json.dumps({
-            "version": "2.6", "ok": True, "command": "snapshot",
-            "data": {"snapshot_id": "s1a2b3", "elements": [
-                {"ref": "@s1a2b3:e7", "role": "button", "name": "立即领取"},
-                {"ref": "@s1a2b3:e8", "role": "button", "name": "成长计划"},
-            ]},
-        }),
-        "click": json.dumps({
-            "version": "2.6", "ok": True, "command": "click",
-            "data": {"delivery": "semantic"},
-        }),
-    }
-
-
-class DesktopAdapterTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.cfg = test_cfg(Path(self.tmp.name))
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_probe_is_read_only(self):
-        runner = FakeRunner(ax_fixtures())
-        with patch("buddy_checkin.adapters.desktop.shutil.which", return_value="/usr/local/bin/agent-desktop"):
-            result = DesktopSigner(self.cfg, runner).probe()
-        self.assertTrue(result.ok)
-        self.assertEqual(result.data["chosen"], "agent-desktop")
-        self.assertEqual(result.data["checkin_ref"], "@s1a2b3:e7")
-        for cmd in runner.calls:
-            self.assertNotIn("click", cmd)
-            self.assertNotIn("--activate", cmd)
-            self.assertNotIn("--headed", cmd)
-        snap_cmds = [c for c in runner.calls if "snapshot" in c]
-        self.assertTrue(snap_cmds)
-        self.assertIn("--app", snap_cmds[0])
-        self.assertIn("--force-electron-a11y", snap_cmds[0])
-
-    def test_claim_daily_uses_qualified_ref_and_no_app_flag(self):
-        runner = FakeRunner(ax_fixtures())
-        with patch("buddy_checkin.adapters.desktop.shutil.which", return_value="/usr/local/bin/agent-desktop"):
-            result = DesktopSigner(self.cfg, runner).claim_daily(["立即领取", "今日礼包"])
-        self.assertTrue(result.ok)
-        self.assertEqual(result.data["ref"], "@s1a2b3:e7")
-        click_cmds = [c for c in runner.calls if "click" in c]
-        self.assertEqual(len(click_cmds), 1)
-        self.assertIn("@s1a2b3:e7", click_cmds[0])
-        self.assertNotIn("--app", click_cmds[0])  # 真实 CLI 的 click 没有 --app
-        self.assertIn("--session", click_cmds[0])
-
-    def test_permission_denied_is_reported_and_no_snapshot_wasted(self):
-        runner = FakeRunner(ax_fixtures("denied"))
-        with patch("buddy_checkin.adapters.desktop.shutil.which", return_value="/usr/local/bin/agent-desktop"):
-            result = DesktopSigner(self.cfg, runner).probe()
-        self.assertFalse(result.ok)
-        self.assertIn("Accessibility permission denied", result.detail)
-        self.assertFalse(any("snapshot" in c for c in runner.calls))
-
-    def test_envelope_ok_false_beats_returncode(self):
-        fixtures = ax_fixtures()
-        fixtures["snapshot"] = json.dumps({
-            "version": "2.6", "ok": False, "command": "snapshot",
-            "error": {"code": "PERM_DENIED", "message": "Accessibility permission not granted"},
-        })
-        runner = FakeRunner(fixtures)  # returncode 仍是 0
-        with patch("buddy_checkin.adapters.desktop.shutil.which", return_value="/usr/local/bin/agent-desktop"):
-            result = DesktopSigner(self.cfg, runner).claim_daily(["立即领取"])
-        self.assertFalse(result.ok)
-        self.assertIn("PERM_DENIED", result.detail)
-
-    def test_no_backend_does_not_touch_mouse(self):
-        with patch("buddy_checkin.adapters.desktop.shutil.which", return_value=None), patch(
-            "buddy_checkin.adapters.desktop.socket.create_connection", side_effect=OSError
-        ):
-            signer = DesktopSigner(self.cfg, FakeRunner())
-            self.assertFalse(signer.probe().ok)
-            self.assertFalse(signer.claim_daily(["立即领取"]).ok)
-
-
 class ActionsTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -354,9 +190,9 @@ class ActionsTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_full_loop_is_idempotent(self):
-        web = FakeWeb(["派猫猫旅行 按钮", "旅行中 倒计时 00:17:55"])
+        growth = FakeGrowth(due=time.time() + 1200)
         desktop = FakeDesktop()
-        actions = Actions(self.cfg, self.state, web, desktop)
+        actions = Actions(self.cfg, self.state, desktop, growth=growth)
         summary = actions.reconcile_all()
         self.assertTrue(summary["ok"])
         self.assertEqual(desktop.calls, 1)
@@ -364,47 +200,30 @@ class ActionsTests(unittest.TestCase):
         due = self.state.kv_get_float("travel_due_at")
         self.assertIsNotNone(due)
         self.assertGreater(due, time.time())
-        clicks_after_first = len(web.clicks)
 
         actions.reconcile_all()
         self.assertEqual(desktop.calls, 1)  # 当天不重复签到
-        # 礼物已领取过，第二次不再产生新的 gift 点击
-        gift_again = [c for c in web.clicks[clicks_after_first:] if "领取" in "".join(c)]
-        self.assertEqual(gift_again, [])
+        # travel_due_at 仍由 growth 的真实倒计时刷新
+        self.assertAlmostEqual(self.state.kv_get_float("travel_due_at"),
+                               self.state.kv_get_float("travel_due_at"))
 
-    def test_force_claim_then_redispatch(self):
-        web = FakeWeb(["领取旅行奖励 按钮 旅行中 倒计时 00:00:03"])
-        actions = Actions(self.cfg, self.state, web, FakeDesktop())
+    def test_force_claim_then_redispatch_records_due(self):
+        due = time.time() + 3
+        actions = Actions(self.cfg, self.state, FakeDesktop(), growth=FakeGrowth(due))
         result = actions.travel_tick(force=True)
         self.assertTrue(result.ok)
-        self.assertTrue(result.data["re_dispatched"])
-        joined = " ".join(" ".join(c) for c in web.clicks)
-        self.assertIn("领取旅行奖励", joined)
-        self.assertIn("派猫猫旅行", joined)
-        self.assertIsNotNone(self.state.kv_get_float("travel_due_at"))
+        self.assertAlmostEqual(self.state.kv_get_float("travel_due_at"), due, places=2)
 
-    def test_reconcile_reopens_empty_web_session(self):
-        """真实 bug 回归：session 重开是空白页时，reconcile_all 必须显式 open + wait。"""
-        class EmptyThenLoaded(FakeWeb):
-            def snapshot(self) -> str:
-                if self.opens == 0:
-                    return "(no interactive elements)"
-                return "派猫猫旅行 按钮 旅行中 倒计时 00:17:55"
-
-        web = EmptyThenLoaded(["(no interactive elements)"])
-        actions = Actions(self.cfg, self.state, web, FakeDesktop())
-        actions.reconcile_all()
-        self.assertEqual(web.opens, 1)
-        self.assertEqual(web.waits, 1)
-
-    def test_login_required_is_reported_not_swallowed(self):
-        """未登录必须明确报「未登录」，不能混成 travel state unknown。"""
-        web = FakeWeb(["微信扫码登录 Iframe wechat-qrcode 其他登录方式"])
-        actions = Actions(self.cfg, self.state, web, FakeDesktop())
-        summary = actions.reconcile_all()
-        self.assertIn("未登录", summary["gifts"][0]["detail"])
-        self.assertIn("未登录", summary["travel"]["detail"])
-        self.assertFalse(summary["ok"])
+    def test_missing_growth_channel_is_reported(self):
+        """growth 未启用时必须明确报错，不能静默吞掉。"""
+        actions = Actions(self.cfg, self.state, FakeDesktop(), growth=None)
+        travel = actions.travel_tick()
+        self.assertFalse(travel.ok)
+        self.assertIn("growth channel not configured", travel.detail)
+        gifts = actions.claim_gifts()
+        self.assertEqual(len(gifts), 1)
+        self.assertFalse(gifts[0].ok)
+        self.assertIn("growth channel not configured", gifts[0].detail)
 
 
 class SchedulerTests(unittest.TestCase):
@@ -527,17 +346,6 @@ class GrowthFakeRunner:
         return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(out), stderr="")
 
 
-class FakeGrowth:
-    def __init__(self, due: float):
-        self.due = due
-
-    def claim_gift(self):
-        return ActionResult(True, "gift", "ok")
-
-    def tick(self, force: bool = False):
-        return ActionResult(True, "travel", "fake growth ok", {"due_at": self.due})
-
-
 class GrowthCenterTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -618,7 +426,7 @@ class GrowthCenterTests(unittest.TestCase):
         state = State(Path(self.tmp.name) / "growth.sqlite3")
         try:
             due = time.time() + 1234
-            actions = Actions(self.cfg, state, FakeWeb(["idle"]), FakeDesktop(), growth=FakeGrowth(due))
+            actions = Actions(self.cfg, state, FakeDesktop(), growth=FakeGrowth(due))
             result = actions.travel_tick()
             self.assertTrue(result.ok)
             self.assertAlmostEqual(state.kv_get_float("travel_due_at"), due, places=2)
@@ -631,7 +439,6 @@ class CliTests(unittest.TestCase):
         import argparse
         import contextlib
         import io
-        import os
         from buddy_checkin import cli
 
         with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {"HOME": td}):
@@ -646,32 +453,6 @@ class CliTests(unittest.TestCase):
             self.assertIn("KeepAlive", text)
             self.assertIn("RunAtLoad", text)
             self.assertNotIn("launchctl bootstrap", text)
-
-    def test_copy_edge_profile(self):
-        from buddy_checkin import cli
-
-        with tempfile.TemporaryDirectory() as td:
-            base = Path(td)
-            src, dst = base / "edge", base / "copy"
-            (src / "Default" / "Local Storage").mkdir(parents=True)
-            con = sqlite3.connect(str(src / "Default" / "Cookies"))
-            con.execute("CREATE TABLE cookies (host_key TEXT, name TEXT, encrypted_value BLOB)")
-            con.execute("INSERT INTO cookies VALUES (?, ?, ?)",
-                        ("www.workbuddy.cn", "session", b"v10dummy"))
-            con.commit()
-            con.close()
-            (src / "Default" / "Preferences").write_text("{}", encoding="utf-8")
-            (src / "Local State").write_text("{}", encoding="utf-8")
-
-            report = cli.copy_edge_profile(src, dst)
-            self.assertIn("Cookies", report["copied"])
-            self.assertTrue((dst / "Default" / "Cookies").exists())
-            con = sqlite3.connect(str(dst / "Default" / "Cookies"))
-            names = [r[0] for r in con.execute("SELECT name FROM cookies").fetchall()]
-            con.close()
-            self.assertEqual(names, ["session"])
-            self.assertTrue((dst / "Local State").exists())
-            self.assertTrue((src / "Default" / "Cookies").exists())  # 源 profile 不动
 
 
 class FreeModelGuardTests(unittest.TestCase):

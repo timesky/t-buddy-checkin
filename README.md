@@ -7,17 +7,17 @@
 
 # buddy-web-checkin
 
-独立的每日签到 / 礼物兑换 / 派遣自动化技能。**只有每日签到依赖 WorkBuddy 桌面客户端**，其余全部在网页端完成；两条通道都在后台隔离执行，**不弹窗、不激活窗口、不抢鼠标键盘、不碰你正在用的浏览器**。
+独立的每日签到 / 礼物兑换 / 派遣自动化技能。**只有每日签到依赖 WorkBuddy 桌面客户端**，领礼物 / 派遣 / 兑换在成长中心页面完成。全部操作走 **CuaDriver** 的 AX 通道：不弹窗、不激活窗口、不抢鼠标键盘、不碰你正在用的浏览器。
 
-零第三方 Python 包（仅标准库 `tomllib` / `sqlite3` / `zoneinfo`）。外部 CLI 依赖：`agent-browser`（仅 `setup` 扫码脚手架用，已随 WorkBuddy 安装或在 `tools/` 本地安装）、可选 `agent-desktop`（桌面端回退引擎，Apache-2.0，实测 TCC 未授权故未启用）；GUI 应用依赖：**CuaDriver**（成长中心 + 桌面签到 AX 通道，已授权 `com.trycua.driver`，是本技能唯一实际可用的自动化后端）。**成长中心不限定浏览器**：从 WorkBuddy 点开进入哪个浏览器（Chrome / Edge / Safari 等），就在哪个浏览器操作，不需要 Edge。不读取、不解密、不导出任何客户端登录态或令牌。安装与核查见下方「第三方依赖安装」一节。
+零第三方 Python 包（仅标准库 `tomllib` / `sqlite3` / `zoneinfo`）。**唯一外部工具是 CuaDriver**（trycua 出品的 GUI 应用，已授权 `com.trycua.driver`）：签到操作 WorkBuddy 客户端窗口，成长中心操作你从 WorkBuddy 点开的浏览器窗口（任意浏览器，未登录只提示、绝不自动登录）。不读取、不解密、不导出任何客户端登录态或令牌。曾经的 `agent-browser` / `agent-desktop` / CDP / computer-use 通道均已移除（详见文末变更记录）。
 
 ## Git 管理
 
 代码托管于 `https://github.com/timesky/t-buddy-checkin`（`main` 分支），本机通过 SSH key 读写（`~/.ssh/id_rsa_tangming` 与 `lcc_op_rsa`，均为 `timesky` 身份，已验证可推送）。
 
 - 远程为空仓库，首次推送即创建 `main`：`git push -u origin main`。
-- 受 `.gitignore` 控制的本地产物**不入库**：`config.toml`（含机器路径）、`tools/node_modules/`（agent-desktop 依赖）、`login-qr.png`、`last-checkin-result.json`、`discovered.json`、`progress.txt`、`*.command`、`*.sqlite3`、浏览器登录态。
-- 新克隆后：`cp config.example.toml config.toml` 按需改；`tools/node_modules` 仅在使用 agent-desktop 引擎时需另装（`npm install --prefix tools agent-desktop`），当前默认 cua-driver 不需要。
+- 受 `.gitignore` 控制的本地产物**不入库**：`config.toml`（含机器路径）、`tools/node_modules/`、`last-checkin-result.json`、`discovered.json`、`progress.txt`、`*.command`、`*.sqlite3`。
+- 新克隆后：`cp config.example.toml config.toml` 按需改即可，无 npm 安装步骤。
 
 ## 免费模型约束（重要）
 
@@ -30,36 +30,25 @@
 
 说明：脚本无法读取当前选中的模型，故以运维侧显式确认作为放行闸门，避免误在付费模型下运行。
 
-## 第三方依赖安装（安装技能时必跑）
+## 第三方依赖（安装技能时必跑 `deps check`）
 
-本技能除 Python 标准库外，依赖若干**外部 CLI / GUI 应用**。它们**不会**随技能仓库自动装好，
-且 mock 单测测不到、只在真实执行才暴露缺失。因此 **安装（或重新拉取）本技能后，agent 必须先跑
-下面两步**，确认第三方依赖已安装并在 PATH / 指定路径可用，再首次运行 `once` / `daemon`：
+本技能除 Python 标准库外，**只依赖一个外部工具：CuaDriver**。安装（或重新拉取）本技能后，agent 必须先跑：
 
 ```bash
-./run.sh deps install   # 装经 npm 管理的依赖；GUI 依赖给出手动安装指引
-./run.sh deps check     # 逐项检查，全部 OK 才放行；缺失则返回非 0 退出码
+./run.sh deps check   # 逐项检查，全部 OK 才放行；缺失则返回非 0 退出码并给安装指引
 ```
 
-`deps check` 的依赖矩阵（2026-11-09 按实际调用核对）：
+依赖矩阵（2026-11-09 按实际调用核对）：
 
 | 依赖 | 类型 | 必需 | 用途 | 安装方式 |
 |---|---|---|---|---|
 | Python ≥ 3.11（推荐 3.13） | 运行时 | ✅ | 标准库 tomllib/sqlite3/zoneinfo | 系统自带 / python.org |
-| CuaDriver | GUI 应用 | ✅ | 成长中心（任意浏览器 AX）+ 桌面签到 AX 通道，**本技能唯一实际可用的自动化后端** | 安装 CuaDriver.app，并在系统设置→隐私与安全性→辅助功能 授权其驱动 |
-| 浏览器（Chrome/Edge/Safari 任一） | GUI 应用 | 否（已有其一即可） | 成长中心页面载体；不限定，用你惯用的浏览器从 WorkBuddy 点开即可 | 无需专门安装 Edge |
-| agent-browser | npm-cli | ✅ | 仅 `setup` 扫码脚手架；功能运行不经此 | `cd tools && npm install`，或 `npm install -g agent-browser` |
-| agent-desktop | npm-cli | 仅 agent-desktop 引擎时 | 桌面端回退引擎（实测 TCC 未授权，未启用） | `cd tools && npm install` |
-
-> 说明：CuaDriver 是 GUI 应用，`deps install` 只打印手动安装与授权指引，不会自动下载。
-> 成长中心不限定浏览器，故 Edge 不再是必需依赖。`deps check` 会区分 `required`（缺失即报错）
-> 与 `optional`（缺失仅警告），并据 `config.toml` 里各通道开关动态判定。
+| CuaDriver | GUI 应用 | ✅ | 签到（WorkBuddy 客户端 AX）+ 成长中心（浏览器窗口 AX），**唯一自动化后端** | 安装 CuaDriver.app，并在 系统设置→隐私与安全性→辅助功能 授权其驱动 |
+| 浏览器（Chrome/Edge/Safari 任一） | GUI 应用 | 否（已有其一即可） | 成长中心页面载体，用你惯用的浏览器从 WorkBuddy 点开即可 | 无需专门安装 |
 
 ## 签到通道（2026-11-09 真实跑通）
 
-系统级 TCC 数据库给出决定性答案：`com.trycua.driver` 是 `auth=2`（已授权），而 `com.apple.Terminal` 和 `com.tencent.workbuddy.mac` 都是 `auth=0`。所以正解是 **CuaDriver**（第一轮就提到的 computer use），不是 agent-desktop。
-
-`config.toml` 已设 `desktop.engine = "cua-driver"`，流程：
+系统级 TCC 数据库给出决定性答案：`com.trycua.driver` 是 `auth=2`（已授权），而 `com.apple.Terminal` 和 `com.tencent.workbuddy.mac` 都是 `auth=0`。所以唯一可行后端是 **CuaDriver**。流程：
 
 1. `cua-driver call list_windows` 找 WorkBuddy 可见主窗口（实测 `pid=452` / `window_id=66`）。
 2. `get_window_state` 重新索引，定位 Buddy 加油站卡片里的 `AXButton "立即领取"`（实测 `element_index=65`）。
@@ -98,14 +87,13 @@
 ## 架构
 
 ```
-每日签到 ──> desktop 通道 ──> agent-desktop 无障碍树 ref（首选，后台）
-                          └─> CDP 连 Electron 渲染进程，eval 穿透 Shadow DOM（备选）
-                          └─> computer-use 截屏点坐标（默认禁用，会抢焦点）
+每日签到 ──────────> CuaDriverSigner ──> cua-driver AX 通道
+                     （WorkBuddy 客户端窗口，element_index 点击 + 复核）
 
-礼物兑换 / 派遣 / 到期领奖 ──> web 通道 ──> agent-browser
-                                          headless + --session 隔离 + --profile 独立登录态
+礼物兑换 / 派遣 / 到期领奖 ──> GrowthCenter ──> cua-driver AX 通道
+                              （任意浏览器里已登录的成长中心窗口）
 
-精确到期 ──> 读 end_at / remaining_seconds / 页面倒计时
+精确到期 ──> 派遣后从「旅行倒计时 HH:MM:SS」读真实剩余秒数
          ──> 换算成北京时间绝对时间戳，写入 SQLite
          ──> heapq 调度器单次等到期 ──> 领奖 ──> 立刻再派遣 ──> 生成下一次到期
 ```
@@ -119,56 +107,27 @@ cd /path/to/buddy-web-checkin
 cp config.example.toml config.toml      # 按需修改
 chmod +x run.sh
 
-./run.sh deps install  # 安装第三方依赖（agent-browser / agent-desktop 经 npm，GUI 给指引）
-./run.sh deps check    # 必跑：确认所有必需依赖已就绪，否则后续命令会在真实环境才暴露缺失
+./run.sh deps check    # 必跑：确认 CuaDriver 已安装并授权，否则后续命令会在真实环境才暴露缺失
 
-./run.sh probe        # 只读探测：网页端入口 + 桌面端可用后端，写 discovered.json
-./run.sh setup        # headless 打开登录页，把二维码截图存到 login-qr.png，手机扫码
 ./run.sh status       # 只读查看下次签到 / 旅行到期时间
-./run.sh checkin-now  # 只做每日签到（桌面端），不碰网页端
+./run.sh checkin-now  # 只做每日签到（桌面端）
 ./run.sh once         # 手动跑一轮完整闭环，确认无误
 ./run.sh daemon       # 常驻精确调度（Ctrl-C 退出）
 ./run.sh install-launchd   # 只写 LaunchAgent plist，不自动加载
 ```
 
-`setup` 的扫码是**唯一需要你动手的登录动作**：headless 页面截图出二维码，登录态只保存在 `web.profile` 这个独立目录里，和你日常 Chrome 完全隔离。
+成长中心的登录**在你自己的浏览器里完成**：从 WorkBuddy 点开「个人中心」进入任意浏览器并登录，工具直接操作该窗口；检测到未登录时只会提示你登录，不做任何自动登录。
 
-## 复用 Edge 已登录状态（免扫码）
-
-如果 Edge 里已经登录过 `www.workbuddy.cn`，可以不扫码：
-
-```bash
-# 必须在 macOS 终端里直接运行，不要经由 WorkBuddy / 沙箱会话
-cd /Users/hy_002/WorkBuddy/2026-11-08-11-27-37/buddy-web-checkin
-./run.sh setup-from-edge
-```
-
-`config.toml` 的 `web.executable_path` 已指向 Edge 可执行文件。命令把 Edge 源 profile 的 `Cookies`（sqlite 一致性快照）、`Preferences`、`Secure Preferences`、`Local Storage`、`Local State` **只读复制**到项目独立 profile，再 `agent-browser close --all` 冷启动（daemon 单例，不冷启动 `--executable-path` 会被忽略），最后用 Edge 打开 `/app` 验证 URL 是否还在 `/login`。必须用 Edge 自己的可执行文件：macOS 上 v10 cookie 由 Keychain 的 `Microsoft Edge Safe Storage` 派生密钥加密，Chrome 用的是 `Chrome Safe Storage`，跨浏览器读会解密失败。源 profile 全程只读、不改动，也不启动或激活你正在用的 Edge 窗口。
-
-**实测边界（2026-11-09）**：Edge Default profile 确认有 `session` / `session_2` / `KEYCLOAK_SESSION` / `AUTH_SESSION_ID`（均 httpOnly，主 `session` 有效期到 11/15 11:44 北京时间）。但在 WorkBuddy 沙箱会话内执行时，`security find-generic-password -w` 读 Keychain 密码被 SIGTERM，Edge 启动时把解不开的 httpOnly 认证 cookie 全部丢弃，URL 仍落回 `/login`；手动 CDP 端口被代理拦成 502，Edge headless 自身也因 sandbox 初始化失败崩溃。UA 已确认是 `Edg/157`，复制与诊断代码路径均正确。**在你自己的终端（非沙箱）跑没有这个限制**，Keychain 可正常访问（可能弹一次授权）。若终端里仍失败（例如 Edge 156 的 app-bound encryption），把 `config.toml` 的 `executable_path` 清空，改用 `./run.sh setup` 扫码。
-
-## 需要人工的四件事
+## 需要人工的两件事
 
 | 事项 | 为什么必须人工 | 具体做法 |
 |---|---|---|
-| 网页端扫码登录一次 | 账号归属 | `./run.sh setup` → 扫 `login-qr.png` |
-| 授予 macOS 辅助功能权限 | 读取无障碍树 | CuaDriver（com.trycua.driver）实测已 `auth=2`，无需再授权；仅当改用 agent-desktop 引擎时才需 `tools/node_modules/.bin/agent-desktop permissions --guide` |
-| 确认签到按钮在 AX 树可见 | Electron/Shadow DOM 未必暴露 | 授权后 `./run.sh probe`，看 `desktop.checkin_ref` 有没有值；没有就走 CDP |
-| （可选）CDP 重启客户端 | 必须带 `--remote-debugging-port` 启动，重启会中断当前对话 | 择时退出后执行 `open -a WorkBuddy --args --remote-debugging-port=9222` |
-
-### 签到后端（优先级）
-
-> 实测更新（2026-11-09）：当前可用后端是 **CuaDriver**（`com.trycua.driver`，TCC `auth=2`）；agent-desktop 仅作为 `engine` 回退，且需要额外授权。
-
-1. **CuaDriver**（当前默认）：`config.toml` 设 `desktop.engine = "cua-driver"`，走 `com.trycua.driver` 的 AX 通道，不移动光标、不抢焦点，已验证可完成真实签到。
-2. **CDP**：社区已下架的签到技能就是用 CDP 穿透 Shadow DOM。本项目用 `agent-browser --cdp 9222 eval` 递归遍历 `shadowRoot` 按文字点击。需要客户端带调试端口启动。
-3. **computer-use**：会移动物理鼠标，与「不影响人工操作」冲突，`desktop.allow_focus` 默认 `false`，只有显式改 true 才启用。
-
-**必须先验证**：`agent-desktop` 对 Electron + Shadow DOM 内的「立即领取」是否可见。跑 `./run.sh probe`，看 `desktop.snapshot` 里有没有签到按钮的 ref；没有就走 CDP 路线。
+| 在浏览器里登录 WorkBuddy 个人中心 | 账号归属 | 从 WorkBuddy 点开「个人中心」，在你惯用的浏览器里登录一次 |
+| 授予 macOS 辅助功能权限（CuaDriver） | 读取无障碍树 | CuaDriver（com.trycua.driver）实测已 `auth=2`，通常无需再授权；新机器上跑 `cua-driver permissions grant` |
 
 ## 精确到期与补偿
 
-- 优先读接口 `end_at`（绝对时间）；没有则读 `remaining_seconds` 或页面倒计时 `00:17:55`，用服务端时间校准后算出绝对到期时间戳。
+- 派遣后从页面倒计时读真实剩余秒数（派遣时长每次不同，绝不套固定间隔）。
 - 到期后延后 `claim_offset_sec`（默认 3 秒）再领，避免服务端尚未结算。
 - 领奖成功后立刻再次派遣，并重新读取到期时间，形成闭环。
 - 关机 / 睡眠期间错过的到期时间，在下次启动时被夹到 `now`，**立即补领**，不会白跑一趟。
@@ -179,39 +138,29 @@ cd /Users/hy_002/WorkBuddy/2026-11-08-11-27-37/buddy-web-checkin
 - 每次领取经 SQLite `(北京时间日期, 类型, 项目)` 唯一键去重，重启、重跑、定时重叠都不会重复领。
 - 所有命令输出经脱敏，含 token / cookie / authorization 的行替换为 `<redacted>`；凭据不落盘、不进日志。
 - 礼物兑换有 `allow_keywords` / `deny_keywords` 白黑名单，默认屏蔽「去完成 / 充值 / 购买 / 开通 / 升级」等消费类按钮。
-- 桌面端命令从不带 `--activate`，网页端从不带 `--headed`（除非你主动改配置）。
+- AX 点击不移动光标、不激活窗口；浏览器窗口只读已登录页面，不注入 cookie、不接管会话。
 - 仅供本人账号、按页面当期规则使用；活动入口、额度、字段会随版本变化，以实际页面为准。
 
 ## 许可
 
-本项目代码无第三方依赖。调用的外部 CLI：`agent-browser` 0.27.0（Apache-2.0）、`agent-desktop`（Apache-2.0）。依赖树中不含 BUSL / FSL / PolyForm-NC 等限制性许可。
+本项目代码零第三方依赖。调用的唯一外部工具 CuaDriver 为独立 GUI 应用（其自身许可见 trycua 官方）。依赖树中不含 BUSL / FSL / PolyForm-NC 等限制性许可。
 
 ## 故障排查
 
 | 现象 | 检查 |
 |---|---|
-| `probe` 显示 desktop 后端 none | 装 agent-desktop 并授权辅助功能，或重启客户端开 9222 |
-| 签到按钮找不到 | Shadow DOM 未在 AX 树暴露 → 改 `desktop.engine = "cdp"` |
-| 网页端一直停在登录页 | 重跑 `./run.sh setup` 扫码；确认 `web.profile` 目录可写 |
-| 到期时间不准 | 在 `config.toml` 填 `web.status_endpoint` 使用结构化 `end_at` |
-| 领取没到账 | `./run.sh status` 看运行日志；`daily_checkin.catch_up` 与 `travel.claim_offset_sec` 可调 |
+| `deps check` 报 CuaDriver MISSING | 安装 CuaDriver.app 并 `cua-driver permissions grant` 授权辅助功能 |
+| 签到报 WorkBuddy main window not found | 确认 WorkBuddy 客户端已打开且主窗口可见 |
+| 成长中心报 login_required | 在浏览器里登录 WorkBuddy 个人中心后重跑（工具不自动登录） |
+| 成长中心报 growth-center window not found | 从 WorkBuddy 点开「个人中心」，让页面在浏览器里可见 |
+| 到期时间不准 | `growth.claim_offset_sec` 可调；确认派遣后读到了真实倒计时 |
+| 领取没到账 | `./run.sh status` 看运行日志；`daily_checkin.catch_up` 可调 |
 
-## 实际执行记录（2026-11-09）
+## 变更记录：移除未使用的工具（2026-11-09）
 
-真实跑 `./run.sh once` 暴露了 4 个假适配器单测抓不到的问题，已全部修复并补回归测试：
+早期版本曾内置多条候选通道，真实执行后确认只有 CuaDriver 可用，其余全部移除以免混淆：
 
-1. **`once` / `daemon` 从不打开网页** → `travel` 只读到 `(no interactive elements)`。修：`Actions.ensure_web_ready()` 在空快照时 `open` + `wait`，并加 `test_reconcile_reopens_empty_web_session`。
-2. **`setup` 立刻截图只拿到骨架屏 + spinner**，二维码不可扫。修：`wait_for_login_page()` 轮询直到 AX 快照出现 `Iframe "wechat-qrcode"` 再截图；实测等待后二维码清晰完整。
-3. **未登录被误报成 `travel state unknown`**。修：识别登录页特征，明确返回 `login_required` 与 `web session not logged in; run ./run.sh setup first`。
-4. **桌面端适配器用了臆造的命令格式**（`click ... --app`、裸 `e7` ref、假定纯文本输出）。修：按 agent-desktop 1.2.0 真实 JSON envelope、全限定 ref `@s1a2b3:e7`、`--session` 一致性重写，并解析 envelope 的 `ok` 而不是只看 returncode；测试 fixture 换成真实 envelope 形状。
-5. **`run.sh` 不切换工作目录** → `config.toml` 从未被加载（`login_wait_sec` 与本地 agent-desktop 路径全部失效）。修：run.sh 加 `cd "$DIR"`，`config.load()` 默认路径改为项目根而非 cwd；实测 `status` 现在显示 `桌面端后端: agent-desktop`。
-6. **`probe` 不等待重定向** → 把瞬间的 `/app` 误读成已登录。修：`probe()` 在 open 后 `wait(5000)`；实测等待后 URL 仍落回 `/login`，确认未登录。
-
-真实探测结论：
-
-- 网页端未登录跳 `www.workbuddy.cn/login/?platform=agents&state=0&redirect_uri=...`；登录页 AX 快照含 `Iframe "wechat-qrcode" [ref=e11]`，另有企业微信 / 手机号 / SSO / QQ / 邮箱入口。`open` 后立刻读 URL 会短暂显示 `/app`，5 秒后才落到 `/login`，因此所有探测都必须等待渲染稳定。
-- `agent-desktop permissions` 实测：`accessibility: denied`、`screen_recording: denied`、`automation: unknown`；`snapshot --app WorkBuddy` 返回 `PERM_DENIED: Accessibility permission not granted`。
-- 沙箱内 `osascript` 读 System Events 被直接 SIGTERM，同向印证辅助功能被拦。
-- 因此**桌面端签到的唯一阻塞是 macOS 辅助功能授权**，不是代码问题；网页端唯一阻塞是扫码登录。
-
-`login-qr.png` 只在 `setup` 运行窗口内有效（窗口由 `web.login_wait_sec` 控制，当前 600 秒）。**首次 10 分钟窗口已超时、无人扫码，该图已作废**，不要扫旧图；准备好后执行 `./run.sh setup` 重新生成，扫描新图即可。
+- **`agent-browser`**（headless 浏览器 + `setup` 扫码 / `setup-from-edge` 复用 Edge 登录态 / `probe` 探测）：已被「从 WorkBuddy 点开浏览器 + 未登录提示」取代，代码与 `web` 配置段一并删除。
+- **`agent-desktop`**（桌面端回退引擎）：TCC 授权对象不是宿主进程，实测 `PERM_DENIED`，从未可用，代码与 npm 依赖一并删除。
+- **CDP / computer-use**（桌面端备选）：前者需带调试端口重启客户端、后者会移动物理鼠标，均删除。
+- `desktop.engine` 配置项随之移除——桌面端后端只有 CuaDriver，无需选择。

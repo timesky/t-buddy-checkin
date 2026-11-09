@@ -21,36 +21,8 @@ class ActionResult:
         }
 
 
-class WebAdapter:
-    """网页端，headless 独立会话。"""
-
-    def open(self, url: str | None = None) -> ActionResult:
-        raise NotImplementedError
-
-    def snapshot(self) -> str:
-        raise NotImplementedError
-
-    def eval_js(self, js: str) -> str:
-        raise NotImplementedError
-
-    def click_text(self, texts: list[str]) -> bool:
-        raise NotImplementedError
-
-    def get_url(self) -> str:
-        raise NotImplementedError
-
-    def screenshot(self, path: str) -> str:
-        raise NotImplementedError
-
-    def wait(self, ms: int = 3000) -> None:
-        raise NotImplementedError
-
-    def close(self) -> None:
-        raise NotImplementedError
-
-
 class DesktopAdapter:
-    """桌面端，仅用于每日签到；默认后台执行，不激活窗口、不移动鼠标。"""
+    """桌面端，仅用于每日签到；后台执行，不激活窗口、不移动鼠标。"""
 
     def probe(self) -> ActionResult:
         raise NotImplementedError

@@ -1,228 +1,27 @@
 """桌面端签到适配器：唯一依赖 WorkBuddy 客户端的环节。
 
-按 agent-desktop 1.2.0 真实 CLI 校准（不是臆测的命令格式）：
-  - 每个命令输出一个 JSON envelope：{"version","ok","command","data"|"error"}
-  - snapshot: `snapshot --app <app> -i --compact --force-electron-a11y --session <s>`
-  - ref 是全限定 `@<snapshot_id>:eN`，UI 变化后即失效，必须重新 snapshot
-  - click: `click <qualified_ref> --session <s>`，click **没有** --app 参数
-  - 默认 strict headless semantic delivery，不激活窗口、不移动光标
+只用 **CuaDriver**（trycua 出品，com.trycua.driver AX 通道）——本机唯一拿到 TCC
+辅助功能授权（auth=2）的自动化后端。其它候选（agent-desktop / cdp / computer-use）
+均未授权、未使用，已从本技能移除。
 
-后端优先级：agent-desktop -> CDP(eval 穿透 Shadow DOM) -> computer-use(默认禁用)。
+实测 2026-11-09：WorkBuddy 客户端 AX 树的 Buddy 加油站卡片里含
+AXButton "立即领取"；用 element_index 点击走 AX press，
+不移动光标、不抢焦点，不干扰人工操作。点击后卡片与按钮消失即签到成功。
 """
 from __future__ import annotations
 
 import json
-import shutil
-import socket
 import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
 from .base import ActionResult, DesktopAdapter
 
-SHADOW_CLICK_JS = """(() => {
-  const words = %s;
-  function walk(root, depth) {
-    if (!root || depth > 12) return null;
-    for (const el of root.querySelectorAll('*')) {
-      const t = (el.innerText || el.textContent || '').trim();
-      if (t && t.length < 40 && words.some(w => t.includes(w))) {
-        const clickable = el.tagName === 'BUTTON'
-          || el.getAttribute('role') === 'button'
-          || typeof el.onclick === 'function';
-        if (clickable) { el.click(); return t; }
-      }
-      if (el.shadowRoot) {
-        const hit = walk(el.shadowRoot, depth + 1);
-        if (hit) return hit;
-      }
-    }
-    return null;
-  }
-  return walk(document, 0) || 'NOT_FOUND';
-})()"""
-
-_LABEL_KEYS = ("name", "label", "title", "value", "description", "text", "role_description")
-
-
-def find_ref(payload: Any, keywords: list[str]) -> str | None:
-    """在结构化的 AX 树 JSON 里按可见名称找全限定 ref。"""
-    stack: list[Any] = [payload]
-    while stack:
-        cur = stack.pop()
-        if isinstance(cur, dict):
-            label = " ".join(str(cur.get(k, "") or "") for k in _LABEL_KEYS)
-            ref = cur.get("ref")
-            if isinstance(ref, str) and ref.startswith("@") and any(w in label for w in keywords):
-                return ref
-            stack.extend(v for v in cur.values() if isinstance(v, (dict, list)))
-        elif isinstance(cur, list):
-            stack.extend(v for v in cur if isinstance(v, (dict, list)))
-    return None
-
-
-class DesktopSigner(DesktopAdapter):
-    def __init__(self, cfg: dict, runner: Callable[..., Any] | None = None) -> None:
-        desk = cfg["desktop"]
-        self.engine = desk["engine"]
-        self.bin = desk["bin"]
-        self.app = desk["app"]
-        self.cdp_port = int(desk["cdp_port"])
-        self.allow_focus = bool(desk["allow_focus"])
-        self.session = "buddy-checkin"
-        self.runner = runner or subprocess.run
-        self.commands: list[list[str]] = []
-
-    # ---- 执行与 JSON envelope ----------------------------------------------
-    def _exec(self, cmd: list[str]) -> tuple[bool, str]:
-        self.commands.append(cmd)
-        try:
-            proc = self.runner(cmd, capture_output=True, text=True, timeout=30)
-        except (OSError, subprocess.SubprocessError) as exc:
-            return False, f"command failed: {exc}"
-        out = (getattr(proc, "stdout", "") or "").strip()
-        err = (getattr(proc, "stderr", "") or "").strip()
-        ok = getattr(proc, "returncode", 1) == 0
-        return ok, out if ok else (out + "\n" + err)[:800]
-
-    def _exec_json(self, cmd: list[str]) -> tuple[bool, str, Any]:
-        rc_ok, out = self._exec(cmd)
-        try:
-            envelope = json.loads(out)
-        except (TypeError, ValueError):
-            return rc_ok, out[:800], None
-        if not isinstance(envelope, dict):
-            return rc_ok, out[:800], None
-        ok = bool(envelope.get("ok", rc_ok))
-        error = envelope.get("error") or {}
-        message = str(error.get("message", "")) if isinstance(error, dict) else str(error)
-        code = str(error.get("code", "")) if isinstance(error, dict) else ""
-        return ok, (f"{code} {message}".strip() or "ok"), envelope.get("data")
-
-    # ---- 后端可用性 ---------------------------------------------------------
-    def _cdp_open(self) -> bool:
-        try:
-            with socket.create_connection(("127.0.0.1", self.cdp_port), timeout=0.3):
-                return True
-        except OSError:
-            return False
-
-    def backends(self) -> dict[str, bool]:
-        return {
-            "agent-desktop": shutil.which(self.bin) is not None,
-            "cdp": self._cdp_open(),
-            "computer-use": self.allow_focus,
-        }
-
-    def _choose(self) -> str | None:
-        available = self.backends()
-        if self.engine != "auto":
-            return self.engine if available.get(self.engine) else None
-        for name in ("agent-desktop", "cdp", "computer-use"):
-            if available.get(name):
-                return name
-        return None
-
-    def permissions(self) -> dict[str, Any]:
-        """只读权限报告，不弹系统对话框。"""
-        ok, _msg, data = self._exec_json([self.bin, "permissions"])
-        return data if ok and isinstance(data, dict) else {}
-
-    def _ax_snapshot(self) -> tuple[bool, str, Any]:
-        # -i 只看可交互节点；--force-electron-a11y 针对 Chromium/Electron 渲染器
-        return self._exec_json(
-            [
-                self.bin, "snapshot", "--app", self.app,
-                "-i", "--compact", "--force-electron-a11y",
-                "--session", self.session, "--timeout-ms", "10000",
-            ]
-        )
-
-    # ---- 只读探测 -----------------------------------------------------------
-    def probe(self) -> ActionResult:
-        available = self.backends()
-        chosen = self._choose()
-        data: dict[str, Any] = {
-            "chosen": chosen,
-            "backends": available,
-            "allow_focus": self.allow_focus,
-        }
-        if chosen == "agent-desktop":
-            perms = self.permissions()
-            data["permissions"] = {
-                k: (v.get("state") if isinstance(v, dict) else v) for k, v in perms.items()
-            }
-            accessibility = data["permissions"].get("accessibility")
-            if accessibility == "denied":
-                return ActionResult(
-                    False,
-                    "desktop.probe",
-                    "Accessibility permission denied; run '<bin> permissions --guide' and grant it to Terminal/WorkBuddy",
-                    data,
-                )
-            ok, message, payload = self._ax_snapshot()
-            data["snapshot"] = str(payload)[:4000]
-            if not ok:
-                return ActionResult(False, "desktop.probe", message, data)
-            data["checkin_ref"] = find_ref(payload, ["立即领取", "今日礼包", "签到"])
-            return ActionResult(
-                True, "desktop.probe",
-                "ax-tree ok; checkin ref found" if data["checkin_ref"] else "ax-tree ok; checkin button NOT visible (try CDP)",
-                data,
-            )
-        if chosen == "cdp":
-            return ActionResult(True, "desktop.probe", f"CDP port {self.cdp_port} reachable", data)
-        data["snapshot"] = "no background backend available"
-        return ActionResult(
-            False, "desktop.probe",
-            "install agent-desktop + grant Accessibility, or relaunch WorkBuddy with --remote-debugging-port=9222",
-            data,
-        )
-
-    # ---- 每日签到 -----------------------------------------------------------
-    def claim_daily(self, texts: list[str]) -> ActionResult:
-        chosen = self._choose()
-        if chosen is None:
-            return ActionResult(False, "desktop.checkin", "no backend available", {"backend": None})
-        if chosen == "agent-desktop":
-            ok, message, payload = self._ax_snapshot()
-            if not ok:
-                return ActionResult(False, "desktop.checkin", message, {"backend": chosen})
-            ref = find_ref(payload, texts)
-            if ref is None:
-                return ActionResult(
-                    False, "desktop.checkin",
-                    "checkin button not found in accessibility tree",
-                    {"backend": chosen, "snapshot": str(payload)[:2000]},
-                )
-            ok, message, _data = self._exec_json([self.bin, "click", ref, "--session", self.session])
-            return ActionResult(
-                ok, "desktop.checkin", message, {"backend": chosen, "ref": ref}
-            )
-        if chosen == "cdp":
-            js = SHADOW_CLICK_JS % json.dumps(texts, ensure_ascii=False)
-            ok, out = self._exec(["agent-browser", "--cdp", str(self.cdp_port), "eval", js])
-            return ActionResult(
-                ok and "NOT_FOUND" not in out,
-                "desktop.checkin", out[:800], {"backend": chosen},
-            )
-        return ActionResult(
-            False, "desktop.checkin",
-            "computer-use backend is disabled: it would move the physical mouse",
-            {"backend": chosen},
-        )
-
-
 CUA_DRIVER_BIN = "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
 
 
 class CuaDriverSigner(DesktopAdapter):
-    """通过已授权的 CuaDriver (com.trycua.driver) 用 AX 路径点击签到按钮。
-
-    实测 2026-11-09：WorkBuddy 客户端 AX 树的 Buddy 加油站卡片里含
-    AXButton "立即领取"；用 element_index 点击走 AX press，
-    不移动光标、不抢焦点，不干扰人工操作。点击后卡片与按钮消失即签到成功。
-    """
+    """通过已授权的 CuaDriver (com.trycua.driver) 用 AX 路径点击签到按钮。"""
 
     def __init__(self, cfg: dict, runner: Callable[..., Any] | None = None) -> None:
         desk = cfg["desktop"]

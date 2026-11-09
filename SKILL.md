@@ -1,24 +1,23 @@
 ---
 name: buddy-web-checkin
-description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、派猫猫旅行自动派遣，并在旅行精确到期时领取礼物后立刻再次派遣。仅签到依赖桌面客户端，其余走网页端；全程后台隔离，不干扰人工操作。触发词：帮我签到、领今日礼包、自动签到、签到礼物兑换、派猫猫旅行、自动派遣、领取旅行礼物、旅行到期领奖、签到守护进程。
+description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、派猫猫旅行自动派遣，并在旅行精确到期时领取礼物后立刻再次派遣。仅签到依赖桌面客户端，其余走已登录浏览器里的成长中心页面；全程后台隔离，不干扰人工操作。触发词：帮我签到、领今日礼包、自动签到、签到礼物兑换、派猫猫旅行、自动派遣、领取旅行礼物、旅行到期领奖、签到守护进程。
 ---
 
 # buddy-web-checkin
 
-这是一个**独立 CLI 技能**，核心运行不依赖 WorkBuddy 的定时任务或技能机制：调度器是自带的标准库 `heapq`，状态在 SQLite，网页端用 `agent-browser` headless 独立会话，**桌面端签到用 CuaDriver 无障碍树（AX 通道，已授权；agent-desktop / CDP 为引擎回退）**。
+这是一个**独立 CLI 技能**，核心运行不依赖 WorkBuddy 的定时任务或技能机制：调度器是自带的标准库 `heapq`，状态在 SQLite。**所有自动化操作（桌面签到 + 成长中心领礼物/派遣/兑换）都走 CuaDriver 无障碍树（AX 通道，已授权）**——它是本技能唯一的外部工具与唯一实际可用的后端；不使用 headless 浏览器（agent-browser / agent-desktop / CDP / computer-use 均已移除）。
 
 > 本技能**依赖 WorkBuddy**（签到在客户端内、成长中心是 WorkBuddy 个人中心），作为 WorkBuddy 技能 / 定时任务运行会消耗模型额度，**必须运行在「免费模型」下**：执行前先在模型选择器选免费模型，再以 `BUDDY_FREE_MODEL=1` 确认，否则命令拒绝执行（见下方「免费模型约束」）。
 
 ## 安装第三方依赖（安装 / 重新拉取技能时必跑）
 
-本技能除 Python 标准库外，依赖若干**外部 CLI / GUI 应用**（CuaDriver、agent-browser、可选 agent-desktop），它们**不会**随技能仓库自动装好，且 mock 单测测不到、只在真实执行才暴露缺失。**安装（或 `git pull` 重新拉取）本技能后，agent 必须先执行以下两步再首次使用**：
+本技能除 Python 标准库外，**只依赖一个外部工具：CuaDriver**（trycua 出品的 GUI 应用，AX 驱动），它不会随技能仓库自动装好，且 mock 单测测不到、只在真实执行才暴露缺失。**安装（或 `git pull` 重新拉取）本技能后，agent 必须先执行以下检查再首次使用**：
 
 ```bash
-./run.sh deps install   # 装经 npm 管理的依赖；GUI 依赖（CuaDriver）给出手动安装与授权指引
 ./run.sh deps check     # 逐项检查，所有必需依赖 OK 才放行；缺失则退出码非 0，必须先补齐
 ```
 
-`deps check` 会据 `config.toml` 各通道开关动态判定「必需 / 可选」：**CuaDriver 始终必需**（它是本技能唯一实际可用的自动化后端，负责桌面签到 + 成长中心任意浏览器的 AX 操作）；**agent-browser 仅 `setup` 扫码脚手架用、仍为必需**；**浏览器不限定**（Chrome/Edge/Safari 任一即可，无需专门装 Edge）；agent-desktop 仅在使用 agent-desktop 引擎时必需（默认 cua-driver 下为可选回退，且实测 TCC 未授权）。GUI 依赖缺失时，`deps install` 只打印指引，需人工安装并在「系统设置 → 隐私与安全性 → 辅助功能」为 CuaDriver 授权。
+依赖矩阵只有三项：**Python ≥ 3.11**（运行时）、**CuaDriver**（唯一必需外部工具：桌面签到 + 成长中心任意浏览器的 AX 操作，需在「系统设置 → 隐私与安全性 → 辅助功能」授权）、**浏览器（可选）**——Chrome/Edge/Safari 任一即可，用你惯用的浏览器从 WorkBuddy 点开「个人中心」，无需专门安装。CuaDriver 缺失时按 `deps check` 打印的指引人工安装并授权。
 
 ## 用法
 
@@ -26,13 +25,11 @@ description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、�
 
 | 命令 | 作用 | 是否需要人工 |
 |---|---|---|
-| `deps install` | 安装经 npm 管理的依赖；GUI 依赖给出手动安装指引 | GUI 依赖需人工安装+授权 |
 | `deps check` | 逐项检查第三方依赖是否就绪（安装技能后必跑） | 否 |
-| `probe` | 只读探测网页端入口与桌面端可用后端，写 `discovered.json` | 否 |
-| `setup` | headless 打开登录页，二维码截图存 `login-qr.png` | 手机扫码一次 |
-| `setup-from-edge` | 只读复制 Edge 已登录 profile 到独立副本，用 Edge 可执行文件验证 | 否（但需在非沙箱终端运行） |
+| `deps install` | 打印 CuaDriver 的手动安装与授权指引（无 npm 依赖） | CuaDriver 需人工安装+授权 |
+| `deps list` | 仅列出依赖与路径 | 否 |
 | `status` | 只读查看下次签到 / 旅行到期 / 最近运行 | 否 |
-| `checkin-now` | 只做每日签到（桌面端），不碰网页端 | 否（需辅助功能授权） |
+| `checkin-now` | 只做每日签到（桌面端） | 否（需 CuaDriver 辅助功能授权） |
 | `once` | 立即跑一轮完整闭环 | 否 |
 | `daemon` | 常驻精确调度，Ctrl-C 退出 | 否 |
 | `install-launchd` | 写 LaunchAgent plist（不自动加载） | 加载动作由你确认 |
@@ -54,11 +51,10 @@ description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、�
 
 ## 执行约束
 
-- **不激活窗口、不移动物理鼠标、不接管用户日常浏览器**：网页端默认 headless + 独立 `--session` / `--profile`；桌面端 `allow_focus=false`。
-- **先探测再动作**：首次使用必须先 `probe`，确认签到按钮在 AX 树里可见，再启用 `daemon`。
+- **不激活窗口、不移动物理鼠标、不接管用户日常浏览器**：AX 点击用 `element_index`，走 AX press；成长中心只操作用户自己打开的浏览器窗口。
 - **幂等**：所有领取经 SQLite 唯一键去重，重复运行不重复领。
 - **时间口径**：一律北京时间；naive 时间按北京时间解释，不按 UTC。
-- **凭据**：输出脱敏，不读取或导出客户端登录态与令牌。
+- **凭据**：输出脱敏，不读取或导出客户端登录态与令牌；不自动登录。
 - 活动入口与字段随版本变化，接口/文字定位失败时如实报告，不盲目重试。
 
 详细架构、人工步骤与故障排查见 `README.md`。需求拆解与验收状态见 `prd.json`。
