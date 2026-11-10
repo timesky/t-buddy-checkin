@@ -233,6 +233,30 @@ class DialogTests(unittest.TestCase):
         self.assertFalse(GrowthCenter._claim_confirmed(_state(["领取礼物"])))
         self.assertFalse(GrowthCenter._claim_confirmed(_state(["某个陌生页面"])))
 
+    def test_tick_clears_leftover_dialog_then_reads_real_countdown(self):
+        """回归（2026-11-10 11:19 真实踩坑）：上一轮领奖后的残留弹窗遮挡本轮，
+        tick 必须先清浮层再读状态，否则整轮误判 gift_dialog 失败。"""
+        wins = _list_windows(
+            {"app_name": "Microsoft Edge", "title": "WorkBuddy - 个人中心",
+             "pid": 446, "window_id": 60, "bounds": {"width": 1900, "height": 940},
+             "is_on_screen": True},
+        )
+        overlay = {"elements": [
+            {"role": "AXButton", "label": "已领取", "element_index": 200},
+            {"role": "AXButton", "label": "关闭", "element_index": 201},
+        ], "raw": ""}
+        states = [
+            _state(["派猫猫旅行", "兑换奖励"]),  # 探窗：成长中心
+            overlay,                            # 残留的领奖确认浮层
+            _state(["旅行倒计时 01:30:58"]),     # 清理后的真实状态
+        ]
+        g = GrowthCenter({"growth": {"browser_app": "auto"}},
+                         runner=_seq_runner(wins, states))
+        res = g.tick(force=False)
+        self.assertTrue(res.ok, res.detail)
+        self.assertIn("real countdown", res.detail)
+        self.assertEqual(res.data.get("remaining_sec"), 5458)
+
 
 if __name__ == "__main__":
     unittest.main()

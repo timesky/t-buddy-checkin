@@ -274,6 +274,7 @@ class GrowthCenter:
         if st == "gift_dialog":
             ok, label = self._click(snap, lambda s: "领取" in s and "积分" in s and "已领取" not in s, pid, wid)
             if not ok:
+                self.dismiss_dialog(pid, wid)
                 return ActionResult(False, "gift", label)
             after = self.snapshot(pid, wid)
             confirmed = self._claim_confirmed(after)
@@ -286,10 +287,12 @@ class GrowthCenter:
 
         ok, label = self._click(snap, lambda s: s.strip() == "领取礼物", pid, wid)
         if not ok:
+            self.dismiss_dialog(pid, wid)
             return ActionResult(False, "gift", label)
         dialog = self.snapshot(pid, wid)
         ok2, label2 = self._click(dialog, lambda s: "领取" in s and "积分" in s and "已领取" not in s, pid, wid)
         if not ok2:
+            self.dismiss_dialog(pid, wid)
             return ActionResult(False, "gift", f"gift dialog: {label2}")
         after = self.snapshot(pid, wid)
         confirmed = self._claim_confirmed(after)
@@ -452,6 +455,9 @@ class GrowthCenter:
         if not win:
             return self._block_result("travel")
         pid, wid = win
+        # 先清掉上一轮遗留的「已领取 / 选择奖励」等浮层，否则会遮挡本轮状态读取
+        # （实测 2026-11-10 11:19 重启轮：残留弹窗导致整轮误判 gift_dialog 失败）
+        self.dismiss_dialog(pid, wid)
         snap = self.snapshot(pid, wid)
         info = self.read_state(snap)
         state = info["state"]
