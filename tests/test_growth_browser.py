@@ -371,6 +371,25 @@ class DocTextFalsePositiveTests(unittest.TestCase):
         self.assertEqual(GrowthCenter.read_state(snap)["state"], "idle")
 
 
+class _FakeState:
+    """最小 KV 假实现，用于验证冷却跨实例持久化。"""
+
+    def __init__(self):
+        self.kv: dict = {}
+
+    def kv_set(self, key, value):
+        self.kv[key] = value
+
+    def kv_get(self, key, default=None):
+        return self.kv.get(key, default)
+
+    def kv_get_float(self, key, default=None):
+        try:
+            return float(self.kv[key])
+        except (KeyError, TypeError, ValueError):
+            return default
+
+
 class _AutoOpenRunner:
     """第一遍：浏览器只有别的页面 + 客户端有入口；第二遍：浏览器已打开成长中心。"""
 
@@ -462,7 +481,8 @@ class AutoOpenPageTests(unittest.TestCase):
         """点入口仍没页面时，后台 open -g 目标 URL 兜底（不抢焦点）。"""
         from unittest.mock import patch
 
-        runner = _AutoOpenRunner(open_after=4)
+        # 5 = 首次探测(1) + 已有页签判断(2) + 找客户端窗口(3) + 点击后探测(4) + URL 兜底后探测(5)
+        runner = _AutoOpenRunner(open_after=5)
         g = GrowthCenter(self._cfg(auto_open_url_fallback=True), runner=runner)
         with patch("buddy_checkin.adapters.growth.subprocess.run") as fake_run:
             fake_run.return_value.returncode = 0
@@ -473,6 +493,84 @@ class AutoOpenPageTests(unittest.TestCase):
                      if c.args and c.args[0][:2] == ["open", "-g"]]
         self.assertEqual(len(url_calls), 1)
         self.assertIn("growth-center", url_calls[0].args[0][2])
+
+    def test_existing_workbuddy_tab_is_not_reopened(self):
+        """回归（2026-11-10）：已有个人中心页签时只读探测，绝不新开页签。"""
+        from unittest.mock import patch
+
+        windows = [
+            {"app_name": "Microsoft Edge", "pid": 446, "window_id": 60,
+             "title": "WorkBuddy - 个人中心", "is_on_screen": True,
+             "bounds": {"width": 1900, "height": 940}},
+        ]
+        plain = {"elements": [
+            {"role": "AXStaticText", "label": "页面加载中", "element_index": 1}]}
+
+        def runner(cmd, **_kw):
+            tool = cmd[2] if len(cmd) > 2 else ""
+            if tool == "list_windows":
+                return _FakeProc(json.dumps({"windows": windows}, ensure_ascii=False))
+            if tool == "get_window_state":
+                return _FakeProc(json.dumps(plain, ensure_ascii=False))
+            return _FakeProc("{}")
+
+        g = GrowthCenter(self._cfg(), runner=runner)
+        with patch("buddy_checkin.adapters.growth.subprocess.run") as fake_run:
+            self.assertIsNone(g._window())
+        self.assertEqual(g._block[0], "not_found")
+        self.assertIn("已存在个人中心", g._block[1])
+        # 没有点入口，也没有 open -g
+        self.assertFalse(any(c.args and c.args[0][:2] == ["open", "-g"]
+                             for c in fake_run.call_args_list))
+
+    def test_other_vendor_center_page_is_not_treated_as_our_tab(self):
+        """CodeBuddy 的「个人中心」不算 WorkBuddy 页签，应允许打开目标页。"""
+        windows = [
+            {"app_name": "Microsoft Edge", "pid": 446, "window_id": 60,
+             "title": "腾讯云代码助手 CodeBuddy - 个人中心", "is_on_screen": True,
+             "bounds": {"width": 1900, "height": 940}},
+        ]
+
+        def runner(cmd, **_kw):
+            if cmd[2] == "list_windows":
+                return _FakeProc(json.dumps({"windows": windows}, ensure_ascii=False))
+            return _FakeProc("{}")
+
+        g = GrowthCenter(self._cfg(), runner=runner)
+        self.assertFalse(g._has_existing_page_tab())
+
+    def test_driver_unavailable_never_auto_opens(self):
+        """回归（2026-11-10）：CuaDriver daemon 挂掉时 list_windows 返回 error，
+        不能当成「没窗口」去 open -g 反复开页签，要明确报 driver_unavailable。"""
+        from unittest.mock import patch
+
+        def runner(cmd, **_kw):
+            if cmd[2] == "list_windows":
+                return _FakeProc(json.dumps({"error": "Cua Driver daemon is not running"}))
+            return _FakeProc("{}")
+
+        g = GrowthCenter(self._cfg(), runner=runner)
+        with patch("buddy_checkin.adapters.growth.subprocess.run") as fake_run:
+            self.assertIsNone(g._window())
+        self.assertEqual(g._block[0], "driver_unavailable")
+        self.assertIn("CuaDriver daemon 不可用", g._block[1])
+        self.assertFalse(any(c.args and c.args[0][:2] == ["open", "-g"]
+                             for c in fake_run.call_args_list))
+
+    def test_auto_open_cooldown_persists_across_instances(self):
+        """重启后新实例从 kv 读冷却，不会立刻又开一个页签。"""
+        import time
+        from unittest.mock import patch
+
+        state = _FakeState()
+        cfg = self._cfg(auto_open_cooldown_sec=9999)
+        g = GrowthCenter(cfg, runner=_AutoOpenRunner(), state=state)
+        state.kv_set("last_auto_open_at", time.time())
+        with patch("buddy_checkin.adapters.growth.subprocess.run") as fake_run:
+            g._window()
+        self.assertEqual(g._last_auto_open, state.kv_get_float("last_auto_open_at"))
+        self.assertFalse(any(c.args and c.args[0][:2] == ["open", "-g"]
+                             for c in fake_run.call_args_list))
 
 
 if __name__ == "__main__":

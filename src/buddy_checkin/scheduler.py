@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
-from .timeutil import CN_TZ, next_daily_at
+from .timeutil import CN_TZ, day_key, next_daily_at
 
 logger = logging.getLogger(__name__)
 
@@ -104,18 +104,31 @@ class Scheduler:
 
     # ---- 线 3：派遣 / 领礼物（动态滚动） ------------------------------------
     def _travel(self, _job: Job) -> Job | None:
+        # 先读持久化标记：当天已判定派遣次数用尽时，重启/定时都直接跳到夜间，
+        # 不再实际检查（否则重启后 initial_jobs 会立即重试并触发自动开页签）。
+        # 2026-11-10 实测：14:36 已排到 23:00，14:42 服务重启后又重试并新开页签。
+        if self.state.kv_get("travel_blocked") == "exhausted" \
+                and self.state.kv_get("travel_blocked_day") == day_key(self.now()):
+            due = self._next_exhausted()
+            logger.info("travel line: exhausted for today (%s), skip until %s",
+                        day_key(self.now()), due)
+            return self._schedule("travel", due)
+
         result = self.actions.travel_tick(force=True)
         blocked = result.data.get("dispatch_blocked")
         if blocked == "exhausted":
             # 当天派遣次数用完：按用户要求禁用到当晚 23:00，不再每小时重试
             due = self._next_exhausted()
             self.state.kv_set("travel_blocked", "exhausted")
+            self.state.kv_set("travel_blocked_day", day_key(self.now()))
             logger.info("travel line: dispatch exhausted today, next=%s (23:00)", due)
         else:
             due = self.state.kv_get_float("travel_due_at")
             if due is None or due <= self.now():
                 due = self.now() + self.fallback
+            # 正常轮次清掉旧的禁用标记（跨天后自动恢复）
             self.state.kv_set("travel_blocked", "")
+            self.state.kv_set("travel_blocked_day", "")
             logger.info("travel line: next=%s (real countdown)", due)
         return self._schedule("travel", due)
 

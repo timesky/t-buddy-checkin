@@ -54,7 +54,9 @@ description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、�
 
 **领取成功判定**：出现「已领取」或页面回到可派遣（idle）/旅行中即成功；仍停在可领/弹窗/未知不算。**动作后清弹窗（三级）**：精确匹配的关闭按钮 → Escape（`CGEventPostToPid`，不移动光标）→ 复核快照确认；不碰浏览器标签页、不误点「确定派出」。领奖后弹窗未关会让派遣按钮 `AXEnabled=false`（2026-11-10 实测）。
 
-**派遣次数当天用尽**：页面出现「明天再来 / 今日已派完 / 次数已用完」，或强关浮层后按钮仍 `AXEnabled=false`，判定 `dispatch_blocked=exhausted` → 旅行线禁用到当晚 23:00（`travel.exhausted_retry_at`，已过则次日 0 点），不再每小时重试；到点自动再检查。
+**派遣次数当天用尽**：页面出现「明天再来 / 今日已派完 / 次数已用完」，或强关浮层后按钮仍 `AXEnabled=false`，判定 `dispatch_blocked=exhausted` → 旅行线禁用到当晚 23:00（`travel.exhausted_retry_at`，已过则次日 0 点），不再每小时重试；到点自动再检查。标记 `travel_blocked` + `travel_blocked_day` 落库，**服务重启后跳过实际检查直接排到 23:00**（避免重启触发重复开页签），跨天自动清除。
+
+**不重复开页签**：自动打开前按标题判断「已有 WorkBuddy 个人中心页签」就不再新开；自动打开冷却写 kv 跨重启生效。CuaDriver daemon 挂掉（`driver_unavailable`）时一律不自动打开，用 `cua-driver permissions grant` 重新拉起（必须以 com.trycua.driver 身份，否则 TCC 授权不生效）。
 
 ## 成长中心与派遣时长
 

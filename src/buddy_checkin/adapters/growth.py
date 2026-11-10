@@ -73,8 +73,10 @@ def parse_hms(text: str) -> int | None:
 
 
 class GrowthCenter:
-    def __init__(self, cfg: dict, runner: Callable[..., Any] | None = None) -> None:
+    def __init__(self, cfg: dict, runner: Callable[..., Any] | None = None,
+                 state: Any | None = None) -> None:
         growth = cfg.get("growth", {})
+        self.state = state  # 可选：把自动打开冷却写到 kv，跨进程/重启生效
         self.bin = growth.get("cua_driver_bin") or CUA_DRIVER_BIN
         # 默认 auto：探测任意浏览器里已打开的成长中心窗口，不限定 Edge
         self.browser_app = growth.get("browser_app", "auto") or "auto"
@@ -95,7 +97,9 @@ class GrowthCenter:
         self.auto_open_url = growth.get("auto_open_url") or \
             "https://www.workbuddy.cn/profile/growth-center"
         self.auto_open_url_fallback = bool(growth.get("auto_open_url_fallback", True))
-        self._last_auto_open = 0.0
+        # 冷却从 kv 读，进程重启后仍生效（避免每次重启都新开页签）
+        persisted = state.kv_get_float("last_auto_open_at") if state is not None else None
+        self._last_auto_open = float(persisted or 0.0)
         self.runner = runner or subprocess.run
         self.commands: list[list[str]] = []
         # 上一次 _window 探窗结论：("login_required"|"not_found", detail)
@@ -153,31 +157,78 @@ class GrowthCenter:
         if win:
             return win
         if self.auto_open_page and self._block and self._block[0] == "not_found":
+            # 先判断：如果已经存在 WorkBuddy/个人中心 页签，只是暂时读不到内容
+            # （加载中、被切到后台），绝不再新开页签——这是 2026-11-10 用户反馈的
+            # 「每次都新开 WorkBuddy 页签」根因。
+            if self._has_existing_page_tab():
+                self._block = (
+                    "not_found",
+                    "已存在个人中心/成长中心页签，但当前读不到内容"
+                    "（可能加载中或切到后台）；不重复新开页签，稍后重试",
+                )
+                return None
+            opened_entry = False
+            opened_url = False
             now = time.time()
             if now - self._last_auto_open >= self.auto_open_cooldown:
                 self._last_auto_open = now
+                if self.state is not None:
+                    self.state.kv_set("last_auto_open_at", now)
                 # 一、优先点用户指定的客户端入口（一轮、只点一个，避免连锁点错）
                 if self._try_auto_open():
+                    opened_entry = True
                     win = self._locate()
                     if win:
                         return win
                 # 二、兜底：后台打开目标 URL（-g 不激活浏览器、不抢焦点）
                 if self.auto_open_url_fallback and self._open_url_fallback():
+                    opened_url = True
                     win = self._locate()
                     if win:
                         return win
-                self._block = (
-                    "not_found",
-                    "已自动点击「做任务赢积分」入口并后台打开成长中心 URL，"
-                    "但仍未检测到页面：请确认页面已加载且已登录"
-                    "（www.workbuddy.cn/profile/growth-center）",
-                )
+            did = "、".join(
+                p for p, ok in (("点击客户端入口", opened_entry),
+                                ("后台打开成长中心 URL", opened_url)) if ok
+            ) or "未执行自动打开"
+            self._block = (
+                "not_found",
+                f"{did}，但仍未检测到页面：请确认页面已加载且已登录"
+                "（www.workbuddy.cn/profile/growth-center）",
+            )
         return None
+
+    def _has_existing_page_tab(self) -> bool:
+        """是否已有目标页签（按窗口标题判断），避免重复新开。
+
+        只把「明确指向 WorkBuddy 个人中心/成长中心」的标题算作已有页签；
+        CodeBuddy 等其它产品的「个人中心」不算，以免把错页当成目标页。
+        """
+        data = self._call("list_windows", {})
+        for w in data.get("windows", []):
+            if (w.get("bounds") or {}).get("width", 0) <= 400:
+                continue
+            title = str(w.get("title") or "")
+            low = title.lower()
+            if "growth-center" in low or "growth_center" in low:
+                return True
+            if "workbuddy" in low and any(
+                    k in title for k in ("个人中心", "成长中心", "成长计划")):
+                return True
+        return False
 
     def _locate(self) -> tuple[int, int] | None:
         """只读探测：扫描可见窗口，按 AX 内容找成长中心页面。"""
         self._block = None
         data = self._call("list_windows", {})
+        if "error" in data:
+            # CuaDriver daemon 挂掉时不能当成「没窗口」，否则会盲目 open -g 反复开页签
+            # （2026-11-10 14:42/15:42 实测）。daemon 不可用时一律不自动打开。
+            self._block = (
+                "driver_unavailable",
+                f"CuaDriver daemon 不可用（{str(data['error'])[:120]}）；"
+                "本轮不自动打开页签。可执行 cua-driver permissions grant 重新拉起 daemon",
+            )
+            return None
         wins = data.get("windows", [])
         if self.browser_app != "auto":
             wins = [w for w in wins if w.get("app_name") == self.browser_app]

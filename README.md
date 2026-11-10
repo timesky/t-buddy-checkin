@@ -177,6 +177,12 @@ launchctl kickstart -k gui/$(id -u)/com.local.buddy-web-checkin
   按钮仍 `AXEnabled=false`，判定 `dispatch_blocked=exhausted` → 旅行线**禁用到当晚 23:00**
   （`travel.exhausted_retry_at`，已过 23:00 则次日 0 点），不再每小时无效重试。
   派遣前也会先清浮层并重读状态。
+- **重启不重置当天状态**：`travel_blocked` 连同 `travel_blocked_day` 落库。服务重启后
+  `initial_jobs` 虽会立即跑三条线，但当天的 exhausted 标记会让它**直接跳到 23:00、
+  不做实际检查**（避免重启误触发自动开页签）；跨天后自动清除。
+- **不重复开页签**：自动打开前先按窗口标题判断「是否已有 WorkBuddy 个人中心页签」，
+  有就只读等待、不再新开；自动打开冷却 `last_auto_open_at` 写 kv，跨进程/重启生效。
+  CuaDriver daemon 不可用时（`driver_unavailable`）一律不自动打开。
 - **重启即补**：进程启动三条线都立即跑一轮，关机/睡眠期间错过的旅行到期会在启动时立刻领奖并再派遣；签到与兑换未确认的也会在启动后立即检查。
 - 签到/兑换在每天 0 点恢复轮询；当天得到确定结论后禁用到 23:59，失败则隔一小时滚动重试。
 
@@ -231,6 +237,8 @@ BUDDY_FREE_MODEL=1 ./run.sh travel-now
 | 签到报 `AXPress ... -25202` | 元素引用失效，已内置 3 次「重新快照定位」重试；仍失败看 `inspect` 的客户端按钮文案 |
 | 领奖后派遣报 `AXEnabled=false` | 弹窗遮挡：已加三级清理（扩展关闭按钮文案 + Escape 兜底 + 复核），派遣前也会先清弹窗 |
 | 页面显示「明天再来 / 次数已用完」 | 当天派遣次数用尽，旅行线自动禁用到 23:00（`travel.exhausted_retry_at`），`status` 可看下次时间 |
+| 反复新开 WorkBuddy 页签 | 已修：先判断已有个人中心页签就不新开；自动打开冷却写 kv，重启不重置 |
+| `list_windows` 失败 / `Cua Driver daemon is not running` | **CuaDriver daemon 挂了**（会连锁导致探测失败、反复开页签、派遣重试）。用 `cua-driver permissions grant` 重新拉起（以 com.trycua.driver 身份，否则辅助功能授权不生效）；daemon 不可用时本技能不会自动开页签 |
 | 客户端文档/对话被误判成成长中心 | 已修：状态判定只认 `AXButton`，并排除客户端窗口（`growth.exclude_apps`） |
 | 另一台机器入口文案不同 | `./run.sh inspect` 看实际按钮，改 `desktop.station_entry_labels` / `growth.auto_open_labels` |
 | 领取没到账                                | `./run.sh status` 看运行日志；签到/兑换失败会隔 1 小时自动重试      |

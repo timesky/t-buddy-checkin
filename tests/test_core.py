@@ -337,6 +337,30 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual((b.date().isoformat(), b.hour, b.minute),
                          ("2026-11-11", 0, 0))
 
+    def test_exhausted_survives_restart_without_rechecking(self):
+        """回归（2026-11-10）：重启后 initial_jobs 立即跑，但当天已用尽必须
+        直接跳到 23:00，绝不重新检查（否则会触发自动开新页签）。"""
+        self.state.kv_set("travel_blocked", "exhausted")
+        self.state.kv_set("travel_blocked_day", "2026-11-10")
+        # 模拟进程重启后的新调度器：固定时间仍在 11:00，且 travel_due_at 已过期
+        self.state.kv_set("travel_due_at", self.fixed_now - 3600)
+        fresh = self._sched()
+        job = fresh._travel(None)
+        b = self._beijing(job.due_at)
+        self.assertEqual((b.date().isoformat(), b.hour, b.minute),
+                         ("2026-11-10", 23, 0))
+        self.assertEqual(self.actions.calls, [])  # 一次实际检查都没发生
+
+    def test_exhausted_from_previous_day_is_cleared(self):
+        """跨天：昨天的禁用标记不应影响今天。"""
+        self.state.kv_set("travel_blocked", "exhausted")
+        self.state.kv_set("travel_blocked_day", "2026-11-09")
+        self.state.kv_set("travel_due_at", self.fixed_now + 1200)
+        job = self.scheduler._travel(None)
+        self.assertAlmostEqual(job.due_at, self.fixed_now + 1200, places=2)
+        self.assertEqual(self.actions.calls, ["travel"])
+        self.assertEqual(self.state.kv_get("travel_blocked"), "")
+
     def test_run_forever_executes_all_three_lines(self):
         executed = self.scheduler.run_forever(max_iterations=3)
         self.assertEqual(executed, 3)

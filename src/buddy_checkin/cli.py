@@ -62,7 +62,7 @@ def build(cfg: dict):
     """构造唯一后端组合：CuaDriverSigner（签到）+ GrowthCenter（礼物/派遣/兑换）。"""
     state = State(config.state_db_path(cfg))
     desktop = CuaDriverSigner(cfg)
-    growth = GrowthCenter(cfg) if cfg.get("growth", {}).get("enabled") else None
+    growth = GrowthCenter(cfg, state=state) if cfg.get("growth", {}).get("enabled") else None
     actions = Actions(cfg, state, desktop, growth=growth)
     return state, desktop, actions
 
