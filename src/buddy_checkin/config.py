@@ -22,7 +22,7 @@ DEFAULTS: dict[str, Any] = {
         "cua_driver_bin": "/Applications/CuaDriver.app/Contents/MacOS/cua-driver",
         "app": "WorkBuddy",
     },
-    "daily_checkin": {"enabled": True, "at": "09:00", "catch_up": True},
+    "daily_checkin": {"enabled": True, "at": "09:30", "catch_up": True},
     "gifts": {
         "enabled": True,
         "allow_keywords": ["今日礼包", "签到", "连签", "盲盒", "抽奖", "旅行", "奖励", "领取"],

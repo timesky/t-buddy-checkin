@@ -31,8 +31,8 @@ description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、�
 | `status` | 只读查看下次签到 / 旅行到期 / 最近运行 | 否 |
 | `checkin-now` | 只做每日签到（桌面端） | 否（需 CuaDriver 辅助功能授权） |
 | `once` | 立即跑一轮完整闭环 | 否 |
-| `daemon` | 常驻精确调度，Ctrl-C 退出 | 否 |
-| `install-launchd` | 写 LaunchAgent plist（不自动加载） | 加载动作由你确认 |
+| `daemon` | 常驻精确调度：每日 9:30 签到+兑换检查；旅行到期自动领奖→再派遣 | 否 |
+| `install-launchd` | 写 LaunchAgent plist（开机常驻，RunAtLoad+KeepAlive） | 加载命令由你确认执行 |
 | `model-check` | 查看免费模型策略与当前确认状态 | 否 |
 
 ## 成长中心与派遣时长

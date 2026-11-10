@@ -140,7 +140,6 @@ def cmd_install_launchd(cfg: dict, args: argparse.Namespace) -> int:
   <key>Label</key><string>com.local.buddy-web-checkin</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <!-- 确认已在 WorkBuddy 选「免费模型」后由本环境变量显式放行（见 runtime.require_free_model） -->
     <key>BUDDY_FREE_MODEL</key><string>1</string>
   </dict>
   <key>ProgramArguments</key>
@@ -187,9 +186,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     cfg = config.load(args.config)
     logging.getLogger().setLevel(getattr(logging, cfg.get("log_level", "INFO"), logging.INFO))
-    # 依赖 WorkBuddy：执行前必须确认运行在免费模型下（model-check / deps 属本地运维，
-    # 不消耗模型额度，放行）
-    if args.command not in ("model-check", "deps"):
+    # 依赖 WorkBuddy：执行前必须确认运行在免费模型下（model-check / deps / install-launchd
+    # 属本地运维——只读策略、检查依赖、写 plist，不消耗模型额度，放行；
+    # plist 内已内置 BUDDY_FREE_MODEL=1，daemon 运行时仍受闸门约束）
+    if args.command not in ("model-check", "deps", "install-launchd"):
         rc = preflight_model_check(cfg)
         if rc:
             return rc

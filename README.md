@@ -113,8 +113,17 @@ chmod +x run.sh
 ./run.sh checkin-now  # 只做每日签到（桌面端）
 ./run.sh once         # 手动跑一轮完整闭环，确认无误
 ./run.sh daemon       # 常驻精确调度（Ctrl-C 退出）
-./run.sh install-launchd   # 只写 LaunchAgent plist，不自动加载
+
+# 开机常驻（推荐）：写 plist 并加载，登录后自动运行 daemon
+./run.sh install-launchd
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.buddy-web-checkin.plist
 ```
+
+### 定时安排（daemon / LaunchAgent 模式）
+
+- **每日 9:30**（`daily_checkin.at`）：自动签到 + 签到礼物/兑换检查；当天未签时启动即补签（`catch_up=true`）。
+- **旅行闭环**：派遣后读真实倒计时落库，到期自动「领礼物 → 再派遣 → 再读倒计时」，全程无固定间隔。
+- `run.sh` 自适应选择 Python ≥ 3.11（launchd 最小 PATH 下系统 `python3` 可能是 3.9，已验证修复），可用 `BUDDY_PYTHON` 指定解释器。
 
 成长中心的登录**在你自己的浏览器里完成**：从 WorkBuddy 点开「个人中心」进入任意浏览器并登录，工具直接操作该窗口；检测到未登录时只会提示你登录，不做任何自动登录。
 

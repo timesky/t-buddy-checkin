@@ -13,7 +13,7 @@ app = "WorkBuddy"
 
 [daily_checkin]
 enabled = true
-at = "09:00"
+at = "09:30"
 catch_up = true          # 开机/唤醒后若今天还没签，立即补签
 
 [gifts]
