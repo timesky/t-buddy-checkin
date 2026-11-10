@@ -6,6 +6,8 @@ set -e
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$DIR"
 export PYTHONPATH="$DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+# launchd 把 stdout 重定向到文件时 Python 默认块缓冲，日志会长期为空
+export PYTHONUNBUFFERED=1
 
 PY=""
 if [ -n "$BUDDY_PYTHON" ]; then

@@ -216,6 +216,18 @@ class GrowthCenter:
         return {"state": state, "remaining_sec": remaining, "raw": joined[:1500]}
 
     # ---- 动作 ---------------------------------------------------------------
+    @staticmethod
+    def _claim_confirmed(after: dict) -> bool:
+        """领奖是否完成。
+
+        实测 2026-11-10：点完「领取 N 积分」后页面可能直接回到可派遣状态（idle），
+        AX 树里根本不出现「已领取」字样。只认文案会误报 FAIL（礼物其实已到账），
+        所以以「页面已离开 可领/弹窗 状态」为准。
+        """
+        if "已领取" in GrowthCenter.read_state(after)["raw"]:
+            return True
+        return GrowthCenter.read_state(after)["state"] not in ("claimable", "gift_dialog")
+
     def claim_gift(self) -> ActionResult:
         win = self._window()
         if not win:
@@ -230,7 +242,7 @@ class GrowthCenter:
             if not ok:
                 return ActionResult(False, "gift", label)
             after = self.snapshot(pid, wid)
-            confirmed = "已领取" in self.read_state(after)["raw"]
+            confirmed = self._claim_confirmed(after)
             return ActionResult(confirmed, "gift", f"claimed {label}", {"confirmed": confirmed})
 
         if st != "claimable":
@@ -244,7 +256,7 @@ class GrowthCenter:
         if not ok2:
             return ActionResult(False, "gift", f"gift dialog: {label2}")
         after = self.snapshot(pid, wid)
-        confirmed = "已领取" in self.read_state(after)["raw"]
+        confirmed = self._claim_confirmed(after)
         return ActionResult(confirmed, "gift", f"claimed {label2}", {"confirmed": confirmed, "label": label2})
 
     @staticmethod

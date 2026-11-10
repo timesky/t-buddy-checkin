@@ -35,6 +35,24 @@ def _state(labels, raw=""):
                          for i, l in enumerate(labels)], "raw": raw}
 
 
+def _seq_runner(list_windows, states):
+    """按 get_window_state 调用次序返回不同快照，模拟点击后的页面变化。"""
+    calls = {"i": 0}
+
+    def _run(cmd, **_kw):
+        tool = cmd[2] if len(cmd) > 2 else ""
+        if tool == "list_windows":
+            return _FakeProc(json.dumps(list_windows, ensure_ascii=False))
+        if tool == "get_window_state":
+            i = calls["i"]
+            calls["i"] += 1
+            snap = states[min(i, len(states) - 1)]
+            return _FakeProc(json.dumps(snap, ensure_ascii=False))
+        return _FakeProc("{}")  # click 等
+
+    return _run
+
+
 class GrowthBrowserTests(unittest.TestCase):
     def test_auto_detects_chrome_growth_window_not_edge(self):
         cfg = {"growth": {"browser_app": "auto", "title_hint": "个人中心"}}
@@ -118,6 +136,42 @@ class GrowthBrowserTests(unittest.TestCase):
         g = GrowthCenter(cfg, runner=_runner(responses))
         self.assertIsNone(g._window())
         self.assertEqual(g._block[0], "not_found")
+
+    def test_claim_confirmed_without_已领取_text(self):
+        """回归（2026-11-10 真实踩坑）：点完「领取 10 积分」后页面直接回到可派遣，
+        AX 树没有「已领取」字样，不能误报 FAIL（礼物其实已到账）。"""
+        wins = _list_windows(
+            {"app_name": "Microsoft Edge", "title": "WorkBuddy - 个人中心",
+             "pid": 446, "window_id": 60, "bounds": {"width": 1900, "height": 940},
+             "is_on_screen": True},
+        )
+        # _window 探窗(1) -> claim_gift 初读(2) -> 点领取礼物后的弹窗(3) -> 点积分后(4)
+        states = [
+            _state(["领取礼物", "兑换奖励"]),            # 探窗：判定为成长中心
+            _state(["领取礼物"]),                        # 初读：claimable
+            _state(["领取 10 积分"]),                    # 弹窗：gift_dialog
+            _state(["派猫猫旅行"]),                      # 领完：直接 idle，无「已领取」
+        ]
+        g = GrowthCenter({"growth": {"browser_app": "auto"}}, runner=_seq_runner(wins, states))
+        res = g.claim_gift()
+        self.assertTrue(res.ok, res.detail)
+        self.assertIn("领取 10 积分", res.detail)
+
+    def test_claim_still_claimable_reports_failure(self):
+        """页面仍停在可领状态（没领成功）时必须如实报 FAIL。"""
+        wins = _list_windows(
+            {"app_name": "Microsoft Edge", "title": "WorkBuddy - 个人中心",
+             "pid": 446, "window_id": 60, "bounds": {"width": 1900, "height": 940},
+             "is_on_screen": True},
+        )
+        states = [
+            _state(["领取礼物"]),
+            _state(["领取礼物"]),
+            _state(["领取 10 积分"]),
+            _state(["领取礼物"]),  # 点击后仍可领
+        ]
+        g = GrowthCenter({"growth": {"browser_app": "auto"}}, runner=_seq_runner(wins, states))
+        self.assertFalse(g.claim_gift().ok)
 
 
 if __name__ == "__main__":
