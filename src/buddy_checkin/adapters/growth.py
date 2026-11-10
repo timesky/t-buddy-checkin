@@ -45,10 +45,23 @@ GROWTH_CONTENT_MARKERS = (
 # 弱特征（窗口标题等）：仅用于候选窗口排序，不参与内容判定
 GROWTH_MARKERS = GROWTH_CONTENT_MARKERS + ("个人中心", "连签", "我的积分")
 
-# 动作完成后需要清掉的页面浮层：只在快照出现这些提示/按钮时才点关闭，
-# 避免误关浏览器标签页或点到「确定派出」等资源类按钮。
-DIALOG_HINTS = ("已领取", "领取成功", "恭喜", "选择奖励", "我知道了", "关闭")
-DIALOG_CLOSE_LABELS = ("关闭", "我知道了", "知道了", "好的", "完成", "确定")
+# 动作完成后需要清掉的页面浮层。
+DIALOG_HINTS = (
+    "已领取", "领取成功", "恭喜", "恭喜获得", "已获得", "获取成功", "领取奖励",
+    "选择奖励", "我知道了", "关闭", "还差", "今日已领", "兑换成功",
+)
+# 精确匹配才点，排除「关闭标签页 / 关闭窗口」等浏览器自身控件。
+# 2026-11-10 实测：领奖浮层的关闭按钮未必叫「关闭」，需覆盖常见变体；
+# 匹配不到时用 Escape 兜底，仍关不掉再判定弹窗遮挡。
+DIALOG_CLOSE_LABELS = (
+    "关闭", "×", "✕", "X", "我知道了", "知道了", "好的", "收到",
+    "完成", "确定", "确认", "稍后再说", "收起", "朕知道了",
+)
+# 派遣被禁用时的次数用尽文案
+DISPATCH_EXHAUSTED_MARKERS = (
+    "今日已派", "次数已用完", "次数用尽", "今日次数", "已达上限",
+    "明日再来", "明天再来", "派遣次数", "已派完", "无可派遣",
+)
 
 
 def parse_hms(text: str) -> int | None:
@@ -381,35 +394,52 @@ class GrowthCenter:
             return True
         return info["state"] in ("idle", "traveling")
 
-    def dismiss_dialog(self, pid: int, wid: int) -> bool:
-        """动作完成后清理页面浮层，避免弹窗遮挡后续 AX 读取。
+    def _has_dialog(self, snap: dict) -> bool:
+        return any(h in self.read_state(snap)["raw"] for h in DIALOG_HINTS)
 
-        保守规则：快照里必须出现明确的弹窗特征才动手；只点页面内容区里的
-        「关闭 / 我知道了 / 好的」等按钮（element_index > 20 排除浏览器工具栏），
-        精确匹配 label —— 「确定派出」「领取 N 积分」等绝不会被误点。
+    def dismiss_dialog(self, pid: int, wid: int) -> bool:
+        """动作完成后清理页面浮层，避免遮挡后续 AX 读取。
+
+        三级策略（2026-11-10 领奖后弹窗没关 → 派遣按钮 AXEnabled=false）：
+          1. 快照有浮层特征时，点内容区精确匹配的「关闭 / 我知道了 / ×」等按钮；
+          2. 找不到匹配按钮、或点了仍在 → 发 Escape（CGEventPostToPid，不移动光标）；
+          3. 复核快照确认浮层已消失，返回是否真的清干净。
+
+        只点精确匹配的 label，天然排除浏览器「关闭标签页 / 关闭窗口」，
+        也不误点「确定派出」「领取 N 积分」等资源类按钮。
         """
         snap = self.snapshot(pid, wid)
         if "error" in snap:
             return False
-        raw = self.read_state(snap)["raw"]
-        if not any(hint in raw for hint in DIALOG_HINTS):
+        if not self._has_dialog(snap):
             return False
+
         candidates = [
             el for el in snap.get("elements", [])
             if el.get("role") == "AXButton"
             and str(el.get("label") or "").strip() in DIALOG_CLOSE_LABELS
             and (el.get("element_index") or 0) > 20
         ]
-        if not candidates:
-            return False
-        el = max(candidates, key=lambda e: e.get("element_index") or 0)
-        payload: dict[str, Any] = {"pid": pid, "window_id": wid}
-        if el.get("element_token"):
-            payload["element_token"] = el["element_token"]
-        else:
-            payload["element_index"] = el.get("element_index")
-        out = self._call("click", payload)
-        return "error" not in out and out.get("path") in (None, "ax")
+        if candidates:
+            el = max(candidates, key=lambda e: e.get("element_index") or 0)
+            payload: dict[str, Any] = {"pid": pid, "window_id": wid}
+            if el.get("element_token"):
+                payload["element_token"] = el["element_token"]
+            else:
+                payload["element_index"] = el.get("element_index")
+            out = self._call("click", payload)
+            if "error" in out or out.get("path") not in (None, "ax"):
+                return False
+            time.sleep(0.4)
+
+        after = self.snapshot(pid, wid)
+        if not self._has_dialog(after):
+            return True
+
+        # 兜底：Escape 关闭浮层（background 投递，不抢前台、不移动光标）
+        self._call("press_key", {"pid": pid, "key": "escape"})
+        time.sleep(0.4)
+        return not self._has_dialog(self.snapshot(pid, wid))
 
     def claim_gift(self) -> ActionResult:
         win = self._window()
@@ -562,20 +592,58 @@ class GrowthCenter:
         self.dismiss_dialog(pid, wid)
         return results
 
+    @staticmethod
+    def _exhausted_hit(raw: str) -> str | None:
+        return next((m for m in DISPATCH_EXHAUSTED_MARKERS if m in (raw or "")), None)
+
     def dispatch(self) -> ActionResult:
         win = self._window()
         if not win:
             return self._block_result("travel_dispatch")
         pid, wid = win
+        # 派遣前先清浮层（领奖确认弹窗未关会让按钮 AXEnabled=false）
+        self.dismiss_dialog(pid, wid)
         snap = self.snapshot(pid, wid)
         st = self.read_state(snap)["state"]
+        raw = self.read_state(snap)["raw"]
+        hit = self._exhausted_hit(raw)
+        if hit:
+            return ActionResult(
+                False, "travel_dispatch",
+                f"dispatch exhausted today (page shows {hit})",
+                {"dispatch_blocked": "exhausted", "evidence": hit},
+            )
 
         if st == "idle":
             ok, label = self._click(snap, lambda s: "派猫猫旅行" in s, pid, wid)
             if not ok:
-                return ActionResult(False, "travel_dispatch", label)
-            snap = self.snapshot(pid, wid)
-            st = self.read_state(snap)["state"]
+                # AXEnabled=false：多半是浮层未清或当天次数已用完。
+                # 强关浮层（含 Escape）后重试一次，仍失败就判定今天不再尝试。
+                if "AXEnabled" in str(label) or "refusing AXPress" in str(label):
+                    self._call("press_key", {"pid": pid, "key": "escape"})
+                    time.sleep(1.0)
+                    snap = self.snapshot(pid, wid)
+                    info2 = self.read_state(snap)
+                    hit = self._exhausted_hit(info2["raw"])
+                    if hit:
+                        return ActionResult(
+                            False, "travel_dispatch",
+                            f"dispatch exhausted today (page shows {hit})",
+                            {"dispatch_blocked": "exhausted", "evidence": hit},
+                        )
+                    if info2["state"] == "idle":
+                        ok, label = self._click(
+                            snap, lambda s: "派猫猫旅行" in s, pid, wid)
+                        if ok:
+                            snap = self.snapshot(pid, wid)
+                            st = self.read_state(snap)["state"]
+                    if not ok:
+                        return ActionResult(
+                            False, "travel_dispatch", label,
+                            {"dispatch_blocked": "exhausted"},
+                        )
+                else:
+                    return ActionResult(False, "travel_dispatch", label)
 
         if st == "scene_dialog":
             if self.scene:
@@ -583,16 +651,21 @@ class GrowthCenter:
                 snap = self.snapshot(pid, wid)
             ok, label = self._click(snap, lambda s: "确定派出" in s, pid, wid)
             if not ok:
-                return ActionResult(False, "travel_dispatch", label)
+                blocked = "exhausted" if ("AXEnabled" in str(label)
+                                          or "refusing AXPress" in str(label)) else None
+                return ActionResult(False, "travel_dispatch", label,
+                                    {"dispatch_blocked": blocked} if blocked else {})
 
         after = self.snapshot(pid, wid)
         info = self.read_state(after)
         if info["state"] != "traveling" or info["remaining_sec"] is None:
             self.dismiss_dialog(pid, wid)
+            hit = self._exhausted_hit(info["raw"])
             return ActionResult(
                 False, "travel_dispatch",
                 f"dispatch not confirmed (state={info['state']})",
-                {"state": info["state"]},
+                {"state": info["state"],
+                 "dispatch_blocked": "exhausted" if hit else None},
             )
         due = time.time() + info["remaining_sec"] + self.claim_offset_sec
         closed = self.dismiss_dialog(pid, wid)
@@ -630,18 +703,23 @@ class GrowthCenter:
             dispatched = self.dispatch()
             due = dispatched.data.get("due_at")
             ok = dispatched.ok and (claimed.ok or claimed.data.get("state") == "traveling")
-            return ActionResult(
-                ok, "travel",
-                f"claim={claimed.detail}; dispatch={dispatched.detail}",
-                {"state": state, "due_at": due, "claim": claimed.as_dict(), "dispatch": dispatched.as_dict()},
-            )
+            data: dict[str, Any] = {
+                "state": state, "due_at": due,
+                "claim": claimed.as_dict(), "dispatch": dispatched.as_dict(),
+            }
+            if dispatched.data.get("dispatch_blocked"):
+                data["dispatch_blocked"] = dispatched.data["dispatch_blocked"]
+            return ActionResult(ok, "travel",
+                                f"claim={claimed.detail}; dispatch={dispatched.detail}", data)
 
         if state == "idle":
             dispatched = self.dispatch()
+            data = {"state": state, "due_at": dispatched.data.get("due_at"),
+                    "dispatch": dispatched.as_dict()}
+            if dispatched.data.get("dispatch_blocked"):
+                data["dispatch_blocked"] = dispatched.data["dispatch_blocked"]
             return ActionResult(
-                dispatched.ok, "travel", dispatched.detail,
-                {"state": state, "due_at": dispatched.data.get("due_at"),
-                 "dispatch": dispatched.as_dict()},
+                dispatched.ok, "travel", dispatched.detail, data,
             )
 
         return ActionResult(False, "travel", f"unknown growth-center state: {state}", info)

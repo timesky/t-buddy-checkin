@@ -77,6 +77,7 @@ class FakeActions:
         self.checkin_confirmed = True
         self.exchange_ok = True
         self.travel_due_at: float | None = None
+        self.travel_blocked: str | None = None
 
     def daily_checkin(self):
         self.calls.append("checkin")
@@ -88,7 +89,10 @@ class FakeActions:
 
     def travel_tick(self, force: bool = False):
         self.calls.append("travel")
-        return ActionResult(True, "travel", "fake", {"due_at": self.travel_due_at})
+        data: dict = {"due_at": self.travel_due_at}
+        if self.travel_blocked:
+            data["dispatch_blocked"] = self.travel_blocked
+        return ActionResult(not self.travel_blocked, "travel", "fake", data)
 
 
 class TimeUtilTests(unittest.TestCase):
@@ -314,6 +318,24 @@ class SchedulerTests(unittest.TestCase):
         self.assertAlmostEqual(job.due_at, real_due, places=2)
         self.assertEqual(self._beijing(job.due_at).minute, 0)
         self.assertEqual(self._beijing(job.due_at).second, 17)
+
+    def test_dispatch_exhausted_defers_to_2300(self):
+        """派遣次数当天用尽：按用户要求禁用到当晚 23:00，不再每小时重试。"""
+        self.actions.travel_blocked = "exhausted"
+        job = self.scheduler._travel(None)
+        b = self._beijing(job.due_at)
+        self.assertEqual((b.date().isoformat(), b.hour, b.minute),
+                         ("2026-11-10", 23, 0))
+        self.assertEqual(self.state.kv_get("travel_blocked"), "exhausted")
+
+    def test_dispatch_exhausted_after_2300_defers_to_midnight(self):
+        """已过 23:00 才发现用尽 → 次日 0 点（次数通常 0 点恢复）。"""
+        self.fixed_now = datetime(2026, 11, 10, 23, 30, 0, tzinfo=CN_TZ).timestamp()
+        self.actions.travel_blocked = "exhausted"
+        job = self.scheduler._travel(None)
+        b = self._beijing(job.due_at)
+        self.assertEqual((b.date().isoformat(), b.hour, b.minute),
+                         ("2026-11-11", 0, 0))
 
     def test_run_forever_executes_all_three_lines(self):
         executed = self.scheduler.run_forever(max_iterations=3)

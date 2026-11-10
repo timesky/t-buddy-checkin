@@ -66,6 +66,8 @@ enabled = true
 claim_offset_sec = 3     # 到期后延后 3 秒再领，避免服务端尚未结算
 re_dispatch = true       # 领完立刻再派，形成闭环
 fallback_interval_sec = 3600
+# 派遣次数当天用尽时禁用到此时刻（北京时间）；已过则次日 0 点再试
+exhausted_retry_at = "23:00"
 end_field_candidates = ["end_at", "endTime", "end_time", "finish_at", "finishTime", "expire_at", "travel_end_at", "return_at", "arrive_at"]
 remaining_field_candidates = ["remaining_seconds", "remainSeconds", "remain_seconds", "left_seconds", "countdown", "remaining", "leftTime", "seconds_left"]
 state_field_candidates = ["state", "status", "travel_state"]

@@ -20,7 +20,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from .timeutil import CN_TZ, next_daily_at
@@ -57,6 +57,7 @@ class Scheduler:
         self.day_boundary = sched.get("day_boundary", "00:00")
         self.hourly = float(sched.get("hourly_interval_sec", 3600))
         self.fallback = float(cfg["travel"].get("fallback_interval_sec", 3600))
+        self.exhausted_retry_at = cfg["travel"].get("exhausted_retry_at", "23:00")
 
     # ---- 排程辅助 -----------------------------------------------------------
     def _next_boundary(self) -> float:
@@ -67,6 +68,16 @@ class Scheduler:
     def _retry(self) -> float:
         """未得到确定结论：从当前时刻向后滚动一个轮询间隔。"""
         return self.now() + self.hourly
+
+    def _next_exhausted(self) -> float:
+        """派遣次数当天用尽 -> 禁用到晚上 23:00；若已过 23:00 则次日 0 点。"""
+        hh, mm = (int(x) for x in self.exhausted_retry_at.split(":"))
+        dt = datetime.fromtimestamp(self.now(), CN_TZ)
+        cand = dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if cand > dt:
+            return cand.timestamp()
+        return (dt + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0).timestamp()
 
     def _schedule(self, name: str, due: float) -> Job:
         self.state.kv_set(f"next_{name}_at", due)
@@ -93,11 +104,19 @@ class Scheduler:
 
     # ---- 线 3：派遣 / 领礼物（动态滚动） ------------------------------------
     def _travel(self, _job: Job) -> Job | None:
-        self.actions.travel_tick(force=True)
-        due = self.state.kv_get_float("travel_due_at")
-        if due is None or due <= self.now():
-            due = self.now() + self.fallback
-        logger.info("travel line: next=%s (real countdown)", due)
+        result = self.actions.travel_tick(force=True)
+        blocked = result.data.get("dispatch_blocked")
+        if blocked == "exhausted":
+            # 当天派遣次数用完：按用户要求禁用到当晚 23:00，不再每小时重试
+            due = self._next_exhausted()
+            self.state.kv_set("travel_blocked", "exhausted")
+            logger.info("travel line: dispatch exhausted today, next=%s (23:00)", due)
+        else:
+            due = self.state.kv_get_float("travel_due_at")
+            if due is None or due <= self.now():
+                due = self.now() + self.fallback
+            self.state.kv_set("travel_blocked", "")
+            logger.info("travel line: next=%s (real countdown)", due)
         return self._schedule("travel", due)
 
     def initial_jobs(self, now_ts: float | None = None) -> list[Job]:

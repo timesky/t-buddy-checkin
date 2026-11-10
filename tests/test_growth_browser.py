@@ -178,52 +178,85 @@ class DialogTests(unittest.TestCase):
     """动作完成后的浮层清理 + 领奖成功判定（用户 2026-11-10 口径）。"""
 
     def _run_dismiss(self, labels):
-        clicks = []
-        snap = {"elements": [
+        """模拟点关闭后浮层消失；同时记录是否用过 Escape 兜底。"""
+        from unittest.mock import patch
+
+        clicks, keys, closed = [], [], [False]
+        overlay = {"elements": [
             {"role": "AXButton", "label": lab, "element_index": idx}
             for idx, lab in enumerate(labels, start=200)
         ], "raw": ""}
+        clean = {"elements": [
+            {"role": "AXButton", "label": "派猫猫旅行", "element_index": 1}], "raw": ""}
 
         def runner(cmd, **_kw):
             tool = cmd[2] if len(cmd) > 2 else ""
             if tool == "get_window_state":
-                return _FakeProc(json.dumps(snap, ensure_ascii=False))
+                return _FakeProc(json.dumps(clean if closed[0] else overlay,
+                                            ensure_ascii=False))
             if tool == "click":
                 clicks.append(json.loads(cmd[3]))
+                closed[0] = True
+            if tool == "press_key":
+                keys.append(json.loads(cmd[3]))
+                closed[0] = True
             return _FakeProc("{}")
 
         g = GrowthCenter({"growth": {"auto_open_page": False}}, runner=runner)
-        return g.dismiss_dialog(446, 60), clicks
+        with patch("buddy_checkin.adapters.growth.time.sleep"):
+            ok = g.dismiss_dialog(446, 60)
+        return ok, clicks, keys
 
     def test_closes_overlay_and_never_clicks_dispatch_button(self):
-        ok, clicks = self._run_dismiss(["已领取", "关闭", "确定派出"])
+        ok, clicks, keys = self._run_dismiss(["已领取", "关闭", "确定派出"])
         self.assertTrue(ok)
         self.assertEqual(len(clicks), 1)
         self.assertEqual(clicks[0]["element_index"], 201)  # 「关闭」，不是「确定派出」
+        self.assertEqual(keys, [])
+
+    def test_escape_fallback_when_no_close_button_matches(self):
+        """领奖浮层没有匹配关闭按钮时，用 Escape 兜底且不移动光标。"""
+        ok, clicks, keys = self._run_dismiss(["已领取", "确定派出"])
+        self.assertTrue(ok)
+        self.assertEqual(clicks, [])
+        self.assertEqual(len(keys), 1)
+        self.assertEqual(keys[0].get("key"), "escape")
 
     def test_no_dialog_hint_does_nothing(self):
-        ok, clicks = self._run_dismiss(["派猫猫旅行", "兑换奖励"])
+        ok, clicks, keys = self._run_dismiss(["派猫猫旅行", "兑换奖励"])
         self.assertFalse(ok)
         self.assertEqual(clicks, [])
+        self.assertEqual(keys, [])
 
     def test_toolbar_close_button_is_not_clicked(self):
-        # 浏览器工具栏的「关闭」元素索引很小，不能被误当成页面弹窗
-        clicks = []
-        snap = {"elements": [
-            {"role": "AXButton", "label": "已领取", "element_index": 5},
-            {"role": "AXButton", "label": "关闭", "element_index": 8},
-        ], "raw": ""}
+        # 浏览器工具栏的「关闭」元素索引很小，不能被误当成页面弹窗。
+        # 没有匹配的页面按钮 → 走 Escape，而不是点工具栏。
+        clicks, keys = [], []
 
         def runner(cmd, **_kw):
-            if cmd[2] == "get_window_state":
-                return _FakeProc(json.dumps(snap, ensure_ascii=False))
-            if cmd[2] == "click":
+            tool = cmd[2] if len(cmd) > 2 else ""
+            out: dict = {}
+            if tool == "get_window_state":
+                out = ({"elements": [{"role": "AXButton", "label": "派猫猫旅行",
+                                      "element_index": 1}], "raw": ""}
+                       if getattr(runner, "clean", False) else {
+                           "elements": [
+                               {"role": "AXButton", "label": "已领取", "element_index": 5},
+                               {"role": "AXButton", "label": "关闭", "element_index": 8},
+                           ], "raw": ""})
+            elif tool == "click":
                 clicks.append(cmd[3])
-            return _FakeProc("{}")
+            elif tool == "press_key":
+                keys.append(cmd[3])
+                runner.clean = True  # Escape 后浮层消失
+            return _FakeProc(json.dumps(out, ensure_ascii=False))
 
+        from unittest.mock import patch
         g = GrowthCenter({"growth": {"auto_open_page": False}}, runner=runner)
-        self.assertFalse(g.dismiss_dialog(446, 60))
+        with patch("buddy_checkin.adapters.growth.time.sleep"):
+            g.dismiss_dialog(446, 60)
         self.assertEqual(clicks, [])
+        self.assertEqual(len(keys), 1)
 
     def test_claim_success_when_page_returns_to_dispatchable(self):
         self.assertTrue(GrowthCenter._claim_confirmed(_state(["派猫猫旅行"])))
@@ -300,6 +333,34 @@ class DocTextFalsePositiveTests(unittest.TestCase):
                "desktop": {"app": "WorkBuddy"}}
         g = GrowthCenter(cfg, runner=runner)
         self.assertEqual(g._window(), (446, 60))
+
+    def test_dispatch_exhausted_marker_is_reported(self):
+        """页面写「今日派遣次数已用完」时，dispatch 返回 exhausted 供调度器禁用到 23:00。"""
+        wins = _list_windows(
+            {"app_name": "Microsoft Edge", "title": "WorkBuddy - 个人中心",
+             "pid": 446, "window_id": 60, "bounds": {"width": 1900, "height": 940},
+             "is_on_screen": True},
+        )
+        exhausted = {"elements": [
+            {"role": "AXStaticText", "label": "今日派遣次数已用完", "element_index": 30}],
+            "raw": ""}
+
+        def runner(cmd, **_kw):
+            tool = cmd[2] if len(cmd) > 2 else ""
+            if tool == "list_windows":
+                return _FakeProc(json.dumps(wins, ensure_ascii=False))
+            if tool == "get_window_state":
+                out = _state(["派猫猫旅行"]) if runner.n == 0 else exhausted
+                runner.n += 1
+                return _FakeProc(json.dumps(out, ensure_ascii=False))
+            return _FakeProc("{}")
+
+        runner.n = 0
+        g = GrowthCenter({"growth": {"browser_app": "auto", "auto_open_page": False}},
+                         runner=runner)
+        res = g.dispatch()
+        self.assertFalse(res.ok)
+        self.assertEqual(res.data.get("dispatch_blocked"), "exhausted")
 
     def test_read_state_ignores_static_doc_text(self):
         snap = {"elements": [

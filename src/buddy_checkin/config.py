@@ -62,6 +62,8 @@ DEFAULTS: dict[str, Any] = {
         "claim_offset_sec": 3,
         "re_dispatch": True,
         "fallback_interval_sec": 3600,
+        # 派遣次数当天用尽时禁用到此时刻（北京时间）；已过则次日 0 点再试
+        "exhausted_retry_at": "23:00",
     },
     # 成长中心：CuaDriver AX 通道操作已登录的成长中心页面（任意浏览器，不限定 Edge）
     "growth": {
