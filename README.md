@@ -1,8 +1,8 @@
-<style>
-  :root { --wb-max-width: 980px; }
-  body { max-width: var(--wb-max-width); margin: 0 auto; padding: 0 24px 48px; }
-  pre, table { max-width: 100%; overflow-x: auto; }
-  img { max-width: 100%; height: auto; }
+<style>  
+  :root { --wb-max-width: 980px; }  
+  body { max-width: var(--wb-max-width); margin: 0 auto; padding: 0 24px 48px; }  
+  pre, table { max-width: 100%; overflow-x: auto; }  
+  img { max-width: 100%; height: auto; }  
 </style>
 
 # buddy-web-checkin
@@ -19,14 +19,20 @@
 - 受 `.gitignore` 控制的本地产物**不入库**：`config.toml`（含机器路径）、`tools/node_modules/`、`last-checkin-result.json`、`discovered.json`、`progress.txt`、`*.command`、`*.sqlite3`。
 - 新克隆后：`cp config.example.toml config.toml` 按需改即可，无 npm 安装步骤。
 
-## 免费模型约束（重要）
+## 运行时依赖与免费模型约束（重要）
 
-本技能**依赖 WorkBuddy**：每日签到在 WorkBuddy 客户端内、成长中心是 WorkBuddy 个人中心。作为 WorkBuddy 技能 / 定时任务运行时，会消耗模型额度，**必须运行在「免费模型」下**。
+**可作为独立服务执行**：运行时不依赖 WorkBuddy agent、不调用任何模型或在线 API。代码是纯 Python 3.11+ 标准库 + CuaDriver CLI，由 macOS LaunchAgent 直接拉起，不经 WorkBuddy 会话、不消耗模型额度。
 
-- 每次执行前（含定时器触发），先在 WorkBuddy 模型选择器选「免费模型」。
-- 命令行以环境变量 `BUDDY_FREE_MODEL=1` 显式确认已选免费模型，否则命令**拒绝执行**（退出码 2）。
-- `./run.sh install-launchd` 生成的 plist 已内置 `BUDDY_FREE_MODEL=1`，定时任务无需额外操作。
-- 查看策略：`run.sh model-check`。
+但「被操作的对象」是 WorkBuddy：
+
+- 签到要点 **WorkBuddy 桌面客户端**窗口里的签到按钮 → 客户端需保持运行；
+- 成长中心是 **WorkBuddy 个人中心网页** → 浏览器需已登录且窗口打开（任意浏览器）；
+- CuaDriver 需 macOS 辅助功能授权。
+
+`BUDDY_FREE_MODEL=1` 是当初按「WorkBuddy 技能」设计时加的运维确认闸门，**独立服务下并不消耗额度，但按约定保留**：除 `model-check` / `deps` / `install-launchd` 等纯本地运维外，所有命令都要求该环境变量，否则拒绝执行（退出码 2）。LaunchAgent plist 已内置。
+
+- 手动执行：`BUDDY_FREE_MODEL=1 ./run.sh <command>`
+- 查看策略：`run.sh model-check`
 
 说明：脚本无法读取当前选中的模型，故以运维侧显式确认作为放行闸门，避免误在付费模型下运行。
 
@@ -40,11 +46,11 @@
 
 依赖矩阵（2026-11-09 按实际调用核对）：
 
-| 依赖 | 类型 | 必需 | 用途 | 安装方式 |
-|---|---|---|---|---|
-| Python ≥ 3.11（推荐 3.13） | 运行时 | ✅ | 标准库 tomllib/sqlite3/zoneinfo | 系统自带 / python.org |
-| CuaDriver | GUI 应用 | ✅ | 签到（WorkBuddy 客户端 AX）+ 成长中心（浏览器窗口 AX），**唯一自动化后端** | 安装 CuaDriver.app，并在 系统设置→隐私与安全性→辅助功能 授权其驱动 |
-| 浏览器（Chrome/Edge/Safari 任一） | GUI 应用 | 否（已有其一即可） | 成长中心页面载体，用你惯用的浏览器从 WorkBuddy 点开即可 | 无需专门安装 |
+| 依赖                         | 类型     | 必需        | 用途                                               | 安装方式                                       |
+| -------------------------- | ------ | --------- | ------------------------------------------------ | ------------------------------------------ |
+| Python ≥ 3.11（推荐 3.13）     | 运行时    | ✅         | 标准库 tomllib/sqlite3/zoneinfo                     | 系统自带 / python.org                          |
+| CuaDriver                  | GUI 应用 | ✅         | 签到（WorkBuddy 客户端 AX）+ 成长中心（浏览器窗口 AX），**唯一自动化后端** | 安装 CuaDriver.app，并在 系统设置→隐私与安全性→辅助功能 授权其驱动 |
+| 浏览器（Chrome/Edge/Safari 任一） | GUI 应用 | 否（已有其一即可） | 成长中心页面载体，用你惯用的浏览器从 WorkBuddy 点开即可                | 无需专门安装                                     |
 
 ## 签到通道（2026-11-09 真实跑通）
 
@@ -70,13 +76,13 @@
 
 通道：用 CuaDriver 的 AX 能力读**已登录的成长中心页面**（`/profile/growth-center`）。**不限定浏览器**——你从 WorkBuddy 点开链接进入哪个浏览器，就在哪个浏览器操作（默认 `growth.browser_app = "auto"`，按页面内容而非固定 app 探测窗口）；如需限定可填浏览器 app 名。不用注入 cookie，也不碰需要 Bearer token 的签到接口。**页面未登录时只提示你先登录，绝不自动登录。**
 
-| AX 状态 | 页面按钮 | 工具动作 |
-|---|---|---|
-| `idle` | `派猫猫旅行` | 点开场景弹窗 → `确定派出` |
-| `traveling` | `旅行倒计时 00:59:56` | 解析真实剩余秒数 → 到期时间戳 |
-| `claimable` | `领取礼物` | 打开归来弹窗 → `领取 7 积分` → 复核 `已领取` |
-| `gift_dialog` | `领取 N 积分` | 直接领取并复核 |
-| `scene_dialog` | `确定派出` | 确认派遣后立刻重读倒计时 |
+| AX 状态          | 页面按钮             | 工具动作                          |
+| -------------- | ---------------- | ----------------------------- |
+| `idle`         | `派猫猫旅行`          | 点开场景弹窗 → `确定派出`               |
+| `traveling`    | `旅行倒计时 00:59:56` | 解析真实剩余秒数 → 到期时间戳              |
+| `claimable`    | `领取礼物`           | 打开归来弹窗 → `领取 7 积分` → 复核 `已领取` |
+| `gift_dialog`  | `领取 N 积分`        | 直接领取并复核                       |
+| `scene_dialog` | `确定派出`           | 确认派遣后立刻重读倒计时                  |
 
 **派遣时长动态处理（关键）**：派遣前页面只写「预计出行时间为1～4小时」，实际每次不同。工具在**派遣之后**从 `旅行倒计时 HH:MM:SS` 读真实剩余秒数，`due_at = now + remaining + claim_offset_sec`（默认 3 秒，防服务端未结算），写入 SQLite。`daemon` 精确等到期 → 领礼物 → 再派遣 → 立刻读新的倒计时 → 生成下一次 due。每轮都按当次实际时长算，不套固定间隔；关机错过的到期在启动补偿时也会重新读页面现状。
 
@@ -109,38 +115,55 @@ chmod +x run.sh
 
 ./run.sh deps check    # 必跑：确认 CuaDriver 已安装并授权，否则后续命令会在真实环境才暴露缺失
 
-./run.sh status       # 只读查看下次签到 / 旅行到期时间
-./run.sh checkin-now  # 只做每日签到（桌面端）
-./run.sh once         # 手动跑一轮完整闭环，确认无误
-./run.sh daemon       # 常驻精确调度（Ctrl-C 退出）
+# 手动命令（除 model-check / deps / install-launchd 外都要带 BUDDY_FREE_MODEL=1）
+BUDDY_FREE_MODEL=1 ./run.sh status        # 只读：三条时间线的下次执行时间
+BUDDY_FREE_MODEL=1 ./run.sh checkin-now   # 只跑签到线一轮
+BUDDY_FREE_MODEL=1 ./run.sh exchange-now  # 只跑兑换检查线一轮
+BUDDY_FREE_MODEL=1 ./run.sh travel-now    # 只跑旅行线一轮（领礼物→派遣→读倒计时）
+BUDDY_FREE_MODEL=1 ./run.sh once          # 手动全量一轮
+BUDDY_FREE_MODEL=1 ./run.sh daemon        # 统一常驻进程（前台，Ctrl-C 退出）
 
 # 开机常驻（推荐）：写 plist 并加载，登录后自动运行 daemon
 ./run.sh install-launchd
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.buddy-web-checkin.plist
+# 代码改动后重启常驻服务：
+launchctl kickstart -k gui/$(id -u)/com.local.buddy-web-checkin
 ```
 
-### 定时安排（daemon / LaunchAgent 模式）
+### 定时安排：统一常驻进程内的三条时间线
 
-- **每日 9:30**（`daily_checkin.at`）：自动签到 + 签到礼物/兑换检查；当天未签时启动即补签（`catch_up=true`）。
-- **旅行闭环**：派遣后读真实倒计时落库，到期自动「领礼物 → 再派遣 → 再读倒计时」，全程无固定间隔。
+一个 `daemon` 进程、三条独立 Job 线，**进程启动时三条都立即执行一次**，之后各自从该时刻向后滚动：
+
+| 线 | 周期 | 停止轮询条件 | 排程 |
+|---|---|---|---|
+| `checkin` 签到 | 每天 0 点恢复，每小时检查 | **确认**签到成功 → 禁用到当天 23:59 | 固定日周期 |
+| `exchange` 兑换检查 | 每天 0 点恢复，每小时检查 | 兑换成功 **或** 确认无可兑换 → 禁用到当天 23:59 | 固定日周期 |
+| `travel` 领礼物/派遣 | 按页面真实倒计时 | 不停，持续滚动 | **唯一动态** |
+
+- 签到「确认」= DB 已记录今日成功 或 本轮点击后按钮消失；仅凭「按钮找不到」推测已签 **不算确认**，隔一小时再查，避免客户端页面未渲染就整天漏签。
+- 兑换检查失败 / 窗口不可用则隔一小时重试，不会立刻禁用。
+- 重启后旅行线先领礼物、再尝试派遣，然后按真实倒计时设置下次检查；派遣时长每次 1～4 小时不等，绝不套固定间隔。
+- 三条线的下次时刻写入 SQLite，`status` 可直接查看。
 - `run.sh` 自适应选择 Python ≥ 3.11（launchd 最小 PATH 下系统 `python3` 可能是 3.9，已验证修复），可用 `BUDDY_PYTHON` 指定解释器。
 
 成长中心的登录**在你自己的浏览器里完成**：从 WorkBuddy 点开「个人中心」进入任意浏览器并登录，工具直接操作该窗口；检测到未登录时只会提示你登录，不做任何自动登录。
 
 ## 需要人工的两件事
 
-| 事项 | 为什么必须人工 | 具体做法 |
-|---|---|---|
-| 在浏览器里登录 WorkBuddy 个人中心 | 账号归属 | 从 WorkBuddy 点开「个人中心」，在你惯用的浏览器里登录一次 |
-| 授予 macOS 辅助功能权限（CuaDriver） | 读取无障碍树 | CuaDriver（com.trycua.driver）实测已 `auth=2`，通常无需再授权；新机器上跑 `cua-driver permissions grant` |
+| 事项                         | 为什么必须人工 | 具体做法                                                                                  |
+| -------------------------- | ------- | ------------------------------------------------------------------------------------- |
+| 在浏览器里登录 WorkBuddy 个人中心     | 账号归属    | 从 WorkBuddy 点开「个人中心」，在你惯用的浏览器里登录一次                                                    |
+| 授予 macOS 辅助功能权限（CuaDriver） | 读取无障碍树  | CuaDriver（com.trycua.driver）实测已 `auth=2`，通常无需再授权；新机器上跑 `cua-driver permissions grant` |
 
 ## 精确到期与补偿
 
 - 派遣后从页面倒计时读真实剩余秒数（派遣时长每次不同，绝不套固定间隔）。
 - 到期后延后 `claim_offset_sec`（默认 3 秒）再领，避免服务端尚未结算。
 - 领奖成功后立刻再次派遣，并重新读取到期时间，形成闭环。
-- 关机 / 睡眠期间错过的到期时间，在下次启动时被夹到 `now`，**立即补领**，不会白跑一趟。
-- 每日签到 0 点刷新、当天不领作废；`catch_up=true` 时启动即补签。
+- **领取成功判定**：出现「已领取」或页面回到可派遣（idle）/旅行中，即为成功；仍停在可领/弹窗/未知状态不算成功。
+- **动作后清弹窗**：领奖、兑换、派遣完成后关闭页面浮层，避免遮挡后续 AX 读取；只点内容区的「关闭 / 我知道了」等，不碰浏览器标签页，也不误点「确定派出」。
+- **重启即补**：进程启动三条线都立即跑一轮，关机/睡眠期间错过的旅行到期会在启动时立刻领奖并再派遣；签到与兑换未确认的也会在启动后立即检查。
+- 签到/兑换在每天 0 点恢复轮询；当天得到确定结论后禁用到 23:59，失败则隔一小时滚动重试。
 
 ## 幂等与安全边界
 
@@ -156,14 +179,14 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.buddy-web-chec
 
 ## 故障排查
 
-| 现象 | 检查 |
-|---|---|
-| `deps check` 报 CuaDriver MISSING | 安装 CuaDriver.app 并 `cua-driver permissions grant` 授权辅助功能 |
-| 签到报 WorkBuddy main window not found | 确认 WorkBuddy 客户端已打开且主窗口可见 |
-| 成长中心报 login_required | 在浏览器里登录 WorkBuddy 个人中心后重跑（工具不自动登录） |
-| 成长中心报 growth-center window not found | 从 WorkBuddy 点开「个人中心」，让页面在浏览器里可见 |
-| 到期时间不准 | `growth.claim_offset_sec` 可调；确认派遣后读到了真实倒计时 |
-| 领取没到账 | `./run.sh status` 看运行日志；`daily_checkin.catch_up` 可调 |
+| 现象                                   | 检查                                                       |
+| ------------------------------------ | -------------------------------------------------------- |
+| `deps check` 报 CuaDriver MISSING     | 安装 CuaDriver.app 并 `cua-driver permissions grant` 授权辅助功能 |
+| 签到报 WorkBuddy main window not found  | 确认 WorkBuddy 客户端已打开且主窗口可见                                |
+| 成长中心报 login_required                 | 在浏览器里登录 WorkBuddy 个人中心后重跑（工具不自动登录）                       |
+| 成长中心报 growth-center window not found | 从 WorkBuddy 点开「个人中心」，让页面在浏览器里可见                          |
+| 到期时间不准                               | `growth.claim_offset_sec` 可调；确认派遣后读到了真实倒计时               |
+| 领取没到账                                | `./run.sh status` 看运行日志；签到/兑换失败会隔 1 小时自动重试      |
 
 ## 变更记录：移除未使用的工具（2026-11-09）
 

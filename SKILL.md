@@ -5,9 +5,11 @@ description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、�
 
 # buddy-web-checkin
 
-这是一个**独立 CLI 技能**，核心运行不依赖 WorkBuddy 的定时任务或技能机制：调度器是自带的标准库 `heapq`，状态在 SQLite。**所有自动化操作（桌面签到 + 成长中心领礼物/派遣/兑换）都走 CuaDriver 无障碍树（AX 通道，已授权）**——它是本技能唯一的外部工具与唯一实际可用的后端；不使用 headless 浏览器（agent-browser / agent-desktop / CDP / computer-use 均已移除）。
+这是一个**可作为独立服务执行的 CLI 技能**：运行时不依赖 WorkBuddy agent / 模型 / 在线 API，调度器是自带的标准库 `heapq`，状态在 SQLite，由 macOS LaunchAgent 直接拉起常驻进程。**所有自动化操作（桌面签到 + 成长中心领礼物/派遣/兑换）都走 CuaDriver 无障碍树（AX 通道，已授权）**——它是唯一的外部工具与实际后端；headless 浏览器（agent-browser / agent-desktop / CDP / computer-use）均已移除。
 
-> 本技能**依赖 WorkBuddy**（签到在客户端内、成长中心是 WorkBuddy 个人中心），作为 WorkBuddy 技能 / 定时任务运行会消耗模型额度，**必须运行在「免费模型」下**：执行前先在模型选择器选免费模型，再以 `BUDDY_FREE_MODEL=1` 确认，否则命令拒绝执行（见下方「免费模型约束」）。
+「被操作的对象」依赖 WorkBuddy：签到要点 WorkBuddy 桌面客户端窗口，成长中心是 WorkBuddy 个人中心网页（任意浏览器、需已登录）。这两者要开着，但不要求 agent 环境。
+
+> `BUDDY_FREE_MODEL=1` 是当初按 WorkBuddy 技能设计时的运维确认闸门，**独立服务下不消耗额度，但按约定保留**：除 `model-check` / `deps` / `install-launchd` 纯本地运维外，所有命令都要该环境变量，否则拒绝执行（见下方「免费模型约束」）。LaunchAgent plist 已内置。
 
 ## 安装第三方依赖（安装 / 重新拉取技能时必跑）
 
@@ -21,19 +23,35 @@ description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、�
 
 ## 用法
 
-所有命令从项目根目录执行 `./run.sh <command>`：
+手动执行：`BUDDY_FREE_MODEL=1 ./run.sh <command>`（`model-check` / `deps` / `install-launchd` 可不带）。
 
 | 命令 | 作用 | 是否需要人工 |
 |---|---|---|
 | `deps check` | 逐项检查第三方依赖是否就绪（安装技能后必跑） | 否 |
 | `deps install` | 打印 CuaDriver 的手动安装与授权指引（无 npm 依赖） | CuaDriver 需人工安装+授权 |
 | `deps list` | 仅列出依赖与路径 | 否 |
-| `status` | 只读查看下次签到 / 旅行到期 / 最近运行 | 否 |
-| `checkin-now` | 只做每日签到（桌面端） | 否（需 CuaDriver 辅助功能授权） |
-| `once` | 立即跑一轮完整闭环 | 否 |
-| `daemon` | 常驻精确调度：每日 9:30 签到+兑换检查；旅行到期自动领奖→再派遣 | 否 |
-| `install-launchd` | 写 LaunchAgent plist（开机常驻，RunAtLoad+KeepAlive） | 加载命令由你确认执行 |
+| `status` | 只读查看三条时间线的下次执行时间 / 最近运行 | 否 |
+| `checkin-now` | 手动跑**签到线**一轮（只签到） | 否（需 CuaDriver 授权） |
+| `exchange-now` | 手动跑**兑换检查线**一轮 | 否 |
+| `travel-now` | 手动跑**旅行线**一轮（领礼物→派遣→读真实倒计时） | 否 |
+| `once` | 手动全量一轮（四条动作一起） | 否 |
+| `daemon` | 统一常驻进程：三条独立时间线 | 否 |
+| `install-launchd` | 写 LaunchAgent plist（RunAtLoad+KeepAlive） | 加载命令由你确认 |
 | `model-check` | 查看免费模型策略与当前确认状态 | 否 |
+
+## 统一常驻进程的三条时间线
+
+进程启动时**三条线都立即执行一次**，之后各自从该时刻向后滚动：
+
+| 线 | 周期 | 停止条件 |
+|---|---|---|
+| `checkin` | 每天 0 点恢复，每小时检查 | **确认**签到成功 → 禁用到当天 23:59 |
+| `exchange` | 每天 0 点恢复，每小时检查 | 兑换成功 **或** 确认无可兑换 → 禁用到当天 23:59 |
+| `travel` | 按页面真实倒计时滚动（唯一动态） | 不停，领奖→再派遣→读新倒计时 |
+
+签到「确认」= DB 已记录今日成功 或 点击后按钮消失；仅凭按钮不存在推测已签不算确认，隔一小时再查（避免客户端页面未渲染就漏签）。兑换失败/窗口不可用同样隔一小时重试。三条线的下次时刻写入 SQLite，`status` 可查。
+
+**领取成功判定**：出现「已领取」或页面回到可派遣（idle）/旅行中即成功；仍停在可领/弹窗/未知不算。**每个动作完成后关闭页面浮层**，避免遮挡后续 AX 读取；只点内容区「关闭 / 我知道了」，不碰浏览器标签页、不误点「确定派出」。
 
 ## 成长中心与派遣时长
 
@@ -59,14 +77,13 @@ description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、�
 
 详细架构、人工步骤与故障排查见 `README.md`。需求拆解与验收状态见 `prd.json`。
 
-## 免费模型约束（重要）
+## 免费模型约束（历史约定，独立服务下不耗额度）
 
-本技能依赖 WorkBuddy，作为 WorkBuddy 技能 / 定时任务运行会消耗模型额度，**必须运行在「免费模型」下**：
+运行时不依赖 WorkBuddy agent / 模型，但 `BUDDY_FREE_MODEL=1` 闸门按约定保留：
 
-1. 每次执行前（含定时器触发），先在 WorkBuddy 模型选择器选「免费模型」。
-2. 命令行以环境变量 `BUDDY_FREE_MODEL=1` 显式确认已选免费模型，否则命令拒绝执行（退出码 2）。
-3. `install-launchd` 生成的 plist 已内置 `BUDDY_FREE_MODEL=1`，定时任务无需额外操作。
-4. 查看策略：`run.sh model-check`。
+1. 手动执行前以 `BUDDY_FREE_MODEL=1` 显式确认，否则命令拒绝执行（退出码 2）。
+2. `install-launchd` 生成的 plist 已内置 `BUDDY_FREE_MODEL=1`，常驻进程无需额外操作。
+3. 查看策略：`run.sh model-check`（纯本地运维，不需要该变量）。
 
 ## Git 管理
 

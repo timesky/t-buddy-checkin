@@ -67,16 +67,25 @@ class FakeGrowth:
 
 
 class FakeActions:
+    """调度器用的假编排：只记录三条线各自的调用与可配置的结论。"""
+
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.checkin_confirmed = True
+        self.exchange_ok = True
+        self.travel_due_at: float | None = None
 
-    def reconcile_all(self, reason: str = "manual") -> dict:
-        self.calls.append(reason)
-        return {}
+    def daily_checkin(self):
+        self.calls.append("checkin")
+        return ActionResult(True, "checkin", "fake", {"confirmed": self.checkin_confirmed})
 
-    def travel_tick(self, force: bool = False) -> ActionResult:
+    def check_exchanges(self):
+        self.calls.append("exchange")
+        return ActionResult(self.exchange_ok, "exchange", "fake", {"count": 0})
+
+    def travel_tick(self, force: bool = False):
         self.calls.append("travel")
-        return ActionResult(True, "travel", "")
+        return ActionResult(True, "travel", "fake", {"due_at": self.travel_due_at})
 
 
 class TimeUtilTests(unittest.TestCase):
@@ -232,30 +241,69 @@ class SchedulerTests(unittest.TestCase):
         self.cfg = test_cfg(Path(self.tmp.name))
         self.state = State(Path(self.tmp.name) / "state.sqlite3")
         self.actions = FakeActions()
+        # 固定为北京时间 2026-11-10 11:00:00，断言所有排程时刻
+        self.fixed_now = datetime(2026, 11, 10, 11, 0, 0, tzinfo=CN_TZ).timestamp()
+        self.scheduler = Scheduler(
+            self.cfg, self.state, self.actions,
+            now=lambda: self.fixed_now, sleep=lambda _s: None,
+        )
 
     def tearDown(self):
         self.state.close()
         self.tmp.cleanup()
 
-    def test_initial_jobs_include_daily_and_travel(self):
-        jobs = Scheduler(self.cfg, self.state, self.actions).initial_jobs(time.time())
-        self.assertEqual({j.name for j in jobs}, {"daily", "travel"})
+    def _sched(self):
+        return Scheduler(self.cfg, self.state, self.actions,
+                         now=lambda: self.fixed_now, sleep=lambda _s: None)
 
-    def test_overdue_due_is_clamped_for_catch_up(self):
-        now = time.time()
-        self.state.kv_set("travel_due_at", now - 7200)
-        jobs = Scheduler(self.cfg, self.state, self.actions).initial_jobs(now)
-        travel = next(j for j in jobs if j.name == "travel")
-        self.assertAlmostEqual(travel.due_at, now, places=2)
+    @staticmethod
+    def _beijing(ts):
+        return datetime.fromtimestamp(ts, CN_TZ)
 
-    def test_run_forever_executes_without_real_sleep(self):
-        scheduler = Scheduler(
-            self.cfg, self.state, self.actions, sleep=lambda _s: None
-        )
-        executed = scheduler.run_forever(max_iterations=2)
-        self.assertEqual(executed, 2)
-        self.assertTrue(any(c == "daily" for c in self.actions.calls))
-        self.assertIn("travel", self.actions.calls)
+    def test_initial_jobs_are_all_three_and_immediate(self):
+        jobs = self.scheduler.initial_jobs(self.fixed_now)
+        self.assertEqual({j.name for j in jobs}, {"checkin", "exchange", "travel"})
+        self.assertTrue(all(j.due_at == self.fixed_now for j in jobs))
+
+    def test_checkin_confirmed_disables_until_next_midnight(self):
+        self.actions.checkin_confirmed = True
+        job = self.scheduler._checkin(None)
+        boundary = self._beijing(job.due_at)
+        self.assertEqual((boundary.hour, boundary.minute, boundary.second), (0, 0, 0))
+        self.assertEqual(boundary.date().isoformat(), "2026-11-11")
+        self.assertEqual(self.state.kv_get_float("next_checkin_at"), job.due_at)
+
+    def test_checkin_unconfirmed_retries_in_one_hour(self):
+        """仅凭按钮不存在推测已签不算确认：从当前时刻向后滚动 1 小时。"""
+        self.actions.checkin_confirmed = False
+        job = self.scheduler._checkin(None)
+        self.assertAlmostEqual(job.due_at, self.fixed_now + 3600, places=2)
+        self.assertEqual(self._beijing(job.due_at).hour, 12)
+
+    def test_exchange_conclusion_disables_until_next_midnight(self):
+        self.actions.exchange_ok = True  # 兑换成功 or 确认无可兑换
+        job = self.scheduler._exchange(None)
+        self.assertEqual(self._beijing(job.due_at).hour, 0)
+        self.assertEqual(self._beijing(job.due_at).date().isoformat(), "2026-11-11")
+
+    def test_exchange_failure_retries_in_one_hour(self):
+        self.actions.exchange_ok = False
+        job = self.scheduler._exchange(None)
+        self.assertAlmostEqual(job.due_at, self.fixed_now + 3600, places=2)
+
+    def test_travel_uses_real_countdown_not_fixed_interval(self):
+        """trave 线唯一动态滚动：按页面真实倒计时得到 due_at。"""
+        real_due = self.fixed_now + 2 * 3600 + 17  # 2h00m17s，非整点
+        self.state.kv_set("travel_due_at", real_due)
+        job = self.scheduler._travel(None)
+        self.assertAlmostEqual(job.due_at, real_due, places=2)
+        self.assertEqual(self._beijing(job.due_at).minute, 0)
+        self.assertEqual(self._beijing(job.due_at).second, 17)
+
+    def test_run_forever_executes_all_three_lines(self):
+        executed = self.scheduler.run_forever(max_iterations=3)
+        self.assertEqual(executed, 3)
+        self.assertEqual(set(self.actions.calls), {"checkin", "exchange", "travel"})
 
 
 class CuaFakeRunner:

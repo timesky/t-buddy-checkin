@@ -16,7 +16,7 @@ from .adapters.growth import GrowthCenter
 from .deps import cmd_deps
 from .scheduler import Scheduler
 from .state import State
-from .timeutil import format_ts, next_daily_at
+from .timeutil import format_ts
 
 ROOT = Path(__file__).resolve().parents[2]
 logger = logging.getLogger("buddy-checkin")
@@ -67,13 +67,34 @@ def build(cfg: dict):
     return state, desktop, actions
 
 
+def _json(result) -> int:
+    print(json.dumps(config.scrub(result.as_dict()), ensure_ascii=False, indent=2))
+    return 0 if result.ok else 1
+
+
 def cmd_checkin_now(cfg: dict, args: argparse.Namespace) -> int:
-    """只做每日签到，不碰网页端。供辅助功能授权后、或在终端直跑。"""
+    """手动：只做签到时间线的一轮（不碰成长中心）。"""
     state, _desktop, actions = build(cfg)
     try:
-        result = actions.daily_checkin()
-        print(json.dumps(config.scrub(result.as_dict()), ensure_ascii=False, indent=2))
-        return 0 if result.ok else 1
+        return _json(actions.daily_checkin())
+    finally:
+        state.close()
+
+
+def cmd_exchange_now(cfg: dict, args: argparse.Namespace) -> int:
+    """手动：只做兑换检查时间线的一轮（不碰签到、不碰派遣）。"""
+    state, _desktop, actions = build(cfg)
+    try:
+        return _json(actions.check_exchanges())
+    finally:
+        state.close()
+
+
+def cmd_travel_now(cfg: dict, args: argparse.Namespace) -> int:
+    """手动：只做旅行时间线的一轮（领礼物 -> 派遣 -> 读真实倒计时）。"""
+    state, _desktop, actions = build(cfg)
+    try:
+        return _json(actions.travel_tick(force=True))
     finally:
         state.close()
 
@@ -90,12 +111,12 @@ def cmd_once(cfg: dict, args: argparse.Namespace) -> int:
 
 def cmd_status(cfg: dict, args: argparse.Namespace) -> int:
     state, desktop, _actions = build(cfg)
-    due = state.kv_get_float("travel_due_at")
     print("== buddy-web-checkin status ==")
     print(f"今日(北京时间)      : {config.scrub(state.kv_get('last_checkin_day')) or '未签到'}")
-    print(f"下次签到            : {format_ts(next_daily_at(cfg['daily_checkin']['at']).timestamp())}")
-    print(f"旅行到期            : {format_ts(due)}")
     print(f"桌面端后端          : {desktop.probe().data.get('backend') or 'none (需安装/授权)'}")
+    print("-- 三条时间线（统一常驻进程）--")
+    for name, label in (("checkin", "签到检查"), ("exchange", "兑换检查"), ("travel", "旅行/派遣")):
+        print(f"  {label:10} 下次: {format_ts(state.kv_get_float(f'next_{name}_at'))}")
     print("-- 最近运行 --")
     for row in state.recent(10):
         print(f"  {format_ts(row['ts'])}  {'OK' if row['ok'] else 'FAIL'}  {row['action']}: {row['detail'][:100]}")
@@ -118,7 +139,8 @@ def cmd_daemon(cfg: dict, args: argparse.Namespace) -> int:
         signal.signal(signal.SIGINT, _stop)
     except (ImportError, ValueError):
         pass
-    print("[daemon] started; waiting for next due (Ctrl-C to stop)")
+    print("[daemon] started: 三条时间线(checkin/exchange/travel)均已立即执行一轮；"
+          " 签到/兑换按日周期，旅行按真实倒计时滚动 (Ctrl-C 退出)")
     try:
         scheduler.run_forever(stop=stop)
     finally:
@@ -167,11 +189,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="buddy-checkin")
     parser.add_argument("--config", help="path to config.toml")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("checkin-now", help="daily checkin only (desktop lane), no web actions")
-    sub.add_parser("once", help="run one full reconcile pass")
-    sub.add_parser("status", help="read-only status")
-    sub.add_parser("daemon", help="run the exact-expiry scheduler")
-    sub.add_parser("install-launchd", help="write LaunchAgent plist (does not load it)")
+    sub.add_parser("checkin-now", help="手动跑签到时间线一轮（只签到）")
+    sub.add_parser("exchange-now", help="手动跑兑换检查时间线一轮")
+    sub.add_parser("travel-now", help="手动跑旅行时间线一轮（领礼物→派遣→读倒计时）")
+    sub.add_parser("once", help="手动跑全量一轮（签到+礼物+兑换+旅行）")
+    sub.add_parser("status", help="只读状态：三条时间线下次执行时间")
+    sub.add_parser("daemon", help="统一常驻进程：三条独立时间线")
+    sub.add_parser("install-launchd", help="写 LaunchAgent plist（开机常驻，不自动加载）")
     sub.add_parser("model-check", help="show free-model policy and current acknowledgment state")
     # 第三方依赖：安装技能时必跑 deps check，确认 CuaDriver 已安装并授权
     dep = sub.add_parser("deps", help="第三方依赖检查（安装技能时必跑）")
@@ -195,6 +219,8 @@ def main(argv: list[str] | None = None) -> int:
             return rc
     handlers = {
         "checkin-now": cmd_checkin_now,
+        "exchange-now": cmd_exchange_now,
+        "travel-now": cmd_travel_now,
         "once": cmd_once,
         "status": cmd_status,
         "daemon": cmd_daemon,

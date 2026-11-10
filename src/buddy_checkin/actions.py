@@ -30,14 +30,24 @@ class Actions:
 
     # ---- 1. 每日签到（唯一依赖桌面客户端） ---------------------------------
     def daily_checkin(self) -> ActionResult:
+        """签到时间线的一轮：只做签到，不碰成长中心。
+
+        返回 data.confirmed：True 才允许当天禁用轮询。
+        DB 已记录今日成功 / 本轮点击并验证按钮消失 = 确认；
+        仅凭「按钮不存在」推测已签 = 未确认，调度器会隔一小时再查。
+        """
         if not self.cfg["daily_checkin"]["enabled"]:
-            return ActionResult(True, "checkin", "disabled")
+            return ActionResult(True, "checkin", "disabled", {"confirmed": True})
         if self.state.kv_get("last_checkin_day") == day_key():
-            return ActionResult(True, "checkin", "already checked in today")
+            return ActionResult(True, "checkin", "already checked in today",
+                                {"confirmed": True})
         result = self.desktop.claim_daily(self.cfg["dom_fallback"]["checkin"])
         if result.ok:
             self.state.claim_once("checkin", "daily")
             self.state.kv_set("last_checkin_day", day_key())
+            data = dict(result.data)
+            data["confirmed"] = bool(data.get("confirmed") or data.get("verified"))
+            result = ActionResult(True, result.action, result.detail, data)
         self.state.log("checkin", result.ok, result.detail)
         return result
 
@@ -61,6 +71,29 @@ class Actions:
         for r in results:
             self.state.log(r.action, r.ok, r.detail[:400])
         return results
+
+    def check_exchanges(self) -> ActionResult:
+        """兑换检查时间线的一轮：只检查/兑换，不碰签到与派遣。
+
+        ok=True 表示得到确定结论（兑换成功，或确认无可兑换），调度器据此
+        禁用到当天 23:59；检查失败/窗口不可用则 ok=False，隔一小时重试。
+        """
+        if not self.cfg.get("growth", {}).get("auto_exchange", True):
+            return ActionResult(True, "exchange", "auto_exchange disabled",
+                                {"skipped": True, "count": 0})
+        if self.growth is None:
+            return ActionResult(False, "exchange",
+                                "growth channel not configured (set [growth].enabled=true)")
+        results = self.growth.claim_exchanges(
+            lambda key: self.state.already_claimed("exchange", key)
+        )
+        for ex in results:
+            if ex.ok and not ex.data.get("skipped") and ex.data.get("count", 1) != 0:
+                self.state.claim_once("exchange", ex.data.get("key", ex.detail))
+            self.state.log(ex.action, ex.ok, ex.detail[:400])
+        ok = all(r.ok for r in results) if results else True
+        detail = "; ".join(r.detail[:100] for r in results) or "nothing exchangeable"
+        return ActionResult(ok, "exchange", detail, {"count": len(results)})
 
     # ---- 3. 派遣 / 到期领奖 / 再派遣 ----------------------------------------
     def travel_tick(self, force: bool = False) -> ActionResult:

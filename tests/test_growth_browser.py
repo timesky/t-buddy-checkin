@@ -174,5 +174,65 @@ class GrowthBrowserTests(unittest.TestCase):
         self.assertFalse(g.claim_gift().ok)
 
 
+class DialogTests(unittest.TestCase):
+    """动作完成后的浮层清理 + 领奖成功判定（用户 2026-11-10 口径）。"""
+
+    def _run_dismiss(self, labels):
+        clicks = []
+        snap = {"elements": [
+            {"role": "AXButton", "label": lab, "element_index": idx}
+            for idx, lab in enumerate(labels, start=200)
+        ], "raw": ""}
+
+        def runner(cmd, **_kw):
+            tool = cmd[2] if len(cmd) > 2 else ""
+            if tool == "get_window_state":
+                return _FakeProc(json.dumps(snap, ensure_ascii=False))
+            if tool == "click":
+                clicks.append(json.loads(cmd[3]))
+            return _FakeProc("{}")
+
+        g = GrowthCenter({"growth": {}}, runner=runner)
+        return g.dismiss_dialog(446, 60), clicks
+
+    def test_closes_overlay_and_never_clicks_dispatch_button(self):
+        ok, clicks = self._run_dismiss(["已领取", "关闭", "确定派出"])
+        self.assertTrue(ok)
+        self.assertEqual(len(clicks), 1)
+        self.assertEqual(clicks[0]["element_index"], 201)  # 「关闭」，不是「确定派出」
+
+    def test_no_dialog_hint_does_nothing(self):
+        ok, clicks = self._run_dismiss(["派猫猫旅行", "兑换奖励"])
+        self.assertFalse(ok)
+        self.assertEqual(clicks, [])
+
+    def test_toolbar_close_button_is_not_clicked(self):
+        # 浏览器工具栏的「关闭」元素索引很小，不能被误当成页面弹窗
+        clicks = []
+        snap = {"elements": [
+            {"role": "AXButton", "label": "已领取", "element_index": 5},
+            {"role": "AXButton", "label": "关闭", "element_index": 8},
+        ], "raw": ""}
+
+        def runner(cmd, **_kw):
+            if cmd[2] == "get_window_state":
+                return _FakeProc(json.dumps(snap, ensure_ascii=False))
+            if cmd[2] == "click":
+                clicks.append(cmd[3])
+            return _FakeProc("{}")
+
+        g = GrowthCenter({"growth": {}}, runner=runner)
+        self.assertFalse(g.dismiss_dialog(446, 60))
+        self.assertEqual(clicks, [])
+
+    def test_claim_success_when_page_returns_to_dispatchable(self):
+        self.assertTrue(GrowthCenter._claim_confirmed(_state(["派猫猫旅行"])))
+        self.assertTrue(GrowthCenter._claim_confirmed(_state(["旅行倒计时 01:00:00"])))
+
+    def test_claim_not_confirmed_while_still_claimable_or_unknown(self):
+        self.assertFalse(GrowthCenter._claim_confirmed(_state(["领取礼物"])))
+        self.assertFalse(GrowthCenter._claim_confirmed(_state(["某个陌生页面"])))
+
+
 if __name__ == "__main__":
     unittest.main()

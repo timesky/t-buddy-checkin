@@ -45,6 +45,11 @@ GROWTH_CONTENT_MARKERS = (
 # 弱特征（窗口标题等）：仅用于候选窗口排序，不参与内容判定
 GROWTH_MARKERS = GROWTH_CONTENT_MARKERS + ("个人中心", "连签", "我的积分")
 
+# 动作完成后需要清掉的页面浮层：只在快照出现这些提示/按钮时才点关闭，
+# 避免误关浏览器标签页或点到「确定派出」等资源类按钮。
+DIALOG_HINTS = ("已领取", "领取成功", "恭喜", "选择奖励", "我知道了", "关闭")
+DIALOG_CLOSE_LABELS = ("关闭", "我知道了", "知道了", "好的", "完成", "确定")
+
 
 def parse_hms(text: str) -> int | None:
     """从任意文本里抽 HH:MM:SS 并返回总秒数。"""
@@ -218,15 +223,44 @@ class GrowthCenter:
     # ---- 动作 ---------------------------------------------------------------
     @staticmethod
     def _claim_confirmed(after: dict) -> bool:
-        """领奖是否完成。
+        """领奖是否完成：出现「已领取」或页面回到可派遣/旅行中，都算成功。
 
-        实测 2026-11-10：点完「领取 N 积分」后页面可能直接回到可派遣状态（idle），
-        AX 树里根本不出现「已领取」字样。只认文案会误报 FAIL（礼物其实已到账），
-        所以以「页面已离开 可领/弹窗 状态」为准。
+        用户口径（2026-11-10）：**领取后变成可派遣就是领取成功了**。
+        实测：点完「领取 N 积分」后页面常直接回到 idle（派猫猫旅行），AX 树
+        根本不出现「已领取」字样；只认文案会误报 FAIL。反之若页面仍停在
+        claimable / gift_dialog / unknown，则不确认，避免把没领到记成成功。
         """
-        if "已领取" in GrowthCenter.read_state(after)["raw"]:
+        info = GrowthCenter.read_state(after)
+        if "已领取" in info["raw"]:
             return True
-        return GrowthCenter.read_state(after)["state"] not in ("claimable", "gift_dialog")
+        return info["state"] in ("idle", "traveling")
+
+    def dismiss_dialog(self, pid: int, wid: int) -> bool:
+        """动作完成后清理页面浮层，避免弹窗遮挡后续 AX 读取。
+
+        保守规则：快照里必须出现明确的弹窗特征才动手；只点页面内容区里的
+        「关闭 / 我知道了 / 好的」等按钮（element_index > 20 排除浏览器工具栏），
+        精确匹配 label —— 「确定派出」「领取 N 积分」等绝不会被误点。
+        """
+        snap = self.snapshot(pid, wid)
+        if "error" in snap:
+            return False
+        raw = self.read_state(snap)["raw"]
+        if not any(hint in raw for hint in DIALOG_HINTS):
+            return False
+        candidates = [
+            el for el in snap.get("elements", [])
+            if el.get("role") == "AXButton"
+            and str(el.get("label") or "").strip() in DIALOG_CLOSE_LABELS
+            and (el.get("element_index") or 0) > 20
+        ]
+        if not candidates:
+            return False
+        el = max(candidates, key=lambda e: e.get("element_index") or 0)
+        out = self._call("click", {
+            "pid": pid, "window_id": wid, "element_index": el["element_index"],
+        })
+        return "error" not in out
 
     def claim_gift(self) -> ActionResult:
         win = self._window()
@@ -243,7 +277,9 @@ class GrowthCenter:
                 return ActionResult(False, "gift", label)
             after = self.snapshot(pid, wid)
             confirmed = self._claim_confirmed(after)
-            return ActionResult(confirmed, "gift", f"claimed {label}", {"confirmed": confirmed})
+            closed = self.dismiss_dialog(pid, wid)
+            return ActionResult(confirmed, "gift", f"claimed {label}",
+                                {"confirmed": confirmed, "dialog_closed": closed})
 
         if st != "claimable":
             return ActionResult(True, "gift", f"nothing claimable (state={st})", {"state": st})
@@ -257,7 +293,9 @@ class GrowthCenter:
             return ActionResult(False, "gift", f"gift dialog: {label2}")
         after = self.snapshot(pid, wid)
         confirmed = self._claim_confirmed(after)
-        return ActionResult(confirmed, "gift", f"claimed {label2}", {"confirmed": confirmed, "label": label2})
+        closed = self.dismiss_dialog(pid, wid)
+        return ActionResult(confirmed, "gift", f"claimed {label2}",
+                            {"confirmed": confirmed, "label": label2, "dialog_closed": closed})
 
     @staticmethod
     def scan_exchanges(snap: dict) -> list[tuple[str, str]]:
@@ -310,6 +348,7 @@ class GrowthCenter:
             snap = self.snapshot(pid, wid)
         candidates = self.scan_exchanges(snap)
         if not candidates:
+            self.dismiss_dialog(pid, wid)
             return [ActionResult(True, "exchange", "nothing exchangeable", {"count": 0})]
         results: list[ActionResult] = []
         for label, kind in candidates:
@@ -363,6 +402,7 @@ class GrowthCenter:
                 ok and not still, "exchange", f"{kind}: {clicked}",
                 {"kind": kind, "label": label, "key": key, "changed": not still},
             ))
+        self.dismiss_dialog(pid, wid)
         return results
 
     def dispatch(self) -> ActionResult:
@@ -391,16 +431,19 @@ class GrowthCenter:
         after = self.snapshot(pid, wid)
         info = self.read_state(after)
         if info["state"] != "traveling" or info["remaining_sec"] is None:
+            self.dismiss_dialog(pid, wid)
             return ActionResult(
                 False, "travel_dispatch",
                 f"dispatch not confirmed (state={info['state']})",
                 {"state": info["state"]},
             )
         due = time.time() + info["remaining_sec"] + self.claim_offset_sec
+        closed = self.dismiss_dialog(pid, wid)
         return ActionResult(
             True, "travel_dispatch",
             f"dispatched; real duration {info['remaining_sec']}s",
-            {"remaining_sec": info["remaining_sec"], "due_at": due, "scene": self.scene or "default"},
+            {"remaining_sec": info["remaining_sec"], "due_at": due,
+             "scene": self.scene or "default", "dialog_closed": closed},
         )
 
     def tick(self, force: bool = False) -> ActionResult:

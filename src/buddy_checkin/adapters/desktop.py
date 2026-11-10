@@ -109,11 +109,13 @@ class CuaDriverSigner(DesktopAdapter):
                                {"backend": "cua-driver"})
         idx = self._find_button(snap, texts)
         if idx is None:
-            # 签到成功后 Buddy 加油站卡片会收起，按钮不再出现
+            # 签到成功后 Buddy 加油站卡片会收起，按钮不再出现；但也可能是页面尚未
+            # 渲染完。标记为「推测」而非「已确认」，让上层每小时轮询再确认一次。
             return ActionResult(
                 True, "desktop.checkin",
                 "checkin button absent; treating as already checked in today",
-                {"backend": "cua-driver", "clicked": False, "already": True},
+                {"backend": "cua-driver", "clicked": False, "already": True,
+                 "inferred": True},
             )
         result = self._call("click", {"pid": pid, "window_id": wid, "element_index": idx})
         if "error" in result:
@@ -127,6 +129,7 @@ class CuaDriverSigner(DesktopAdapter):
             "clicked and button disappeared (checkin verified)" if ok
             else "clicked but button still visible",
             {"backend": "cua-driver", "clicked": True, "element_index": idx,
-             "verified": ok, "element_count_before": snap.get("element_count"),
+             "verified": ok, "confirmed": ok,
+             "element_count_before": snap.get("element_count"),
              "element_count_after": after.get("element_count")},
         )

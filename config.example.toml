@@ -12,9 +12,16 @@ cua_driver_bin = "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
 app = "WorkBuddy"
 
 [daily_checkin]
-enabled = true
-at = "09:30"
-catch_up = true          # 开机/唤醒后若今天还没签，立即补签
+enabled = true          # 签到时间线的总开关；周期见下方 [schedule]
+
+[schedule]
+# 统一常驻进程的三条时间线。只有 travel 是动态滚动：
+#   checkin   每天 0 点恢复每小时轮询，签到成功 -> 禁用到当天 23:59
+#   exchange  每天 0 点恢复每小时轮询，兑换成功或确认无可兑换 -> 禁用到当天 23:59
+#   travel    重启先领礼物/派遣，之后按页面真实倒计时设置下次检查
+# 进程启动时三条线都立即执行一次，然后各自从该时刻向后滚动。
+day_boundary = "00:00"
+hourly_interval_sec = 3600
 
 [gifts]
 enabled = true

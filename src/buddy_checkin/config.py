@@ -22,7 +22,17 @@ DEFAULTS: dict[str, Any] = {
         "cua_driver_bin": "/Applications/CuaDriver.app/Contents/MacOS/cua-driver",
         "app": "WorkBuddy",
     },
-    "daily_checkin": {"enabled": True, "at": "09:30", "catch_up": True},
+    # 签到时间线由 [schedule] 控制（0 点恢复 / 每小时轮询），此处只留总开关
+    "daily_checkin": {"enabled": True},
+    # 统一进程内的三条调度线（仅 travel 为动态滚动）：
+    #   1 checkin  每天 0 点恢复每小时轮询，签到成功即禁用到当天 23:59
+    #   2 exchange 每天 0 点恢复每小时轮询，兑换成功或确认无可兑换即禁用到当天 23:59
+    #   3 travel   重启先领礼物/派遣，之后按真实倒计时动态滚动
+    # 三条线在进程启动时都立即执行一次，再各自从该时刻向后滚动。
+    "schedule": {
+        "day_boundary": "00:00",
+        "hourly_interval_sec": 3600,
+    },
     "gifts": {
         "enabled": True,
         "allow_keywords": ["今日礼包", "签到", "连签", "盲盒", "抽奖", "旅行", "奖励", "领取"],
