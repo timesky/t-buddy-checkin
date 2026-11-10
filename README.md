@@ -57,11 +57,18 @@
 系统级 TCC 数据库给出决定性答案：`com.trycua.driver` 是 `auth=2`（已授权），而 `com.apple.Terminal` 和 `com.tencent.workbuddy.mac` 都是 `auth=0`。所以唯一可行后端是 **CuaDriver**。流程：
 
 1. `cua-driver call list_windows` 找 WorkBuddy 可见主窗口（实测 `pid=452` / `window_id=66`）。
-2. `get_window_state` 重新索引，定位 Buddy 加油站卡片里的 `AXButton "立即领取"`（实测 `element_index=65`）。
-3. `click` 用 `element_index` 走 AX press —— **不移动光标、不抢焦点、不激活窗口**。
-4. 再取一次快照复核：按钮与卡片消失即签到成功。
+2. `get_window_state` 重新索引。**签到按钮藏在「Buddy加油站」面板里**：面板收起时 AX 树只有入口
+   `AXButton "Buddy加油站"`，**没有**「立即领取」。必须先点开入口、再取一次新快照重新定位
+   `AXButton "立即领取"`（实测展开后 `element_index=64`）。
+3. `click` 优先用 `element_token`（来自最近一次快照，失效会显式报 stale），无 token 才回退
+   `element_index`；并且**校验返回 `path == "ax"`，任何非 AX 路径一律拒绝**——像素路径会合成
+   鼠标事件、把光标甩到窗口左上角。纯 AX press 不移动光标、不抢焦点、不激活窗口。
+4. 再取一次快照复核：按钮与卡片消失即签到成功（1360 → 985 个元素）。
 
-实测结果：点击后「Buddy加油站 / 每日可领 100 积分 / 立即领取」全部从 AX 树消失；随后 `./run.sh checkin-now` 返回 `{"ok": true, "already": true}`，并落库 `last_checkin_day=2026-11-09`。按钮不存在时适配器判定为「今天已签到」，不会重复点击。
+> **2026-11-10 真实踩坑**：旧逻辑在面板收起时找不到「立即领取」就判定「今天已签到」并写库
+> `last_checkin_day`，造成**整天假阳性、根本没签到**，之后所有轮询都被幂等跳过。现在规则是：
+> 面板未展开 → 先展开再判断；展开后仍无按钮 = 确认已签；连入口都找不到 = **状态不确定**
+> （不写库、隔一小时再查）。只有 `confirmed=true` 才落库。
 
 前置条件：CuaDriver daemon 必须在自身身份下运行：
 

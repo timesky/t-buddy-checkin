@@ -41,15 +41,16 @@ def test_cfg(tmp: Path) -> dict:
 
 
 class FakeDesktop(DesktopAdapter):
-    def __init__(self) -> None:
+    def __init__(self, confirmed: bool = True) -> None:
         self.calls = 0
+        self.confirmed = confirmed
 
     def probe(self) -> ActionResult:
         return ActionResult(True, "desktop.probe", "")
 
     def claim_daily(self, texts: list[str]) -> ActionResult:
         self.calls += 1
-        return ActionResult(True, "checkin", "ok")
+        return ActionResult(True, "checkin", "ok", {"confirmed": self.confirmed})
 
 
 class FakeGrowth:
@@ -216,6 +217,18 @@ class ActionsTests(unittest.TestCase):
         self.assertAlmostEqual(self.state.kv_get_float("travel_due_at"),
                                self.state.kv_get_float("travel_due_at"))
 
+    def test_unconfirmed_checkin_does_not_write_state(self):
+        """回归（2026-11-10）：按钮找不到只是推测，绝不能写 last_checkin_day，
+        否则当天所有后续轮询都被跳过，整天漏签。"""
+        actions = Actions(self.cfg, self.state, FakeDesktop(confirmed=False),
+                          growth=FakeGrowth(due=time.time() + 1200))
+        result = actions.daily_checkin()
+        self.assertFalse(result.data.get("confirmed"))
+        self.assertIsNone(self.state.kv_get("last_checkin_day"))
+        # 下一轮仍会真正调用桌面端检查，而不是被幂等跳过
+        actions.daily_checkin()
+        self.assertEqual(2, actions.desktop.calls)
+
     def test_force_claim_then_redispatch_records_due(self):
         due = time.time() + 3
         actions = Actions(self.cfg, self.state, FakeDesktop(), growth=FakeGrowth(due))
@@ -306,13 +319,20 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(set(self.actions.calls), {"checkin", "exchange", "travel"})
 
 
-class CuaFakeRunner:
-    """模拟 cua-driver call：第一次快照有签到按钮，点击后快照里按钮消失。"""
+def desktop_snap(*buttons) -> dict:
+    elements = [{"element_index": 0, "role": "AXWindow", "label": "WorkBuddy"}]
+    elements.extend(buttons)
+    return {"elements": elements, "element_count": len(elements)}
 
-    def __init__(self, button_present: bool = True):
+
+class CuaFakeRunner:
+    """按快照序列模拟 cua-driver call，可注入 click 的 path。"""
+
+    def __init__(self, snaps: list[dict] | None = None, *, click_path: str = "ax"):
+        self.snaps = list(snaps) if snaps else [desktop_snap()]
+        self.click_path = click_path
         self.calls: list[list[str]] = []
         self.snap_count = 0
-        self.button_present = button_present
 
     def __call__(self, cmd, **_kwargs):
         self.calls.append(cmd)
@@ -324,12 +344,9 @@ class CuaFakeRunner:
             }]}
         elif tool == "get_window_state":
             self.snap_count += 1
-            elements = [{"element_index": 0, "role": "AXWindow", "label": "WorkBuddy"}]
-            if self.button_present and self.snap_count == 1:
-                elements.append({"element_index": 65, "role": "AXButton", "label": "立即领取"})
-            out = {"elements": elements, "element_count": len(elements)}
+            out = self.snaps.pop(0) if len(self.snaps) > 1 else self.snaps[0]
         elif tool == "click":
-            out = {"effect": "unverifiable", "path": "ax", "verified": False}
+            out = {"effect": "unverifiable", "path": self.click_path, "verified": False}
         else:
             out = {}
         return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(out), stderr="")
@@ -345,22 +362,69 @@ class CuaDriverTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_clicks_checkin_button_and_verifies_disappearance(self):
-        runner = CuaFakeRunner()
+        snaps = [
+            desktop_snap({"element_index": 65, "role": "AXButton", "label": "立即领取"}),
+            desktop_snap(),  # 点击后按钮消失
+        ]
+        runner = CuaFakeRunner(snaps)
         result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
         self.assertTrue(result.ok)
         self.assertTrue(result.data["verified"])
         clicks = [c for c in runner.calls if c[2] == "click"]
         self.assertEqual(len(clicks), 1)
-        payload = json.loads(clicks[0][3])
-        self.assertEqual(payload, {"pid": 452, "window_id": 66, "element_index": 65})
-        self.assertEqual(runner.snap_count, 2)  # 点击后复核快照
+        self.assertEqual(json.loads(clicks[0][3]),
+                         {"pid": 452, "window_id": 66, "element_index": 65})
+        self.assertEqual(runner.snap_count, 2)
 
-    def test_absent_button_means_already_checked_in(self):
-        runner = CuaFakeRunner(button_present=False)
+    def test_opens_collapsed_station_panel_then_clicks_checkin(self):
+        """回归（2026-11-10）：面板收起时 AX 树里只有入口按钮，没有「立即领取」。
+        必须先展开加油站、重新快照定位，否则整天假阳性不签到。"""
+        snaps = [
+            desktop_snap({"element_index": 58, "role": "AXButton", "label": "Buddy加油站"}),
+            desktop_snap({"element_index": 64, "role": "AXButton", "label": "立即领取",
+                          "element_token": "s2:64"}),
+            desktop_snap(),  # 点击签到后按钮消失
+        ]
+        runner = CuaFakeRunner(snaps)
+        result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
+        self.assertTrue(result.ok, result.detail)
+        self.assertTrue(result.data["confirmed"])
+        self.assertTrue(result.data["station_expanded"])
+        clicks = [json.loads(c[3]) for c in runner.calls if c[2] == "click"]
+        self.assertEqual(len(clicks), 2)
+        self.assertEqual(clicks[0]["element_index"], 58)       # 先展开面板
+        self.assertEqual(clicks[1].get("element_token"), "s2:64")  # 重新定位并优先用 token
+
+    def test_no_button_after_expanding_means_already_checked_in(self):
+        snaps = [
+            desktop_snap({"element_index": 58, "role": "AXButton", "label": "Buddy加油站"}),
+            desktop_snap(),  # 展开后仍无领取按钮
+        ]
+        runner = CuaFakeRunner(snaps)
         result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
         self.assertTrue(result.ok)
+        self.assertTrue(result.data["confirmed"])
         self.assertTrue(result.data["already"])
+
+    def test_missing_button_and_entry_is_uncertain_not_checked_in(self):
+        """连入口都找不到：不能推断已签，交给调度器隔一小时再查。"""
+        runner = CuaFakeRunner([desktop_snap()])
+        result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
+        self.assertFalse(result.ok)
+        self.assertFalse(result.data["confirmed"])
+        self.assertTrue(result.data["uncertain"])
         self.assertFalse(any(c[2] == "click" for c in runner.calls))
+
+    def test_refuses_non_ax_click_path(self):
+        """非 AX 路径会合成鼠标事件把光标甩到左上角，必须拒绝。"""
+        snaps = [
+            desktop_snap({"element_index": 65, "role": "AXButton", "label": "立即领取"}),
+            desktop_snap(),
+        ]
+        runner = CuaFakeRunner(snaps, click_path="cg_event")
+        result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
+        self.assertFalse(result.ok)
+        self.assertIn("non-AX", result.detail)
 
 
 def growth_snap(labels: list[str]) -> dict:

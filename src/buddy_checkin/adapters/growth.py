@@ -180,12 +180,19 @@ class GrowthCenter:
                 continue
             label = str(el.get("label") or "")
             if predicate(label):
-                idx = el.get("element_index")
-                if idx is None:
+                payload: dict[str, Any] = {"pid": pid, "window_id": wid}
+                if el.get("element_token"):
+                    payload["element_token"] = el["element_token"]
+                elif el.get("element_index") is not None:
+                    payload["element_index"] = el["element_index"]
+                else:
                     continue
-                out = self._call("click", {"pid": pid, "window_id": wid, "element_index": idx})
+                out = self._call("click", payload)
                 if "error" in out:
-                    return False, out["error"]
+                    return False, str(out["error"])
+                if out.get("path") not in (None, "ax"):
+                    # 非 AX 路径会移动光标，坚决拒绝
+                    return False, f"refused non-AX click path: {out.get('path')}"
                 return True, label
         return False, "button not found"
 
@@ -257,10 +264,13 @@ class GrowthCenter:
         if not candidates:
             return False
         el = max(candidates, key=lambda e: e.get("element_index") or 0)
-        out = self._call("click", {
-            "pid": pid, "window_id": wid, "element_index": el["element_index"],
-        })
-        return "error" not in out
+        payload: dict[str, Any] = {"pid": pid, "window_id": wid}
+        if el.get("element_token"):
+            payload["element_token"] = el["element_token"]
+        else:
+            payload["element_index"] = el.get("element_index")
+        out = self._call("click", payload)
+        return "error" not in out and out.get("path") in (None, "ax")
 
     def claim_gift(self) -> ActionResult:
         win = self._window()
@@ -334,7 +344,12 @@ class GrowthCenter:
             lab = str(el.get("label") or "").strip()
             idx = el.get("element_index") or 0
             if el.get("role") == "AXButton" and lab == "关闭" and idx > 150:
-                call("click", {"pid": pid, "window_id": wid, "element_index": idx})
+                payload: dict[str, Any] = {"pid": pid, "window_id": wid}
+                if el.get("element_token"):
+                    payload["element_token"] = el["element_token"]
+                else:
+                    payload["element_index"] = idx
+                call("click", payload)
                 return True
         return False
 

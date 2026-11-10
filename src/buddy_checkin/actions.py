@@ -42,12 +42,11 @@ class Actions:
             return ActionResult(True, "checkin", "already checked in today",
                                 {"confirmed": True})
         result = self.desktop.claim_daily(self.cfg["dom_fallback"]["checkin"])
-        if result.ok:
+        # 只有「确认」才落库：面板收起导致按钮找不到时绝不写 last_checkin_day，
+        # 否则会像 2026-11-10 08:49 那样把假阳性固化、整天不再补签。
+        if result.ok and result.data.get("confirmed"):
             self.state.claim_once("checkin", "daily")
             self.state.kv_set("last_checkin_day", day_key())
-            data = dict(result.data)
-            data["confirmed"] = bool(data.get("confirmed") or data.get("verified"))
-            result = ActionResult(True, result.action, result.detail, data)
         self.state.log("checkin", result.ok, result.detail)
         return result
 

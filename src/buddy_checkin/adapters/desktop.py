@@ -68,11 +68,40 @@ class CuaDriverSigner(DesktopAdapter):
         })
 
     @staticmethod
-    def _find_button(payload: dict, texts: list[str]) -> int | None:
+    def _find(payload: dict, texts: list[str]) -> dict | None:
+        """返回匹配的元素（含 element_token / element_index），而不只是索引。"""
         for el in payload.get("elements", []):
             label = str(el.get("label") or "")
             if el.get("role") in ("AXButton", "AXMenuItem") and any(t in label for t in texts):
-                return el.get("element_index")
+                return el
+        return None
+
+    # 签到按钮藏在「Buddy加油站」面板里，面板收起时按钮根本不在 AX 树中。
+    # 必须先点开这个入口，再重新快照找「立即领取」。
+    STATION_ENTRY = ["Buddy加油站"]
+
+    def _click_element(self, el: dict, pid: int, wid: int) -> ActionResult | None:
+        """纯 AX 路径点击；返回 None 表示成功，否则返回失败结果。
+
+        element_token 来自最近一次快照，失效时 CuaDriver 会显式报 stale，
+        不会静默回退到坐标点击（那会把光标甩到窗口左上角）。
+        同时校验返回的 path == 'ax'，任何像素路径一律视为失败并拒绝。
+        """
+        payload: dict[str, Any] = {"pid": pid, "window_id": wid}
+        if el.get("element_token"):
+            payload["element_token"] = el["element_token"]
+        elif el.get("element_index") is not None:
+            payload["element_index"] = el["element_index"]
+        else:
+            return ActionResult(False, "desktop.click", "element has no token/index")
+        out = self._call("click", payload)
+        if "error" in out:
+            return ActionResult(False, "desktop.click", str(out["error"]), {"payload": payload})
+        if out.get("path") not in (None, "ax"):
+            # 非 AX 路径会合成鼠标事件、移动光标，坚决拒绝
+            return ActionResult(False, "desktop.click",
+                                f"refused non-AX click path: {out.get('path')}",
+                                {"payload": payload})
         return None
 
     def probe(self) -> ActionResult:
@@ -88,48 +117,80 @@ class CuaDriverSigner(DesktopAdapter):
         if "error" in snap:
             return ActionResult(False, "desktop.probe", snap["error"],
                                {"backend": "cua-driver", "pid": pid, "window_id": wid})
-        idx = self._find_button(snap, ["立即领取", "今日礼包"])
+        btn = self._find(snap, ["立即领取", "今日礼包"])
         return ActionResult(
             True, "desktop.probe",
-            "checkin button visible" if idx is not None
-            else "checkin button absent (likely already checked in today)",
+            "checkin button visible" if btn is not None
+            else "checkin button absent (station panel may be collapsed)",
             {"backend": "cua-driver", "pid": pid, "window_id": wid,
-             "element_count": snap.get("element_count"), "checkin_button_index": idx},
+             "element_count": snap.get("element_count"),
+             "checkin_button_index": btn.get("element_index") if btn else None},
         )
 
     def claim_daily(self, texts: list[str]) -> ActionResult:
+        """签到：先确保加油站面板展开，再用纯 AX 路径点「立即领取」并复核。
+
+        实测 2026-11-10：面板收起时 AX 树里只有入口按钮「Buddy加油站」，
+        **没有**「立即领取」。旧逻辑把「按钮找不到」当成已签到 → 假阳性，
+        整天没签却写了 last_checkin_day。现在必须先展开面板再判断。
+        """
         win = self._window()
         if not win:
             return ActionResult(False, "desktop.checkin", "WorkBuddy main window not found",
-                               {"backend": "cua-driver"})
+                                {"backend": "cua-driver"})
         pid, wid = win
         snap = self._snapshot(pid, wid)
         if "error" in snap:
             return ActionResult(False, "desktop.checkin", snap["error"],
-                               {"backend": "cua-driver"})
-        idx = self._find_button(snap, texts)
-        if idx is None:
-            # 签到成功后 Buddy 加油站卡片会收起，按钮不再出现；但也可能是页面尚未
-            # 渲染完。标记为「推测」而非「已确认」，让上层每小时轮询再确认一次。
+                                {"backend": "cua-driver"})
+
+        btn = self._find(snap, texts)
+        expanded = False
+        if btn is None:
+            entry = self._find(snap, self.STATION_ENTRY)
+            if entry is not None:
+                failure = self._click_element(entry, pid, wid)
+                if failure is not None:
+                    return ActionResult(False, "desktop.checkin",
+                                        f"open station panel: {failure.detail}")
+                expanded = True
+                # element_index 缓存会被新快照替换，必须重新取快照再定位
+                snap = self._snapshot(pid, wid)
+                if "error" in snap:
+                    return ActionResult(False, "desktop.checkin", snap["error"],
+                                        {"backend": "cua-driver"})
+                btn = self._find(snap, texts)
+
+        if btn is None:
+            if expanded:
+                # 面板已展开仍无领取按钮 = 今天确实已领
+                return ActionResult(
+                    True, "desktop.checkin",
+                    "station panel open, no checkin button; already checked in today",
+                    {"backend": "cua-driver", "clicked": False, "already": True,
+                     "confirmed": True, "station_expanded": True},
+                )
+            # 连入口都找不到：不能推断，交给调度器隔一小时再查
             return ActionResult(
-                True, "desktop.checkin",
-                "checkin button absent; treating as already checked in today",
-                {"backend": "cua-driver", "clicked": False, "already": True,
-                 "inferred": True},
+                False, "desktop.checkin",
+                "checkin button and station entry both missing; state uncertain",
+                {"backend": "cua-driver", "clicked": False, "confirmed": False,
+                 "uncertain": True},
             )
-        result = self._call("click", {"pid": pid, "window_id": wid, "element_index": idx})
-        if "error" in result:
-            return ActionResult(False, "desktop.checkin", result["error"],
-                               {"backend": "cua-driver", "element_index": idx})
+
+        failure = self._click_element(btn, pid, wid)
+        if failure is not None:
+            return ActionResult(False, "desktop.checkin", failure.detail,
+                                {"backend": "cua-driver", "confirmed": False})
         after = self._snapshot(pid, wid)
-        still = self._find_button(after, texts)
+        still = self._find(after, texts)
         ok = still is None
         return ActionResult(
             ok, "desktop.checkin",
             "clicked and button disappeared (checkin verified)" if ok
             else "clicked but button still visible",
-            {"backend": "cua-driver", "clicked": True, "element_index": idx,
-             "verified": ok, "confirmed": ok,
+            {"backend": "cua-driver", "clicked": True,
+             "verified": ok, "confirmed": ok, "station_expanded": expanded,
              "element_count_before": snap.get("element_count"),
              "element_count_after": after.get("element_count")},
         )
