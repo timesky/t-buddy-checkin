@@ -55,7 +55,7 @@ def _seq_runner(list_windows, states):
 
 class GrowthBrowserTests(unittest.TestCase):
     def test_auto_detects_chrome_growth_window_not_edge(self):
-        cfg = {"growth": {"browser_app": "auto", "title_hint": "个人中心"}}
+        cfg = {"growth": {"browser_app": "auto", "title_hint": "个人中心", "auto_open_page": False}}
         responses = {
             "list_windows": _list_windows(
                 {"app_name": "Google Chrome", "title": "个人中心 - WorkBuddy",
@@ -74,7 +74,7 @@ class GrowthBrowserTests(unittest.TestCase):
         self.assertIsNone(g._block)
 
     def test_login_page_sets_login_required_block(self):
-        cfg = {"growth": {"browser_app": "auto", "title_hint": "个人中心"}}
+        cfg = {"growth": {"browser_app": "auto", "title_hint": "个人中心", "auto_open_page": False}}
         responses = {
             "list_windows": _list_windows(
                 {"app_name": "Safari", "title": "WorkBuddy",
@@ -94,7 +94,7 @@ class GrowthBrowserTests(unittest.TestCase):
     def test_logged_in_page_with_incidental_login_text_is_not_misjudged(self):
         """回归（2026-11-09 真实踩坑）：已登录成长中心页面夹杂「…请登录」文案，
         不能误判为未登录——强成长内容优先于登录标记判定。"""
-        cfg = {"growth": {"browser_app": "auto", "title_hint": "个人中心"}}
+        cfg = {"growth": {"browser_app": "auto", "title_hint": "个人中心", "auto_open_page": False}}
         responses = {
             "list_windows": _list_windows(
                 {"app_name": "Microsoft Edge", "title": "WorkBuddy - 个人中心",
@@ -114,7 +114,7 @@ class GrowthBrowserTests(unittest.TestCase):
         self.assertIsNone(g._block)
 
     def test_explicit_browser_app_restricts_to_that_app(self):
-        cfg = {"growth": {"browser_app": "Microsoft Edge", "title_hint": "个人中心"}}
+        cfg = {"growth": {"browser_app": "Microsoft Edge", "title_hint": "个人中心", "auto_open_page": False}}
         responses = {
             "list_windows": _list_windows(
                 {"app_name": "Google Chrome", "title": "个人中心 - WorkBuddy",
@@ -131,7 +131,7 @@ class GrowthBrowserTests(unittest.TestCase):
         self.assertEqual(win, (2002, 20))  # 显式指定 Edge，只认 Edge
 
     def test_no_window_sets_not_found_block(self):
-        cfg = {"growth": {"browser_app": "auto", "title_hint": "个人中心"}}
+        cfg = {"growth": {"browser_app": "auto", "title_hint": "个人中心", "auto_open_page": False}}
         responses = {"list_windows": _list_windows()}
         g = GrowthCenter(cfg, runner=_runner(responses))
         self.assertIsNone(g._window())
@@ -152,7 +152,7 @@ class GrowthBrowserTests(unittest.TestCase):
             _state(["领取 10 积分"]),                    # 弹窗：gift_dialog
             _state(["派猫猫旅行"]),                      # 领完：直接 idle，无「已领取」
         ]
-        g = GrowthCenter({"growth": {"browser_app": "auto"}}, runner=_seq_runner(wins, states))
+        g = GrowthCenter({"growth": {"browser_app": "auto", "auto_open_page": False}}, runner=_seq_runner(wins, states))
         res = g.claim_gift()
         self.assertTrue(res.ok, res.detail)
         self.assertIn("领取 10 积分", res.detail)
@@ -170,7 +170,7 @@ class GrowthBrowserTests(unittest.TestCase):
             _state(["领取 10 积分"]),
             _state(["领取礼物"]),  # 点击后仍可领
         ]
-        g = GrowthCenter({"growth": {"browser_app": "auto"}}, runner=_seq_runner(wins, states))
+        g = GrowthCenter({"growth": {"browser_app": "auto", "auto_open_page": False}}, runner=_seq_runner(wins, states))
         self.assertFalse(g.claim_gift().ok)
 
 
@@ -192,7 +192,7 @@ class DialogTests(unittest.TestCase):
                 clicks.append(json.loads(cmd[3]))
             return _FakeProc("{}")
 
-        g = GrowthCenter({"growth": {}}, runner=runner)
+        g = GrowthCenter({"growth": {"auto_open_page": False}}, runner=runner)
         return g.dismiss_dialog(446, 60), clicks
 
     def test_closes_overlay_and_never_clicks_dispatch_button(self):
@@ -221,7 +221,7 @@ class DialogTests(unittest.TestCase):
                 clicks.append(cmd[3])
             return _FakeProc("{}")
 
-        g = GrowthCenter({"growth": {}}, runner=runner)
+        g = GrowthCenter({"growth": {"auto_open_page": False}}, runner=runner)
         self.assertFalse(g.dismiss_dialog(446, 60))
         self.assertEqual(clicks, [])
 
@@ -250,12 +250,168 @@ class DialogTests(unittest.TestCase):
             overlay,                            # 残留的领奖确认浮层
             _state(["旅行倒计时 01:30:58"]),     # 清理后的真实状态
         ]
-        g = GrowthCenter({"growth": {"browser_app": "auto"}},
+        g = GrowthCenter({"growth": {"browser_app": "auto", "auto_open_page": False}},
                          runner=_seq_runner(wins, states))
         res = g.tick(force=False)
         self.assertTrue(res.ok, res.detail)
         self.assertIn("real countdown", res.detail)
         self.assertEqual(res.data.get("remaining_sec"), 5458)
+
+
+class DocTextFalsePositiveTests(unittest.TestCase):
+    """回归（2026-11-10）：客户端窗口里打开的 README/对话含「派猫猫旅行」
+    「领取 7 积分」等字样，不能因此被当成成长中心页面。"""
+
+    def test_client_doc_text_is_not_growth_page(self):
+        windows = [
+            {"app_name": "WorkBuddy", "pid": 452, "window_id": 66,
+             "title": "WorkBuddy", "is_on_screen": True,
+             "bounds": {"width": 1920, "height": 960}},
+            {"app_name": "Microsoft Edge", "pid": 446, "window_id": 60,
+             "title": "WorkBuddy - 个人中心", "is_on_screen": True,
+             "bounds": {"width": 1900, "height": 940}},
+        ]
+        by_pid = {
+            452: {"elements": [
+                {"role": "AXStaticText", "label": "派猫猫旅行", "element_index": 1},
+                {"role": "AXStaticText", "label": "领取 7 积分", "element_index": 2},
+                {"role": "AXTextArea", "label": "旅行倒计时 00:59:56", "element_index": 3},
+                {"role": "AXButton", "label": "关闭", "element_index": 4},
+            ]},
+            446: {"elements": [
+                {"role": "AXButton", "label": "派猫猫旅行", "element_index": 1},
+                {"role": "AXButton", "label": "兑换奖励", "element_index": 2},
+            ]},
+        }
+
+        def runner(cmd, **_kw):
+            tool = cmd[2]
+            if tool == "list_windows":
+                return _FakeProc(json.dumps({"windows": windows}, ensure_ascii=False))
+            if tool == "get_window_state":
+                pid = json.loads(cmd[3]).get("pid")
+                return _FakeProc(json.dumps(by_pid.get(pid, {"elements": []}),
+                                            ensure_ascii=False))
+            return _FakeProc("{}")
+
+        # 故意关掉 app 级排除，验证 classify 本身也足够稳
+        cfg = {"growth": {"browser_app": "auto", "auto_open_page": False,
+                          "exclude_apps": []},
+               "desktop": {"app": "WorkBuddy"}}
+        g = GrowthCenter(cfg, runner=runner)
+        self.assertEqual(g._window(), (446, 60))
+
+    def test_read_state_ignores_static_doc_text(self):
+        snap = {"elements": [
+            {"role": "AXStaticText", "label": "领取 7 积分", "element_index": 1},
+            {"role": "AXTextArea", "label": "旅行倒计时 00:59:56", "element_index": 2},
+            {"role": "AXButton", "label": "派猫猫旅行", "element_index": 3},
+        ]}
+        self.assertEqual(GrowthCenter.read_state(snap)["state"], "idle")
+
+
+class _AutoOpenRunner:
+    """第一遍：浏览器只有别的页面 + 客户端有入口；第二遍：浏览器已打开成长中心。"""
+
+    def __init__(self, growth_on_second: bool = True, open_after: int = 3):
+        self.list_count = 0
+        self.clicks: list[dict] = []
+        self.growth_on_second = growth_on_second
+        self.open_after = open_after
+
+    def __call__(self, cmd, **_kw):
+        tool = cmd[2] if len(cmd) > 2 else ""
+        payload = json.loads(cmd[3]) if len(cmd) > 3 else {}
+        if tool == "list_windows":
+            self.list_count += 1
+            opened = self.list_count >= self.open_after and self.growth_on_second
+            browser = {
+                "app_name": "Google Chrome", "pid": 100, "window_id": 10,
+                "bounds": {"width": 1200, "height": 800},
+                "title": "WorkBuddy - 个人中心" if opened else "其他页面",
+                "is_on_screen": True,
+            }
+            client = {
+                "app_name": "WorkBuddy", "pid": 452, "window_id": 66,
+                "bounds": {"width": 1400, "height": 900},
+                "title": "WorkBuddy", "is_on_screen": True,
+            }
+            out = {"windows": [browser, client]}
+        elif tool == "get_window_state":
+            if payload.get("pid") == 452:
+                out = {"elements": [
+                    {"role": "AXStaticText", "label": "做任务赢积分好礼",
+                     "element_index": 56, "element_token": "s:56"},
+                    {"role": "AXButton", "label": "Buddy加油站",
+                     "element_index": 58, "element_token": "s:58"},
+                    {"role": "AXButton", "label": "成长计划",
+                     "element_index": 63, "element_token": "s:63"},
+                ]}
+            elif self.list_count >= self.open_after and self.growth_on_second:
+                out = {"elements": [
+                    {"role": "AXButton", "label": "派猫猫旅行", "element_index": 1}]}
+            else:
+                out = {"elements": [
+                    {"role": "AXStaticText", "label": "其他网站", "element_index": 1}]}
+        elif tool == "click":
+            self.clicks.append(payload)
+            out = {"effect": "unverifiable", "path": "ax", "verified": False}
+        else:
+            out = {}
+        return _FakeProc(json.dumps(out, ensure_ascii=False))
+
+
+class AutoOpenPageTests(unittest.TestCase):
+    """回归（另一台机器 2026-11-10）：没有成长中心页面时自动从客户端入口打开。"""
+
+    def _cfg(self, **overrides):
+        cfg = {"growth": {"browser_app": "auto", "auto_open_wait_sec": 0,
+                          "auto_open_cooldown_sec": 0,
+                          "auto_open_url_fallback": False},
+               "desktop": {"app": "WorkBuddy"}}
+        cfg["growth"].update(overrides)
+        return cfg
+
+    def test_opens_page_from_client_entry_when_missing(self):
+        runner = _AutoOpenRunner()
+        g = GrowthCenter(self._cfg(), runner=runner)
+        win = g._window()
+        self.assertEqual(win, (100, 10))
+        self.assertEqual(len(runner.clicks), 1)  # 只点一个入口，不连锁点错
+        self.assertTrue("element_token" in runner.clicks[0]
+                        or "element_index" in runner.clicks[0])
+        self.assertIsNone(g._block)
+
+    def test_disabled_auto_open_does_not_click(self):
+        runner = _AutoOpenRunner()
+        g = GrowthCenter(self._cfg(auto_open_page=False), runner=runner)
+        self.assertIsNone(g._window())
+        self.assertEqual(runner.clicks, [])
+        self.assertEqual(g._block[0], "not_found")
+
+    def test_auto_open_respects_cooldown(self):
+        import time
+        runner = _AutoOpenRunner()
+        g = GrowthCenter(self._cfg(auto_open_cooldown_sec=9999), runner=runner)
+        g._last_auto_open = time.time()  # 模拟刚触发过，冷却期内不应再点
+        self.assertIsNone(g._window())
+        self.assertEqual(runner.clicks, [])
+
+    def test_url_fallback_when_entry_click_is_not_enough(self):
+        """点入口仍没页面时，后台 open -g 目标 URL 兜底（不抢焦点）。"""
+        from unittest.mock import patch
+
+        runner = _AutoOpenRunner(open_after=4)
+        g = GrowthCenter(self._cfg(auto_open_url_fallback=True), runner=runner)
+        with patch("buddy_checkin.adapters.growth.subprocess.run") as fake_run:
+            fake_run.return_value.returncode = 0
+            win = g._window()
+        self.assertEqual(win, (100, 10))
+        self.assertEqual(len(runner.clicks), 1)
+        url_calls = [c for c in fake_run.call_args_list
+                     if c.args and c.args[0][:2] == ["open", "-g"]]
+        self.assertEqual(len(url_calls), 1)
+        self.assertIn("growth-center", url_calls[0].args[0][2])
 
 
 if __name__ == "__main__":

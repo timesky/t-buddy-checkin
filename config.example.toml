@@ -10,6 +10,13 @@ log_level = "INFO"
 # 不移动光标、不抢焦点）
 cua_driver_bin = "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
 app = "WorkBuddy"
+# 面板收起时用于展开的入口按钮；不同客户端版本文案可能不同
+station_entry_labels = ["Buddy加油站", "做任务赢积分"]
+# 点击后出现的「今天已领」文案，作为已签到的强证据
+already_claimed_labels = ["今日已领取", "已领取", "明日再来", "今日已领"]
+# AXPress -25202（元素引用失效）时重新快照定位的重试次数/间隔
+click_max_attempts = 3
+click_retry_delay_sec = 0.8
 
 [daily_checkin]
 enabled = true          # 签到时间线的总开关；周期见下方 [schedule]
@@ -38,9 +45,21 @@ cua_driver_bin = "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
 # 如需限定某一浏览器，可填其 app 名（如 "Microsoft Edge" / "Google Chrome"）
 browser_app = "auto"
 title_hint = "个人中心"
+# 客户端窗口可能显示含成长关键词的文档/对话，默认排除避免误判
+exclude_apps = ["WorkBuddy"]
 scene = ""              # 可填 咖啡馆 / 商场店铺 / 健身房 / 古镇客栈；留空用默认
 claim_offset_sec = 3
 auto_exchange = true    # 补登卡等有限资源不会自动消耗
+# 浏览器里没有成长中心页面时，自动从 WorkBuddy 客户端入口触发打开页面
+# （另一台机器全新安装时无需人工先点开页面）。带冷却避免反复打开新标签页。
+auto_open_page = true
+# 「成长计划」实测会打开 CodeBuddy 积分页，故不放默认候选
+auto_open_labels = ["做任务赢积分", "任务中心", "Buddy加油站"]
+auto_open_wait_sec = 6
+auto_open_cooldown_sec = 300
+# 点击入口后仍找不到页面时，后台打开目标 URL（open -g 不抢焦点）
+auto_open_url = "https://www.workbuddy.cn/profile/growth-center"
+auto_open_url_fallback = true
 
 [travel]
 enabled = true

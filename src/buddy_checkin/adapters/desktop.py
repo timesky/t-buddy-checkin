@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,6 +28,14 @@ class CuaDriverSigner(DesktopAdapter):
         desk = cfg["desktop"]
         self.bin = desk.get("cua_driver_bin") or CUA_DRIVER_BIN
         self.app = desk.get("app", "WorkBuddy")
+        self.station_entry_labels = desk.get("station_entry_labels") or ["Buddy加油站"]
+        self.already_claimed_labels = desk.get("already_claimed_labels") or [
+            "今日已领取", "已领取", "明日再来", "今日已领",
+        ]
+        # AXPress -25202 = kAXErrorInvalidUIElement（元素引用失效）。
+        # 常见于另一台机器/客户端刚重绘：重新取快照定位再点即可恢复。
+        self.max_attempts = int(desk.get("click_max_attempts", 3))
+        self.retry_delay = float(desk.get("click_retry_delay_sec", 0.8))
         self.runner = runner or subprocess.run
         self.commands: list[list[str]] = []
 
@@ -68,11 +77,15 @@ class CuaDriverSigner(DesktopAdapter):
         })
 
     @staticmethod
-    def _find(payload: dict, texts: list[str]) -> dict | None:
-        """返回匹配的元素（含 element_token / element_index），而不只是索引。"""
+    def _find(payload: dict, texts: list[str],
+              roles: tuple[str, ...] | None = ("AXButton", "AXMenuItem")) -> dict | None:
+        """返回匹配的元素（含 element_token / element_index），而不只是索引。
+
+        roles=None 表示不限 role（用于查「今日已领取」这类静态文案）。
+        """
         for el in payload.get("elements", []):
             label = str(el.get("label") or "")
-            if el.get("role") in ("AXButton", "AXMenuItem") and any(t in label for t in texts):
+            if (roles is None or el.get("role") in roles) and any(t in label for t in texts):
                 return el
         return None
 
@@ -128,12 +141,23 @@ class CuaDriverSigner(DesktopAdapter):
         )
 
     def claim_daily(self, texts: list[str]) -> ActionResult:
-        """签到：先确保加油站面板展开，再用纯 AX 路径点「立即领取」并复核。
+        """签到（带重试）：整轮失败就重新走一遍「取快照 → 展开 → 定位 → 点击」。
 
-        实测 2026-11-10：面板收起时 AX 树里只有入口按钮「Buddy加油站」，
-        **没有**「立即领取」。旧逻辑把「按钮找不到」当成已签到 → 假阳性，
-        整天没签却写了 last_checkin_day。现在必须先展开面板再判断。
+        另一台机器实测 2026-11-10 报 `AXUIElementPerformAction(AXPress)
+        returned -25202`（kAXErrorInvalidUIElement，元素引用失效）。这类错误
+        只能靠**重新快照重新定位**恢复，重试同一 token 必然再失败。
         """
+        last: ActionResult | None = None
+        for attempt in range(self.max_attempts):
+            result = self._claim_once(texts)
+            if result.ok:
+                return result
+            last = result
+            if attempt + 1 < self.max_attempts:
+                time.sleep(self.retry_delay)
+        return last or ActionResult(False, "desktop.checkin", "no attempt made")
+
+    def _claim_once(self, texts: list[str]) -> ActionResult:
         win = self._window()
         if not win:
             return ActionResult(False, "desktop.checkin", "WorkBuddy main window not found",
@@ -147,21 +171,31 @@ class CuaDriverSigner(DesktopAdapter):
         btn = self._find(snap, texts)
         expanded = False
         if btn is None:
-            entry = self._find(snap, self.STATION_ENTRY)
+            entry = self._find(snap, self.station_entry_labels)
             if entry is not None:
                 failure = self._click_element(entry, pid, wid)
                 if failure is not None:
                     return ActionResult(False, "desktop.checkin",
-                                        f"open station panel: {failure.detail}")
+                                        f"open station panel: {failure.detail}",
+                                        {"backend": "cua-driver", "retryable": True})
                 expanded = True
                 # element_index 缓存会被新快照替换，必须重新取快照再定位
                 snap = self._snapshot(pid, wid)
                 if "error" in snap:
                     return ActionResult(False, "desktop.checkin", snap["error"],
-                                        {"backend": "cua-driver"})
+                                        {"backend": "cua-driver", "retryable": True})
                 btn = self._find(snap, texts)
 
         if btn is None:
+            # 「今日已领取 / 明日再来」等文案是页面给出的强证据，优先于推断
+            evidence = self._find(snap, self.already_claimed_labels, roles=None)
+            if evidence is not None:
+                return ActionResult(
+                    True, "desktop.checkin",
+                    f"already checked in today (page shows {evidence.get('label')})",
+                    {"backend": "cua-driver", "clicked": False, "already": True,
+                     "confirmed": True, "evidence": evidence.get("label")},
+                )
             if expanded:
                 # 面板已展开仍无领取按钮 = 今天确实已领
                 return ActionResult(
@@ -181,7 +215,8 @@ class CuaDriverSigner(DesktopAdapter):
         failure = self._click_element(btn, pid, wid)
         if failure is not None:
             return ActionResult(False, "desktop.checkin", failure.detail,
-                                {"backend": "cua-driver", "confirmed": False})
+                                {"backend": "cua-driver", "confirmed": False,
+                                 "retryable": True})
         after = self._snapshot(pid, wid)
         still = self._find(after, texts)
         ok = still is None

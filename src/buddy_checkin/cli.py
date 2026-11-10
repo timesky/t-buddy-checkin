@@ -116,7 +116,9 @@ def cmd_status(cfg: dict, args: argparse.Namespace) -> int:
     print(f"桌面端后端          : {desktop.probe().data.get('backend') or 'none (需安装/授权)'}")
     print("-- 三条时间线（统一常驻进程）--")
     for name, label in (("checkin", "签到检查"), ("exchange", "兑换检查"), ("travel", "旅行/派遣")):
-        print(f"  {label:10} 下次: {format_ts(state.kv_get_float(f'next_{name}_at'))}")
+        due = state.kv_get_float(f"next_{name}_at")
+        shown = format_ts(due) if due else "首轮执行中（三条线顺序启动，稍后写入）"
+        print(f"  {label:10} 下次: {shown}")
     print("-- 最近运行 --")
     for row in state.recent(10):
         print(f"  {format_ts(row['ts'])}  {'OK' if row['ok'] else 'FAIL'}  {row['action']}: {row['detail'][:100]}")
@@ -145,6 +147,62 @@ def cmd_daemon(cfg: dict, args: argparse.Namespace) -> int:
         scheduler.run_forever(stop=stop)
     finally:
         state.close()
+    return 0
+
+
+def cmd_inspect(cfg: dict, args: argparse.Namespace) -> int:
+    """只读诊断：打印客户端/浏览器窗口与关键 AX 文案，供跨机器 UI 差异排查。
+
+    不点击、不改状态、不移动光标。另一台机器签到失败时先跑它，把输出贴回来即可
+    判断入口文案、页面是否打开、是否登录。
+    """
+    import subprocess
+
+    bin_path = cfg["desktop"].get("cua_driver_bin") or \
+        "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
+
+    def call(tool: str, payload: dict) -> dict:
+        proc = subprocess.run(
+            [bin_path, "call", tool, json.dumps(payload, ensure_ascii=False)],
+            capture_output=True, text=True, timeout=30,
+        )
+        raw = proc.stdout or ""
+        i = raw.find("{")
+        return json.loads(raw[i:]) if i >= 0 else {"error": (raw or proc.stderr)[:200]}
+
+    data = call("list_windows", {})
+    wins = [w for w in data.get("windows", []) if w.get("is_on_screen")]
+    print("== 可见窗口 ==")
+    for w in wins:
+        b = w.get("bounds") or {}
+        print(f"  {str(w.get('app_name')):22} pid={w.get('pid'):>7} "
+              f"wid={w.get('window_id'):>5} {b.get('width')}x{b.get('height')} "
+              f"{str(w.get('title'))[:48]}")
+
+    keys = ("签到", "领取", "任务", "积分", "加油站", "成长", "计划", "好礼",
+            "连登", "旅行", "倒计时", "兑换", "盲盒", "抽奖", "登录")
+    app_name = cfg["desktop"].get("app", "WorkBuddy")
+    client = next((w for w in wins if w.get("app_name") == app_name), None)
+    if client:
+        snap = call("get_window_state", {
+            "pid": client["pid"], "window_id": client["window_id"],
+            "include_screenshot": False, "max_elements": 2500,
+        })
+        print(f"\n== {app_name} 客户端关键元素（可交互/短标签，最多 40 条）==")
+        roles = ("AXButton", "AXLink", "AXMenuItem", "AXRadioButton",
+                 "AXPopUpButton", "AXCheckBox", "AXStaticText")
+        shown = 0
+        for el in snap.get("elements", []):
+            lab = str(el.get("label") or "").strip()
+            if (shown < 40 and lab and len(lab) <= 60
+                    and el.get("role") in roles and any(k in lab for k in keys)):
+                print(f"  idx={el.get('element_index'):>4} {str(el.get('role')):<14} {lab}")
+                shown += 1
+
+    growth = GrowthCenter(cfg)
+    growth.auto_open_page = False  # 诊断时绝不触发点击
+    win = growth._window()
+    print(f"\n== 成长中心探测 ==\n  {'已找到 ' + str(win) if win else (growth._block or ('?', '?'))[1]}")
     return 0
 
 
@@ -194,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("travel-now", help="手动跑旅行时间线一轮（领礼物→派遣→读倒计时）")
     sub.add_parser("once", help="手动跑全量一轮（签到+礼物+兑换+旅行）")
     sub.add_parser("status", help="只读状态：三条时间线下次执行时间")
+    sub.add_parser("inspect", help="只读诊断：打印客户端/浏览器窗口与关键 AX 文案（跨机器排查）")
     sub.add_parser("daemon", help="统一常驻进程：三条独立时间线")
     sub.add_parser("install-launchd", help="写 LaunchAgent plist（开机常驻，不自动加载）")
     sub.add_parser("model-check", help="show free-model policy and current acknowledgment state")
@@ -210,10 +269,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     cfg = config.load(args.config)
     logging.getLogger().setLevel(getattr(logging, cfg.get("log_level", "INFO"), logging.INFO))
-    # 依赖 WorkBuddy：执行前必须确认运行在免费模型下（model-check / deps / install-launchd
-    # 属本地运维——只读策略、检查依赖、写 plist，不消耗模型额度，放行；
+    # 依赖 WorkBuddy：执行前必须确认运行在免费模型下（model-check / deps /
+    # install-launchd / inspect 属本地运维或只读诊断，不消耗模型额度，放行；
     # plist 内已内置 BUDDY_FREE_MODEL=1，daemon 运行时仍受闸门约束）
-    if args.command not in ("model-check", "deps", "install-launchd"):
+    if args.command not in ("model-check", "deps", "install-launchd", "inspect"):
         rc = preflight_model_check(cfg)
         if rc:
             return rc
@@ -223,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
         "travel-now": cmd_travel_now,
         "once": cmd_once,
         "status": cmd_status,
+        "inspect": cmd_inspect,
         "daemon": cmd_daemon,
         "install-launchd": cmd_install_launchd,
         "model-check": cmd_model_check,

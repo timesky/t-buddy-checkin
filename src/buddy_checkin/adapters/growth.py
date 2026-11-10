@@ -68,6 +68,21 @@ class GrowthCenter:
         self.title_hint = growth.get("title_hint", "个人中心")
         self.claim_offset_sec = float(growth.get("claim_offset_sec", 3))
         self.scene = growth.get("scene", "")  # 留空 = 用页面默认场景
+        # 浏览器里没有成长中心页面时，自动从 WorkBuddy 客户端入口触发打开
+        self.desktop_app = (cfg.get("desktop", {}) or {}).get("app", "WorkBuddy")
+        # 客户端窗口里可能显示包含「派猫猫旅行」等字样的文档/对话，必须排除，
+        # 否则会被误判成成长中心页面（2026-11-10 实测踩坑）
+        self.exclude_apps = growth.get("exclude_apps") or [self.desktop_app]
+        self.auto_open_page = bool(growth.get("auto_open_page", True))
+        self.auto_open_labels = growth.get("auto_open_labels") or [
+            "做任务赢积分", "成长计划", "任务中心", "Buddy加油站",
+        ]
+        self.auto_open_wait = float(growth.get("auto_open_wait_sec", 6))
+        self.auto_open_cooldown = float(growth.get("auto_open_cooldown_sec", 300))
+        self.auto_open_url = growth.get("auto_open_url") or \
+            "https://www.workbuddy.cn/profile/growth-center"
+        self.auto_open_url_fallback = bool(growth.get("auto_open_url_fallback", True))
+        self._last_auto_open = 0.0
         self.runner = runner or subprocess.run
         self.commands: list[list[str]] = []
         # 上一次 _window 探窗结论：("login_required"|"not_found", detail)
@@ -94,50 +109,82 @@ class GrowthCenter:
     def _classify(snap: dict) -> str:
         """判定快照属于 成长中心页面 / 登录页 / 其他。
 
-        强成长内容（派猫猫旅行 / 领取礼物 / 旅行倒计时 等真实按钮）**优先**：
-        已登录的成长中心页面可能夹杂「请登录」之类的泛化文案（实测侧栏就有），
-        不能因此误判为未登录。只有页面没有成长内容、且出现登录特征时才算登录页。
+        **只认 AXButton 的标签**作为成长中心的强内容证据：真实页面里
+        「派猫猫旅行 / 领取礼物 / 旅行倒计时 / 兑换奖励」都是按钮；而客户端
+        里打开的 README/对话中同样字样是 AXStaticText/AXTextArea，不能算。
+        登录页则用全部文本判定（登录提示常是静态文本）。
         """
         if not isinstance(snap, dict):
             return "other"
-        labels = " ".join(str(e.get("label") or "") for e in snap.get("elements", []))
-        text = f"{snap.get('raw', '')} {labels}"
-        if any(m in text for m in GROWTH_CONTENT_MARKERS):
+        els = snap.get("elements", [])
+        buttons = " ".join(
+            str(e.get("label") or "") for e in els
+            if e.get("role") in ("AXButton", "AXPopUpButton")
+        )
+        all_text = f"{snap.get('raw', '')} " + " ".join(
+            str(e.get("label") or "") for e in els
+        )
+        if any(m in buttons for m in GROWTH_CONTENT_MARKERS):
             return "growth"
-        if any(m in text for m in LOGIN_MARKERS):
+        if any(m in all_text for m in LOGIN_MARKERS):
             return "login"
         return "other"
 
     def _window(self) -> tuple[int, int] | None:
-        """找已打开的成长中心窗口（任意浏览器），返回 (pid, window_id)。
+        """找成长中心窗口；找不到且开启 auto_open_page 时自动触发打开页面。
 
-        不限定浏览器：browser_app="auto" 时扫描所有可见窗口，按页面内容（而非
-        app 名）判定是否为成长中心；命中登录页则记为 login_required 并提示用户登录。
+        不限定浏览器：browser_app="auto" 时按页面内容判定；命中登录页则
+        记为 login_required 并提示用户登录（此时**不**自动点任何东西）。
         """
+        win = self._locate()
+        if win:
+            return win
+        if self.auto_open_page and self._block and self._block[0] == "not_found":
+            now = time.time()
+            if now - self._last_auto_open >= self.auto_open_cooldown:
+                self._last_auto_open = now
+                # 一、优先点用户指定的客户端入口（一轮、只点一个，避免连锁点错）
+                if self._try_auto_open():
+                    win = self._locate()
+                    if win:
+                        return win
+                # 二、兜底：后台打开目标 URL（-g 不激活浏览器、不抢焦点）
+                if self.auto_open_url_fallback and self._open_url_fallback():
+                    win = self._locate()
+                    if win:
+                        return win
+                self._block = (
+                    "not_found",
+                    "已自动点击「做任务赢积分」入口并后台打开成长中心 URL，"
+                    "但仍未检测到页面：请确认页面已加载且已登录"
+                    "（www.workbuddy.cn/profile/growth-center）",
+                )
+        return None
+
+    def _locate(self) -> tuple[int, int] | None:
+        """只读探测：扫描可见窗口，按 AX 内容找成长中心页面。"""
         self._block = None
         data = self._call("list_windows", {})
         wins = data.get("windows", [])
         if self.browser_app != "auto":
-            # 用户显式指定浏览器时才按 app 过滤，否则任意浏览器皆可
             wins = [w for w in wins if w.get("app_name") == self.browser_app]
-        wins = [w for w in wins if (w.get("bounds") or {}).get("width", 0) > 400]
+        wins = [w for w in wins
+                if (w.get("bounds") or {}).get("width", 0) > 400
+                and w.get("app_name") not in self.exclude_apps]
         if not wins:
             self._block = ("not_found",
                            "未找到任何浏览器窗口：请从 WorkBuddy 点开「个人中心」"
                            "(www.workbuddy.cn/profile/growth-center) 再运行")
             return None
-        # 粗筛排序：标题含 title_hint 或 WorkBuddy 的优先，其次按窗口面积
-        title_hint = self.title_hint
         ranked = sorted(
             wins,
             key=lambda w: (
-                (title_hint in str(w.get("title") or "")
+                (self.title_hint in str(w.get("title") or "")
                  or "workbuddy" in str(w.get("title") or "").lower()),
                 w["bounds"]["width"] * w["bounds"]["height"],
             ),
             reverse=True,
         )
-        # 逐个用 AX 内容精筛（最多前 4 个候选），同时识别登录页
         for w in ranked[:4]:
             pid, wid = int(w["pid"]), int(w["window_id"])
             snap = self._call("get_window_state", {
@@ -159,6 +206,83 @@ class GrowthCenter:
                        "www.workbuddy.cn/profile/growth-center 且已登录")
         return None
 
+    # ---- 自动打开成长中心页面 ------------------------------------------------
+    def _desktop_window(self) -> tuple[int, int] | None:
+        data = self._call("list_windows", {})
+        wins = [
+            w for w in data.get("windows", [])
+            if w.get("app_name") == self.desktop_app
+            and w.get("is_on_screen")
+            and (w.get("bounds") or {}).get("width", 0) > 400
+        ]
+        if not wins:
+            return None
+        w = max(wins, key=lambda x: x["bounds"]["width"] * x["bounds"]["height"])
+        return int(w["pid"]), int(w["window_id"])
+
+    def _click_raw(self, el: dict, pid: int, wid: int) -> str | None:
+        """纯 AX 点击，成功返回 None，失败返回原因（不移动光标）。"""
+        payload: dict[str, Any] = {"pid": pid, "window_id": wid}
+        if el.get("element_token"):
+            payload["element_token"] = el["element_token"]
+        elif el.get("element_index") is not None:
+            payload["element_index"] = el["element_index"]
+        else:
+            return "element has no token/index"
+        out = self._call("click", payload)
+        if "error" in out:
+            return str(out["error"])
+        if out.get("path") not in (None, "ax"):
+            return f"non-AX click path: {out.get('path')}"
+        return None
+
+    # 允许尝试的角色：不同客户端版本里入口可能是按钮、链接或纯文本卡片
+    _ENTRY_ROLES = ("AXButton", "AXMenuItem", "AXLink", "AXCell", "AXStaticText")
+
+    def _try_auto_open(self) -> bool:
+        """从 WorkBuddy 客户端入口触发打开成长中心页面（只点一个入口）。
+
+        实测 2026-11-10：面板收起时是 `AXStaticText "做任务赢积分好礼"` +
+        `AXButton "Buddy加油站"`；「成长计划」实测打开的是 CodeBuddy 积分页，
+        已移出默认候选。这里**不做第二轮连锁点击**，避免点错入口覆盖正确页面。
+        任何元素点击失败（如 AXStaticText 不支持 AXPress）都继续试下一个候选。
+        返回是否真的点了一个入口。
+        """
+        win = self._desktop_window()
+        if not win:
+            return False
+        pid, wid = win
+        snap = self._call("get_window_state", {
+            "pid": pid, "window_id": wid,
+            "include_screenshot": False, "max_elements": 2000,
+        })
+        if "error" in snap:
+            return False
+        for label in self.auto_open_labels:
+            for el in snap.get("elements", []):
+                lab = str(el.get("label") or "").strip()
+                if label not in lab or el.get("role") not in self._ENTRY_ROLES:
+                    continue
+                if self._click_raw(el, pid, wid) is not None:
+                    continue  # 该元素不能 press，试下一个
+                time.sleep(self.auto_open_wait)
+                return True
+        return False
+
+    def _open_url_fallback(self) -> bool:
+        """后台打开成长中心 URL；open -g 不激活浏览器、不抢焦点。"""
+        try:
+            proc = subprocess.run(
+                ["open", "-g", self.auto_open_url],
+                capture_output=True, text=True, timeout=10,
+            )
+            ok = proc.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if ok:
+            time.sleep(self.auto_open_wait)
+        return ok
+
     def _block_result(self, action: str) -> ActionResult:
         kind, detail = self._block or ("not_found", "growth-center window not found")
         return ActionResult(False, action, detail, {"block": kind})
@@ -174,7 +298,8 @@ class GrowthCenter:
             "include_screenshot": False, "max_elements": 3000,
         })
 
-    def _click(self, snap: dict, predicate, pid: int, wid: int) -> tuple[bool, str]:
+    def _click(self, snap: dict, predicate, pid: int, wid: int,
+               _retries: int = 1) -> tuple[bool, str]:
         for el in snap.get("elements", []):
             if el.get("role") != "AXButton":
                 continue
@@ -189,6 +314,10 @@ class GrowthCenter:
                     continue
                 out = self._call("click", payload)
                 if "error" in out:
+                    # -25202 / stale：元素引用失效，重新快照定位再试一次
+                    if _retries > 0:
+                        return self._click(self.snapshot(pid, wid), predicate,
+                                           pid, wid, _retries - 1)
                     return False, str(out["error"])
                 if out.get("path") not in (None, "ax"):
                     # 非 AX 路径会移动光标，坚决拒绝
@@ -199,31 +328,41 @@ class GrowthCenter:
     # ---- 状态解析 -----------------------------------------------------------
     @staticmethod
     def read_state(snap: dict) -> dict[str, Any]:
-        """从 AX 快照读真实旅行状态与剩余秒数。"""
+        """从 AX 快照读真实旅行状态与剩余秒数。
+
+        状态判定**只看 AXButton**：这些在真实页面里都是按钮；文档/对话中
+        同样的字样是静态文本，绝不能用来驱动状态机。raw 仍保留全部文本，
+        供「已领取」等_confirmation 文案检索。
+        """
+        els = snap.get("elements", [])
         labels: list[str] = []
-        for el in snap.get("elements", []):
+        buttons: list[str] = []
+        for el in els:
             lab = str(el.get("label") or "")
-            if lab and lab != "None":
-                labels.append(lab)
+            if not lab or lab == "None":
+                continue
+            labels.append(lab)
+            if el.get("role") in ("AXButton", "AXPopUpButton"):
+                buttons.append(lab)
         joined = " | ".join(labels[:250])
         state = "unknown"
         remaining = None
-        if "旅行倒计时" in joined:
+        countdown = [b for b in buttons if "旅行倒计时" in b]
+        if countdown:
             state = "traveling"
-            for lab in labels:
-                if "旅行倒计时" in lab:
-                    remaining = parse_hms(lab)
-                    if remaining is not None:
-                        break
+            for lab in countdown:
+                remaining = parse_hms(lab)
+                if remaining is not None:
+                    break
             if remaining is None:
-                remaining = parse_hms(joined)
-        elif any("领取" in lab and "积分" in lab for lab in labels):
+                remaining = parse_hms(" ".join(countdown))
+        elif any("领取" in b and "积分" in b for b in buttons):
             state = "gift_dialog"
-        elif any(lab.strip() == "领取礼物" for lab in labels):
+        elif any(b.strip() == "领取礼物" for b in buttons):
             state = "claimable"
-        elif any("确定派出" in lab for lab in labels):
+        elif any("确定派出" in b for b in buttons):
             state = "scene_dialog"
-        elif any("派猫猫旅行" in lab for lab in labels):
+        elif any("派猫猫旅行" in b for b in buttons):
             state = "idle"
         return {"state": state, "remaining_sec": remaining, "raw": joined[:1500]}
 

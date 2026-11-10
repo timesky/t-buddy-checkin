@@ -21,6 +21,10 @@ DEFAULTS: dict[str, Any] = {
     "desktop": {
         "cua_driver_bin": "/Applications/CuaDriver.app/Contents/MacOS/cua-driver",
         "app": "WorkBuddy",
+        # 面板收起时用于展开的入口按钮；不同客户端版本文案可能不同
+        "station_entry_labels": ["Buddy加油站", "做任务赢积分"],
+        # 点击后出现的「今天已领」文案，作为已签到的强证据
+        "already_claimed_labels": ["今日已领取", "已领取", "明日再来", "今日已领"],
     },
     # 签到时间线由 [schedule] 控制（0 点恢复 / 每小时轮询），此处只留总开关
     "daily_checkin": {"enabled": True},
@@ -69,6 +73,16 @@ DEFAULTS: dict[str, Any] = {
         "scene": "",              # 留空用页面默认场景
         "claim_offset_sec": 3,    # 倒计时归零后再等 3 秒，避免服务端未结算
         "auto_exchange": True,    # 自动兑换连登奖励/抽奖/满能量盲盒；补登卡永不自动消耗
+        # 浏览器里没有成长中心页面时，自动从 WorkBuddy 客户端入口触发打开。
+        # 不同客户端版本入口文案不同，可按需增补；带冷却避免反复打开新标签页。
+        "auto_open_page": True,
+        # 「成长计划」实测会打开 CodeBuddy 积分页，故不放在默认候选里
+        "auto_open_labels": ["做任务赢积分", "任务中心", "Buddy加油站"],
+        "auto_open_wait_sec": 6,
+        "auto_open_cooldown_sec": 300,
+        # 点击入口后仍找不到页面时的兜底：后台打开目标 URL（-g 不抢焦点）
+        "auto_open_url": "https://www.workbuddy.cn/profile/growth-center",
+        "auto_open_url_fallback": True,
     },
     # DOM 文本兜底：接口未知或改版时按可见文字定位
     "dom_fallback": {

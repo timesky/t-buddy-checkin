@@ -37,6 +37,8 @@ from buddy_checkin.timeutil import (  # noqa: E402
 def test_cfg(tmp: Path) -> dict:
     cfg = copy.deepcopy(config.DEFAULTS)
     cfg["state_db"] = str(tmp / "state.sqlite3")
+    # 单测不得触发真实的「自动打开页面 / open -g」
+    cfg["growth"]["auto_open_page"] = False
     return cfg
 
 
@@ -326,11 +328,13 @@ def desktop_snap(*buttons) -> dict:
 
 
 class CuaFakeRunner:
-    """按快照序列模拟 cua-driver call，可注入 click 的 path。"""
+    """按快照序列模拟 cua-driver call，可注入 click 的 path / 错误序列。"""
 
-    def __init__(self, snaps: list[dict] | None = None, *, click_path: str = "ax"):
+    def __init__(self, snaps: list[dict] | None = None, *, click_path: str = "ax",
+                 click_results: list[dict] | None = None):
         self.snaps = list(snaps) if snaps else [desktop_snap()]
         self.click_path = click_path
+        self.click_results = list(click_results) if click_results else None
         self.calls: list[list[str]] = []
         self.snap_count = 0
 
@@ -346,7 +350,11 @@ class CuaFakeRunner:
             self.snap_count += 1
             out = self.snaps.pop(0) if len(self.snaps) > 1 else self.snaps[0]
         elif tool == "click":
-            out = {"effect": "unverifiable", "path": self.click_path, "verified": False}
+            if self.click_results:
+                out = (self.click_results.pop(0) if len(self.click_results) > 1
+                       else self.click_results[0])
+            else:
+                out = {"effect": "unverifiable", "path": self.click_path, "verified": False}
         else:
             out = {}
         return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(out), stderr="")
@@ -357,6 +365,9 @@ class CuaDriverTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = test_cfg(Path(self.tmp.name))
         self.cfg["desktop"]["cua_driver_bin"] = "/fake/cua-driver"
+        # 大多数用例不需要重试；专门的重试用例会自行调大
+        self.cfg["desktop"]["click_max_attempts"] = 1
+        self.cfg["desktop"]["click_retry_delay_sec"] = 0
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -417,14 +428,39 @@ class CuaDriverTests(unittest.TestCase):
 
     def test_refuses_non_ax_click_path(self):
         """非 AX 路径会合成鼠标事件把光标甩到左上角，必须拒绝。"""
-        snaps = [
+        runner = CuaFakeRunner([
             desktop_snap({"element_index": 65, "role": "AXButton", "label": "立即领取"}),
-            desktop_snap(),
-        ]
-        runner = CuaFakeRunner(snaps, click_path="cg_event")
+        ], click_path="cg_event")
         result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
         self.assertFalse(result.ok)
         self.assertIn("non-AX", result.detail)
+
+    def test_retries_after_stale_ax_element(self):
+        """回归（另一台机器 -25202）：元素引用失效后必须重新快照定位再点。"""
+        self.cfg["desktop"]["click_max_attempts"] = 3
+        btn = {"element_index": 65, "role": "AXButton", "label": "立即领取"}
+        runner = CuaFakeRunner(
+            [desktop_snap(btn), desktop_snap(btn), desktop_snap()],
+            click_results=[
+                {"error": "AX action failed: AXUIElementPerformAction(AXPress) returned -25202"},
+                {"effect": "unverifiable", "path": "ax", "verified": False},
+            ],
+        )
+        result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
+        self.assertTrue(result.ok, result.detail)
+        self.assertTrue(result.data["confirmed"])
+        self.assertEqual(runner.snap_count, 3)
+
+    def test_already_claimed_evidence_is_accepted(self):
+        """展开面板后页面明确显示「今日已领取」= 已签到的强证据。"""
+        runner = CuaFakeRunner([
+            desktop_snap({"element_index": 58, "role": "AXButton", "label": "Buddy加油站"}),
+            desktop_snap({"element_index": 64, "role": "AXButton", "label": "今日已领取"}),
+        ])
+        result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
+        self.assertTrue(result.ok)
+        self.assertTrue(result.data["confirmed"])
+        self.assertEqual(result.data.get("evidence"), "今日已领取")
 
 
 def growth_snap(labels: list[str]) -> dict:

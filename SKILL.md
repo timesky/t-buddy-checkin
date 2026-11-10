@@ -23,13 +23,14 @@ description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、�
 
 ## 用法
 
-手动执行：`BUDDY_FREE_MODEL=1 ./run.sh <command>`（`model-check` / `deps` / `install-launchd` 可不带）。
+手动执行：`BUDDY_FREE_MODEL=1 ./run.sh <command>`（`model-check` / `deps` / `install-launchd` / `inspect` 可不带）。
 
 | 命令 | 作用 | 是否需要人工 |
 |---|---|---|
 | `deps check` | 逐项检查第三方依赖是否就绪（安装技能后必跑） | 否 |
 | `deps install` | 打印 CuaDriver 的手动安装与授权指引（无 npm 依赖） | CuaDriver 需人工安装+授权 |
 | `deps list` | 仅列出依赖与路径 | 否 |
+| `inspect` | 只读诊断：窗口清单 + 客户端入口文案 + 成长中心探测（跨机器排查首选） | 否 |
 | `status` | 只读查看三条时间线的下次执行时间 / 最近运行 | 否 |
 | `checkin-now` | 手动跑**签到线**一轮（只签到） | 否（需 CuaDriver 授权） |
 | `exchange-now` | 手动跑**兑换检查线**一轮 | 否 |
@@ -70,7 +71,10 @@ description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、�
 ## 执行约束
 
 - **不激活窗口、不移动物理鼠标、不接管用户日常浏览器**：所有点击优先用 `element_token`（无则 `element_index`）走 AX press，并校验返回 `path == "ax"`；任何会移动光标的像素路径一律拒绝。成长中心只操作用户自己打开的浏览器窗口。
-- **签到按钮需要先展开面板**：客户端「Buddy加油站」面板收起时 AX 树里没有「立即领取」。必须先点开入口再重新快照定位；展开后仍无按钮才算已签，连入口都找不到则报「状态不确定」、隔一小时再查，**绝不写 `last_checkin_day`**（否则整天假阳性漏签）。
+- **签到按钮需要先展开面板**：客户端「Buddy加油站」面板收起时 AX 树里没有「立即领取」。必须先点开入口再重新快照定位；展开后仍无按钮、或页面出现「今日已领取」= 确认已签；连入口都找不到则报「状态不确定」、隔一小时再查，**绝不写 `last_checkin_day`**。
+- **跨机器**：`AXPress -25202`（元素引用失效）已内置 3 次「重新快照定位」重试；入口文案用 `desktop.station_entry_labels` / `growth.auto_open_labels` 配置，差异先用 `./run.sh inspect` 只读查看。
+- **页面免人工打开**：`growth.auto_open_page=true` 时，没有成长中心页面会先点客户端「做任务赢积分」入口，仍找不到则 `open -g` 后台打开目标 URL（不抢焦点，300 秒冷却）。未登录只提示、不自动登录。
+- **状态判定只认 `AXButton`**：客户端里打开的 README/对话若含「派猫猫旅行」「领取 7 积分」等字样，不能被误判为成长中心页面；客户端窗口由 `growth.exclude_apps` 排除。
 - **幂等**：所有领取经 SQLite 唯一键去重，重复运行不重复领。
 - **时间口径**：一律北京时间；naive 时间按北京时间解释，不按 UTC。
 - **凭据**：输出脱敏，不读取或导出客户端登录态与令牌；不自动登录。

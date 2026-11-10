@@ -121,6 +121,7 @@ cp config.example.toml config.toml      # 按需修改
 chmod +x run.sh
 
 ./run.sh deps check    # 必跑：确认 CuaDriver 已安装并授权，否则后续命令会在真实环境才暴露缺失
+./run.sh inspect      # 只读诊断：窗口清单 + 客户端入口文案 + 成长中心探测（跨机器排查首选）
 
 # 手动命令（除 model-check / deps / install-launchd 外都要带 BUDDY_FREE_MODEL=1）
 BUDDY_FREE_MODEL=1 ./run.sh status        # 只读：三条时间线的下次执行时间
@@ -184,6 +185,34 @@ launchctl kickstart -k gui/$(id -u)/com.local.buddy-web-checkin
 
 本项目代码零第三方依赖。调用的唯一外部工具 CuaDriver 为独立 GUI 应用（其自身许可见 trycua 官方）。依赖树中不含 BUSL / FSL / PolyForm-NC 等限制性许可。
 
+## 另一台机器 / 全新安装
+
+```bash
+git clone git@github.com:timesky/t-buddy-checkin.git
+cd t-buddy-checkin && cp config.example.toml config.toml && chmod +x run.sh
+./run.sh deps check        # CuaDriver 必须在「辅助功能」里授权 com.trycua.driver
+./run.sh inspect           # 只读：看客户端入口文案、窗口清单、成长中心探测结果
+BUDDY_FREE_MODEL=1 ./run.sh checkin-now    # 逐条验证，先看单条线结果
+BUDDY_FREE_MODEL=1 ./run.sh exchange-now
+BUDDY_FREE_MODEL=1 ./run.sh travel-now
+./run.sh install-launchd   # 然后 launchctl bootstrap，或下次登录自动加载
+```
+
+**页面无需人工先点开**：`growth.auto_open_page=true` 时，浏览器里没有成长中心页面会先点客户端
+「做任务赢积分」入口；点击后仍检测不到，就用 `open -g` 在后台打开
+`https://www.workbuddy.cn/profile/growth-center`（不激活浏览器、不抢焦点）。
+带 300 秒冷却，避免每次轮询重复开标签页。未登录仍只提示，绝不自动登录。
+
+跨机器常见差异（2026-11-10 实测）：
+
+- `AXUIElementPerformAction(AXPress) returned -25202` = 元素引用失效，已内置 3 次
+  「重新取快照 → 重新定位 → 再点」的重试（`desktop.click_max_attempts`）。
+- 客户端版本不同、入口文案不同 → `inspect` 看实际按钮，改
+  `desktop.station_entry_labels` / `growth.auto_open_labels` / `dom_fallback.checkin`。
+- 「成长计划」按钮实测打开的是 CodeBuddy 积分页，已从默认 `auto_open_labels` 移除。
+- 客户端窗口里打开含「派猫猫旅行 / 领取 7 积分」的文档时曾被误判为成长中心：
+  现在状态判定**只认 `AXButton`** 标签，并排除客户端窗口（`growth.exclude_apps`）。
+
 ## 故障排查
 
 | 现象                                   | 检查                                                       |
@@ -191,8 +220,10 @@ launchctl kickstart -k gui/$(id -u)/com.local.buddy-web-checkin
 | `deps check` 报 CuaDriver MISSING     | 安装 CuaDriver.app 并 `cua-driver permissions grant` 授权辅助功能 |
 | 签到报 WorkBuddy main window not found  | 确认 WorkBuddy 客户端已打开且主窗口可见                                |
 | 成长中心报 login_required                 | 在浏览器里登录 WorkBuddy 个人中心后重跑（工具不自动登录）                       |
-| 成长中心报 growth-center window not found | 从 WorkBuddy 点开「个人中心」，让页面在浏览器里可见                          |
-| 到期时间不准                               | `growth.claim_offset_sec` 可调；确认派遣后读到了真实倒计时               |
+| 成长中心报 growth-center window not found | 现在会**自动**点「做任务赢积分」入口、并后台 `open -g` 打开成长中心 URL；仍失败看 `./run.sh inspect` |
+| 签到报 `AXPress ... -25202` | 元素引用失效，已内置 3 次「重新快照定位」重试；仍失败看 `inspect` 的客户端按钮文案 |
+| 客户端文档/对话被误判成成长中心 | 已修：状态判定只认 `AXButton`，并排除客户端窗口（`growth.exclude_apps`） |
+| 另一台机器入口文案不同 | `./run.sh inspect` 看实际按钮，改 `desktop.station_entry_labels` / `growth.auto_open_labels` |
 | 领取没到账                                | `./run.sh status` 看运行日志；签到/兑换失败会隔 1 小时自动重试      |
 
 ## 变更记录：移除未使用的工具（2026-11-09）
