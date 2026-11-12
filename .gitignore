@@ -6,9 +6,15 @@ progress.txt
 *.sqlite3
 *.db
 
-# ---- 历史遗留：早期 npm 依赖目录（现已无 npm 依赖，防止误提交） ----
+# ---- npm 依赖（agent-desktop 引擎，本地安装不提交） ----
 tools/node_modules/
 tools/package-lock.json
+
+# ---- 登录检测/调试截图（可能含个人隐私，绝不提交） ----
+.tmp/
+*.png
+screenshots/
+.local/share/
 
 # ---- Python ----
 __pycache__/
