@@ -180,6 +180,20 @@ launchctl kickstart -k gui/$(id -u)/com.local.buddy-web-checkin
 - **重启不重置当天状态**：`travel_blocked` 连同 `travel_blocked_day` 落库。服务重启后
   `initial_jobs` 虽会立即跑三条线，但当天的 exhausted 标记会让它**直接跳到 23:00、
   不做实际检查**（避免重启误触发自动开页签）；跨天后自动清除。
+- **签到假阳性防护（2026-11-12 实测）**：WorkBuddy 5.11.2 客户端右侧对话正文会含
+  「明日再来」等历史消息。已签证据**只在「Buddy加油站」面板区内（入口索引 +
+  `desktop.station_panel_window`，默认 16）且只认 AXButton**，绝不全文搜索正文。
+  面板收起时先点开入口再判断；面板展开后确无「立即领取」按钮才确认已签。
+- **签到满 24 小时**：落库 `last_checkin_at`（真实签到时刻），`daily_checkin.min_interval_sec`
+  默认 86400；距上次真实签到不足 24h 即使跨了 0 点也不重复签，继续轮询。
+- **web 动作前先刷新页面**（`growth.refresh_before_action=true`）：页面久置会保留旧状态
+  （实测「今天已能派遣，页面仍显示昨天的『明天再来』」）。用纯 AX 点浏览器工具栏
+  「刷新」按钮（不移动光标），等待 `refresh_wait_sec` 后重建快照再判断；同轮只刷一次。
+- **兑换确定性结论**：弹窗里「本月已兑换 / 已兑完 / 已达上限」等判为**无法兑换**，
+  返回 ok=True 让兑换线禁用到 23:59，而不是 ok=False 每小时无效重试。
+- **派遣场景弹窗**：点「派猫猫旅行」后会进入场景选择弹窗，必须**重读快照**再点
+  「确定派出」（不能用弹窗出现前的旧索引）；点击后异步更新，读不到 traveling 时
+  等 1.2s 复核一次，避免把成功的派遣误判失败。
 - **不重复开页签**：自动打开前先按窗口标题判断「是否已有 WorkBuddy 个人中心页签」，
   有就只读等待、不再新开；自动打开冷却 `last_auto_open_at` 写 kv，跨进程/重启生效。
   CuaDriver daemon 不可用时（`driver_unavailable`）一律不自动打开。
@@ -239,6 +253,9 @@ BUDDY_FREE_MODEL=1 ./run.sh travel-now
 | 页面显示「明天再来 / 次数已用完」 | 当天派遣次数用尽，旅行线自动禁用到 23:00（`travel.exhausted_retry_at`），`status` 可看下次时间 |
 | 反复新开 WorkBuddy 页签 | 已修：先判断已有个人中心页签就不新开；自动打开冷却写 kv，重启不重置 |
 | `list_windows` 失败 / `Cua Driver daemon is not running` | **CuaDriver daemon 挂了**（会连锁导致探测失败、反复开页签、派遣重试）。用 `cua-driver permissions grant` 重新拉起（以 com.trycua.driver 身份，否则辅助功能授权不生效）；daemon 不可用时本技能不会自动开页签 |
+| 今天明明没签到却显示已签 / 整晚不补签 | 对话正文的「明日再来」被误当证据（5.11.2 实测）。已修：已签证据只在加油站面板区内认按钮；确认异常时清 `last_checkin_day`/`last_checkin_at` 后重跑 `checkin-now` |
+| 页面状态不变（如今天可派遣却显示「明天再来」） | 页面久置未刷新。已加 web 动作前自动刷新（`growth.refresh_before_action`），也可手动 `travel-now` 复验 |
+| 派遣停在 `state=scene_dialog` | 点「派猫猫旅行」后才出场景弹窗，已修为重建快照再点「确定派出」+ 异步复核 |
 | 客户端文档/对话被误判成成长中心 | 已修：状态判定只认 `AXButton`，并排除客户端窗口（`growth.exclude_apps`） |
 | 另一台机器入口文案不同 | `./run.sh inspect` 看实际按钮，改 `desktop.station_entry_labels` / `growth.auto_open_labels` |
 | 领取没到账                                | `./run.sh status` 看运行日志；签到/兑换失败会隔 1 小时自动重试      |

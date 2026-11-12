@@ -62,6 +62,13 @@ DISPATCH_EXHAUSTED_MARKERS = (
     "今日已派", "次数已用完", "次数用尽", "今日次数", "已达上限",
     "明日再来", "明天再来", "派遣次数", "已派完", "无可派遣",
 )
+# 兑换弹窗里表示「本期/本月已兑完、无可兑」的确定性文案。
+# 2026-11-12 实测：「本月已兑换」含「兑换」二字被误当可兑奖励，点击失败后
+# 每小时间断重试；它其实是确定性「无法兑换」，应让兑换线禁用到当天 23:59。
+EXCHANGE_NO_MORE_MARKERS = (
+    "本月已兑换", "本月已兑", "已兑换", "本月已领", "已兑完",
+    "本轮已兑", "已达上限", "兑换完毕", "暂不可兑", "次数已用完",
+)
 
 
 def parse_hms(text: str) -> int | None:
@@ -97,6 +104,12 @@ class GrowthCenter:
         self.auto_open_url = growth.get("auto_open_url") or \
             "https://www.workbuddy.cn/profile/growth-center"
         self.auto_open_url_fallback = bool(growth.get("auto_open_url_fallback", True))
+        # web 动作前先刷新页面：页面久置会保留旧状态（2026-11-12 用户实测
+        # 「做 web 任务前先刷新，否则状态可能不变」）。纯 AX 点工具栏刷新，
+        # 不移动光标；刷新后 element_index 全部失效，必须重建快照。
+        self.refresh_before_action = bool(growth.get("refresh_before_action", True))
+        self.refresh_wait_sec = float(growth.get("refresh_wait_sec", 3))
+        self._refreshed_this_cycle = False
         # 冷却从 kv 读，进程重启后仍生效（避免每次重启都新开页签）
         persisted = state.kv_get_float("last_auto_open_at") if state is not None else None
         self._last_auto_open = float(persisted or 0.0)
@@ -303,6 +316,48 @@ class GrowthCenter:
     # 允许尝试的角色：不同客户端版本里入口可能是按钮、链接或纯文本卡片
     _ENTRY_ROLES = ("AXButton", "AXMenuItem", "AXLink", "AXCell", "AXStaticText")
 
+    # 浏览器工具栏刷新按钮（中文/英文浏览器均可）
+    _REFRESH_LABELS = ("刷新", "重新加载", "Reload", "Refresh")
+
+    def _maybe_refresh(self, pid: int, wid: int) -> bool:
+        """本轮首次动作前刷新一次页面；同轮后续动作不重复刷新。"""
+        if self._refreshed_this_cycle:
+            return False
+        self._refreshed_this_cycle = True
+        return self.refresh_page(pid, wid)
+
+    def refresh_page(self, pid: int, wid: int) -> bool:
+        """动作前刷新成长中心页面，确保读到服务端最新状态。
+
+        2026-11-12 用户实测：页面久置后状态可能不更新（例如今天已能派遣，
+        页面却仍显示昨天的『明天再来』/次数用尽），导致误判。这里用纯 AX
+        点浏览器工具栏「刷新」按钮（element_token，不移动光标），等待加载；
+        刷新后调用方必须重新 snapshot（element_index 已全部失效）。
+        找不到刷新按钮时返回 False，不阻断后续动作。
+        """
+        if not self.refresh_before_action:
+            return False
+        snap = self._call("get_window_state", {
+            "pid": pid, "window_id": wid,
+            "include_screenshot": False, "max_elements": 2000,
+        })
+        if "error" in snap:
+            return False
+        # 工具栏刷新按钮索引很小（实测 Edge idx=2），限定前 30 避免误点页面内容
+        refresh = next(
+            (e for e in snap.get("elements", [])
+             if e.get("role") in ("AXButton", "AXMenuItem")
+             and str(e.get("label") or "").strip() in self._REFRESH_LABELS
+             and (e.get("element_index") or 0) <= 30),
+            None,
+        )
+        if refresh is None:
+            return False
+        if self._click_raw(refresh, pid, wid) is not None:
+            return False
+        time.sleep(self.refresh_wait_sec)
+        return True
+
     def _try_auto_open(self) -> bool:
         """从 WorkBuddy 客户端入口触发打开成长中心页面（只点一个入口）。
 
@@ -497,6 +552,7 @@ class GrowthCenter:
         if not win:
             return self._block_result("gift")
         pid, wid = win
+        self._maybe_refresh(pid, wid)  # 手动单命令也先刷新（tick 内已刷则跳过）
         snap = self.snapshot(pid, wid)
         st = self.read_state(snap)["state"]
 
@@ -579,7 +635,9 @@ class GrowthCenter:
         if not win:
             return [self._block_result("exchange")]
         pid, wid = win
-        snap = self.snapshot(pid, wid)
+        self._refreshed_this_cycle = False  # 兑换线是独立一轮，先刷新
+        self._maybe_refresh(pid, wid)
+        snap = self.snapshot(pid, wid)  # 刷新后重建索引
         # 自愈：上一轮遗留的「选择奖励」弹窗先关掉
         if "选择奖励" in self.read_state(snap)["raw"]:
             self._close_dialog(snap, self._call, pid, wid)
@@ -606,26 +664,44 @@ class GrowthCenter:
             after = self.snapshot(pid, wid)
 
             if kind == "milestone":
-                # 「兑换奖励」会打开选择奖励弹窗；只有不含「还差/未解锁/已领取」的才是真可兑
+                # 「兑换奖励」会打开选择奖励弹窗；只有不含「还差/未解锁/已领取」的才是真可兑。
+                # 「本月已兑换 / 已兑完」等是确定性「无法兑换」，必须排除，
+                # 否则会被当奖励点击失败 → ok=False → 每小时间断重试（2026-11-12 实测）。
                 unlocked = [
                     str(e.get("label") or "").strip()
                     for e in after.get("elements", [])
                     if e.get("role") == "AXButton"
                     and any(k in str(e.get("label") or "") for k in ("领取", "兑换"))
                     and not any(k in str(e.get("label") or "") for k in
-                                ("还差", "未解锁", "已领取", "兑换奖励"))
+                                ("还差", "未解锁", "已领取", "兑换奖励",
+                                 "已兑换", "已兑完", "本月已兑", "本月已领",
+                                 "已达上限", "兑换完毕", "暂不可兑"))
                 ]
                 if not unlocked:
                     self._close_dialog(after, self._call, pid, wid)
+                    # 弹窗里若明确写「本月已兑换」等 → 确定性结论，禁用到 23:59
+                    dialog_text = " | ".join(
+                        str(e.get("label") or "") for e in after.get("elements", []))
+                    no_more = next((m for m in EXCHANGE_NO_MORE_MARKERS if m in dialog_text), None)
                     results.append(ActionResult(
-                        True, "exchange", "milestone: no unlocked reward yet",
-                        {"kind": kind, "key": key, "skipped": True},
+                        True, "exchange",
+                        (f"exchange concluded: {no_more}" if no_more
+                         else "milestone: no unlocked reward yet"),
+                        {"kind": kind, "key": key, "skipped": True,
+                         "conclusive": bool(no_more)},
                     ))
                     continue
                 target = unlocked[0]
-                ok2, _ = self._click(after, lambda s, t=target: s.strip() == t, pid, wid)
+                ok2, click_label = self._click(after, lambda s, t=target: s.strip() == t, pid, wid)
                 final = self.snapshot(pid, wid)
                 self._close_dialog(final, self._call, pid, wid)
+                if not ok2 and any(m in str(click_label) + str(target) for m in EXCHANGE_NO_MORE_MARKERS):
+                    # 点击「本月已兑换」类按钮失败 = 确定无法兑换，不当成临时错误
+                    results.append(ActionResult(
+                        True, "exchange", f"exchange concluded: {target}",
+                        {"kind": kind, "key": key, "skipped": True, "conclusive": True},
+                    ))
+                    continue
                 results.append(ActionResult(
                     ok2, "exchange", f"milestone claimed: {target}",
                     {"kind": kind, "key": key, "label": target},
@@ -652,6 +728,7 @@ class GrowthCenter:
         if not win:
             return self._block_result("travel_dispatch")
         pid, wid = win
+        self._maybe_refresh(pid, wid)  # 手动单命令也先刷新（tick 内已刷则跳过）
         # 派遣前先清浮层（领奖确认弹窗未关会让按钮 AXEnabled=false）
         self.dismiss_dialog(pid, wid)
         snap = self.snapshot(pid, wid)
@@ -695,8 +772,16 @@ class GrowthCenter:
                         )
                 else:
                     return ActionResult(False, "travel_dispatch", label)
+            else:
+                # 点「派猫猫旅行」成功后会进入场景弹窗（或已直接开跑），
+                # 必须重读状态，否则 st 还停在旧快照的 idle，漏掉 scene_dialog 分支。
+                snap = self.snapshot(pid, wid)
+                st = self.read_state(snap)["state"]
 
         if st == "scene_dialog":
+            # 场景弹窗是点「派猫猫旅行」后才出现的，必须重建快照再定位，
+            # 否则用的是弹窗出现前的旧索引（2026-11-12 实测 dispatch 卡 scene_dialog）
+            snap = self.snapshot(pid, wid)
             if self.scene:
                 self._click(snap, lambda s: "切换到" in s and self.scene in s, pid, wid)
                 snap = self.snapshot(pid, wid)
@@ -707,8 +792,14 @@ class GrowthCenter:
                 return ActionResult(False, "travel_dispatch", label,
                                     {"dispatch_blocked": blocked} if blocked else {})
 
+        # 派遣是异步的：点击后页面需要时间从 scene_dialog 变成 traveling。
+        # 读不到 traveling 时等一下重读一次，避免把成功的派遣误判为失败。
         after = self.snapshot(pid, wid)
         info = self.read_state(after)
+        if info["state"] != "traveling" or info["remaining_sec"] is None:
+            time.sleep(1.2)
+            after = self.snapshot(pid, wid)
+            info = self.read_state(after)
         if info["state"] != "traveling" or info["remaining_sec"] is None:
             self.dismiss_dialog(pid, wid)
             hit = self._exhausted_hit(info["raw"])
@@ -733,12 +824,17 @@ class GrowthCenter:
         if not win:
             return self._block_result("travel")
         pid, wid = win
+        # 每轮动作前刷新页面，避免读到久置的旧状态（用户 2026-11-12 要求）
+        self._refreshed_this_cycle = False
+        refreshed = self._maybe_refresh(pid, wid)
         # 先清掉上一轮遗留的「已领取 / 选择奖励」等浮层，否则会遮挡本轮状态读取
         # （实测 2026-11-10 11:19 重启轮：残留弹窗导致整轮误判 gift_dialog 失败）
         self.dismiss_dialog(pid, wid)
-        snap = self.snapshot(pid, wid)
+        snap = self.snapshot(pid, wid)  # 刷新后重建索引
         info = self.read_state(snap)
         state = info["state"]
+        if refreshed:
+            info["refreshed"] = True
 
         if state == "traveling" and not force:
             if info["remaining_sec"] is None:

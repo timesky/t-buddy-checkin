@@ -33,20 +33,36 @@ class Actions:
         """签到时间线的一轮：只做签到，不碰成长中心。
 
         返回 data.confirmed：True 才允许当天禁用轮询。
-        DB 已记录今日成功 / 本轮点击并验证按钮消失 = 确认；
-        仅凭「按钮不存在」推测已签 = 未确认，调度器会隔一小时再查。
+        只有「本轮点击并验证按钮消失」或「面板展开后确认无领取按钮」才算确认；
+        仅凭按钮不存在推测、或对话正文里的『明日再来』都不得落库。
+
+        满 24 小时口径（2026-11-12 用户要求）：即使跨了北京时间 0 点，若距
+        上次真实签到不足 min_interval_sec（默认 24h），仍不认定已签，继续轮询，
+        避免凌晨因活动尚未刷新而把旧状态当作新一天的签到。
         """
         if not self.cfg["daily_checkin"]["enabled"]:
             return ActionResult(True, "checkin", "disabled", {"confirmed": True})
+        cfg = self.cfg.get("daily_checkin", {})
+        min_interval = float(cfg.get("min_interval_sec", 24 * 3600))
+        last_at = self.state.kv_get_float("last_checkin_at")
+        now = time.time()
+        if last_at is not None and 0 <= now - last_at < min_interval:
+            left = int(min_interval - (now - last_at))
+            return ActionResult(
+                True, "checkin",
+                f"last real checkin < {int(min_interval/3600)}h ago; wait {left}s",
+                {"confirmed": True, "waiting_cooldown": True, "last_checkin_at": last_at},
+            )
         if self.state.kv_get("last_checkin_day") == day_key():
             return ActionResult(True, "checkin", "already checked in today",
                                 {"confirmed": True})
         result = self.desktop.claim_daily(self.cfg["dom_fallback"]["checkin"])
-        # 只有「确认」才落库：面板收起导致按钮找不到时绝不写 last_checkin_day，
-        # 否则会像 2026-11-10 08:49 那样把假阳性固化、整天不再补签。
+        # 只有「确认」才落库：面板收起导致按钮找不到、或对话正文干扰，
+        # 都绝不写 last_checkin_day / last_checkin_at，否则整天不再补签。
         if result.ok and result.data.get("confirmed"):
             self.state.claim_once("checkin", "daily")
             self.state.kv_set("last_checkin_day", day_key())
+            self.state.kv_set("last_checkin_at", now)
         self.state.log("checkin", result.ok, result.detail)
         return result
 

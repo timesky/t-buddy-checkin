@@ -23,11 +23,14 @@ DEFAULTS: dict[str, Any] = {
         "app": "WorkBuddy",
         # 面板收起时用于展开的入口按钮；不同客户端版本文案可能不同
         "station_entry_labels": ["Buddy加油站", "做任务赢积分"],
-        # 点击后出现的「今天已领」文案，作为已签到的强证据
+        # 点击后出现的「今天已领」文案，作为已签到的强证据（只在面板区内认）
         "already_claimed_labels": ["今日已领取", "已领取", "明日再来", "今日已领"],
+        # 加油站面板索引窗口：入口 idx + 该值 = 面板上界，超出即对话正文，不参与已签判定
+        "station_panel_window": 16,
     },
     # 签到时间线由 [schedule] 控制（0 点恢复 / 每小时轮询），此处只留总开关
-    "daily_checkin": {"enabled": True},
+    # min_interval_sec：两次真实签到的最小间隔（默认 24h，满足「满 24 小时」口径）
+    "daily_checkin": {"enabled": True, "min_interval_sec": 86400},
     # 统一进程内的三条调度线（仅 travel 为动态滚动）：
     #   1 checkin  每天 0 点恢复每小时轮询，签到成功即禁用到当天 23:59
     #   2 exchange 每天 0 点恢复每小时轮询，兑换成功或确认无可兑换即禁用到当天 23:59
@@ -85,6 +88,9 @@ DEFAULTS: dict[str, Any] = {
         # 点击入口后仍找不到页面时的兜底：后台打开目标 URL（-g 不抢焦点）
         "auto_open_url": "https://www.workbuddy.cn/profile/growth-center",
         "auto_open_url_fallback": True,
+        # web 动作前先刷新页面（页面久置会保留旧状态），纯 AX 点工具栏刷新
+        "refresh_before_action": True,
+        "refresh_wait_sec": 3,
     },
     # DOM 文本兜底：接口未知或改版时按可见文字定位
     "dom_fallback": {

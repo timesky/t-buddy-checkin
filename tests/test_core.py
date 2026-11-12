@@ -508,6 +508,43 @@ class CuaDriverTests(unittest.TestCase):
         self.assertTrue(result.data["confirmed"])
         self.assertEqual(result.data.get("evidence"), "今日已领取")
 
+    def test_conversation_body_mingri_is_not_checkin_evidence(self):
+        """回归（2026-11-12 假阳性）：客户端右侧对话正文里的「明日再来」
+        绝不能被当成页面已签证据。已签判定只在加油站面板区内、只认按钮。"""
+        body = {"element_index": 200, "role": "AXStaticText",
+                "label": "新增「明日再来 / 今日已派完」等文案识别"}
+        runner = CuaFakeRunner([
+            desktop_snap({"element_index": 58, "role": "AXButton", "label": "Buddy加油站"}),
+            desktop_snap(body),  # 展开后：面板区内无领取按钮，正文有「明日再来」
+        ])
+        result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
+        # 面板已展开且面板区内确实无按钮 -> 仍可信已签，但证据不能来自正文
+        self.assertTrue(result.ok)
+        self.assertNotIn("evidence", result.data)  # 没有拿正文当证据
+        self.assertTrue(result.data.get("station_expanded"))
+
+    def test_body_mingri_without_expand_is_uncertain(self):
+        """未展开面板、只有正文含「明日再来」时：状态不确定，不落库。"""
+        body = {"element_index": 200, "role": "AXStaticText",
+                "label": "明日再来（历史聊天）"}
+        runner = CuaFakeRunner([desktop_snap(body)])
+        result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
+        self.assertFalse(result.ok)
+        self.assertFalse(result.data.get("confirmed"))
+
+    def test_24h_cooldown_blocks_second_checkin(self):
+        """24 小时口径：距上次真实签到不足 24h 不重复签。"""
+        from buddy_checkin.actions import Actions
+
+        state = State(Path(self.tmp.name) / "cooldown.sqlite3")
+        state.kv_set("last_checkin_at", time.time() - 3600)  # 1 小时前签过
+        actions = Actions(self.cfg, state, FakeDesktop(), growth=None)
+        res = actions.daily_checkin()
+        self.assertTrue(res.ok)
+        self.assertTrue(res.data.get("waiting_cooldown"))
+        self.assertIsNone(state.kv_get("last_checkin_day"))
+        state.close()
+
 
 def growth_snap(labels: list[str]) -> dict:
     return {
@@ -588,6 +625,43 @@ class GrowthCenterTests(unittest.TestCase):
             dues.append(result.data["due_at"])
         self.assertAlmostEqual(dues[1] - dues[0], 8130 - 3596, delta=5)
 
+    def test_dispatch_scene_dialog_rebuilds_snapshot(self):
+        """回归（2026-11-12）：点「派猫猫旅行」后场景弹窗才出现，
+        定位「确定派出」必须重建快照，不能用弹窗出现前的旧索引。"""
+        main = growth_snap(["派猫猫旅行", "兑换奖励"])
+        scene = growth_snap(["确定派出", "切换到 咖啡馆", "预计出行时间为1～4小时"])
+        traveling = growth_snap(["旅行倒计时 02:59:58", "Buddy 正在采风中"])
+
+        def runner(cmd, **_kw):
+            tool = cmd[2]
+            if tool == "list_windows":
+                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"windows": [
+                    {"app_name": "Microsoft Edge", "pid": 446, "window_id": 60,
+                     "title": "WorkBuddy - 个人中心", "is_on_screen": True,
+                     "bounds": {"width": 1900, "height": 940}},
+                ]}), stderr="")
+            if tool == "get_window_state":
+                # 第1次=dispatch入口取快照(此时idle)；点过派猫猫旅行后=scene_dialog；
+                # 点过确定派出后=traveling
+                dispatch_clicked = any(c[2] == "click" for c in runner_calls)
+                confirm_clicked = len([c for c in runner_calls if c[2] == "click"]) >= 2
+                out = traveling if confirm_clicked else (scene if dispatch_clicked else main)
+                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(out), stderr="")
+            if tool == "click":
+                runner_calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+        runner_calls: list = []
+        # 关掉预刷新，让快照序列只由 dispatch 自己的动作推进，聚焦 scene_dialog
+        cfg = dict(self.cfg)
+        cfg["growth"] = dict(self.cfg["growth"])
+        cfg["growth"]["refresh_before_action"] = False
+        gc = GrowthCenter(cfg, runner=runner)
+        res = gc.dispatch()
+        self.assertTrue(res.ok, res.detail)
+        self.assertIn("real duration", res.detail)
+        self.assertEqual(res.data.get("remaining_sec"), 10798)  # 02:59:58
+
     def test_scan_exchanges_is_conservative(self):
         snap = growth_snap([
             "兑换奖励", "抽奖(0)", "开启盲盒 8/10", "抽奖(2)", "开启盲盒 10/10", "1", "2",
@@ -608,6 +682,36 @@ class GrowthCenterTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertTrue(results[0].data["skipped"])
         self.assertFalse(any(c[2] == "click" for c in runner.calls))
+
+    def test_benefit_exhausted_is_conclusive_not_retried(self):
+        """回归（2026-11-12）：兑换弹窗显示「本月已兑换」= 确定性无法兑换，
+        必须回 ok=True（让兑换线禁用到 23:59），而不是 ok=False 每小时重试。"""
+        win_snap = growth_snap(["兑换奖励", "旅行倒计时 00:10:00"])
+        dialog = growth_snap(["本月已兑换", "还差 3 天", "关闭"])
+        clicked = {"any": False}
+
+        def runner(cmd, **_kw):
+            tool = cmd[2]
+            if tool == "list_windows":
+                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"windows": [
+                    {"app_name": "Microsoft Edge", "pid": 446, "window_id": 60,
+                     "title": "WorkBuddy - 个人中心", "is_on_screen": True,
+                     "bounds": {"width": 1900, "height": 940}},
+                ]}), stderr="")
+            if tool == "get_window_state":
+                out = dialog if clicked["any"] else win_snap
+                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(out), stderr="")
+            if tool == "click":
+                clicked["any"] = True  # 点过「兑换奖励」后进入弹窗
+            return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+        gc = GrowthCenter(self.cfg, runner)
+        results = gc.claim_exchanges(claimed_before=lambda _key: False)
+        self.assertTrue(len(results) >= 1)
+        self.assertTrue(results[-1].ok, results[-1].detail)  # 确定性结论 -> ok
+        self.assertTrue(results[-1].data.get("skipped"))
+        self.assertTrue(results[-1].data.get("conclusive"))
+        self.assertIn("本月已兑换", results[-1].detail)
 
     def test_traveling_tick_records_due_from_countdown(self):
         runner = GrowthFakeRunner([growth_snap(["旅行倒计时 00:17:55"])])

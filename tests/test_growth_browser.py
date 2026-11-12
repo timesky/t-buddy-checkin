@@ -291,6 +291,73 @@ class DialogTests(unittest.TestCase):
         self.assertEqual(res.data.get("remaining_sec"), 5458)
 
 
+class RefreshPageTests(unittest.TestCase):
+    """回归（2026-11-12）：web 动作前先刷新，避免读到久置的旧状态。"""
+
+    def _cfg(self, **overrides):
+        cfg = {"growth": {"browser_app": "auto", "auto_open_page": False,
+                          "refresh_before_action": True, "refresh_wait_sec": 0},
+               "desktop": {"app": "WorkBuddy"}}
+        cfg["growth"].update(overrides)
+        return cfg
+
+    def test_refresh_clicked_before_tick_and_rebuilds_snapshot(self):
+        clicks = []
+        # 第 1 次快照：工具栏有「刷新」(idx=2)；第 2 次（刷新后）状态变 claimable
+        before = {"elements": [
+            {"role": "AXButton", "label": "刷新", "element_index": 2,
+             "element_token": "s1:2"},
+            {"role": "AXButton", "label": "派猫猫旅行", "element_index": 30,
+             "element_token": "s1:30"},
+        ]}
+        after = {"elements": [
+            {"role": "AXButton", "label": "刷新", "element_index": 2},
+            {"role": "AXButton", "label": "领取礼物", "element_index": 31},
+        ]}
+        seq = [before, after]
+
+        def runner(cmd, **_kw):
+            tool = cmd[2]
+            if tool == "list_windows":
+                return _FakeProc(json.dumps({"windows": [
+                    {"app_name": "Microsoft Edge", "pid": 446, "window_id": 60,
+                     "title": "WorkBuddy - 个人中心", "is_on_screen": True,
+                     "bounds": {"width": 1900, "height": 940}},
+                ]}, ensure_ascii=False))
+            if tool == "get_window_state":
+                out = seq.pop(0) if len(seq) > 1 else seq[0]
+                return _FakeProc(json.dumps(out, ensure_ascii=False))
+            if tool == "click":
+                clicks.append(json.loads(cmd[3]))
+            return _FakeProc("{}")
+
+        from unittest.mock import patch
+        g = GrowthCenter(self._cfg(), runner=runner)
+        with patch("buddy_checkin.adapters.growth.time.sleep"):
+            # 只验证刷新被触发：直接调 refresh 后的首轮 tick 读状态
+            g._refreshed_this_cycle = False
+            g._maybe_refresh(446, 60)
+        self.assertEqual(len(clicks), 1)
+        self.assertEqual(clicks[0].get("element_token"), "s1:2")
+        self.assertEqual(len(seq), 1)  # 刷新后又取了一次快照
+
+    def test_refresh_disabled_skips_click(self):
+        clicks = []
+
+        def runner(cmd, **_kw):
+            if cmd[2] == "get_window_state":
+                return _FakeProc(json.dumps({"elements": [
+                    {"role": "AXButton", "label": "刷新", "element_index": 2}]},
+                    ensure_ascii=False))
+            if cmd[2] == "click":
+                clicks.append(cmd[3])
+            return _FakeProc("{}")
+
+        g = GrowthCenter(self._cfg(refresh_before_action=False), runner=runner)
+        self.assertFalse(g.refresh_page(446, 60))
+        self.assertEqual(clicks, [])
+
+
 class DocTextFalsePositiveTests(unittest.TestCase):
     """回归（2026-11-10）：客户端窗口里打开的 README/对话含「派猫猫旅行」
     「领取 7 积分」等字样，不能因此被当成成长中心页面。"""

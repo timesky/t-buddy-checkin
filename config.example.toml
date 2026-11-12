@@ -12,14 +12,17 @@ cua_driver_bin = "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
 app = "WorkBuddy"
 # 面板收起时用于展开的入口按钮；不同客户端版本文案可能不同
 station_entry_labels = ["Buddy加油站", "做任务赢积分"]
-# 点击后出现的「今天已领」文案，作为已签到的强证据
+# 点击后出现的「今天已领」文案，作为已签到的强证据（只在面板区内认）
 already_claimed_labels = ["今日已领取", "已领取", "明日再来", "今日已领"]
+# 加油站面板索引窗口：入口 idx + 该值 = 面板上界，超出即对话正文，不参与已签判定
+station_panel_window = 16
 # AXPress -25202（元素引用失效）时重新快照定位的重试次数/间隔
 click_max_attempts = 3
 click_retry_delay_sec = 0.8
 
 [daily_checkin]
 enabled = true          # 签到时间线的总开关；周期见下方 [schedule]
+min_interval_sec = 86400  # 两次真实签到最小间隔 24h（满足「满 24 小时」口径）
 
 [schedule]
 # 统一常驻进程的三条时间线。只有 travel 是动态滚动：
@@ -60,6 +63,9 @@ auto_open_cooldown_sec = 300
 # 点击入口后仍找不到页面时，后台打开目标 URL（open -g 不抢焦点）
 auto_open_url = "https://www.workbuddy.cn/profile/growth-center"
 auto_open_url_fallback = true
+# web 动作前先刷新页面：页面久置状态可能不变（2026-11-12 用户实测）
+refresh_before_action = true
+refresh_wait_sec = 3
 
 [travel]
 enabled = true

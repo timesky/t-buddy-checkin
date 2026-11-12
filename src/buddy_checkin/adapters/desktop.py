@@ -32,6 +32,8 @@ class CuaDriverSigner(DesktopAdapter):
         self.already_claimed_labels = desk.get("already_claimed_labels") or [
             "今日已领取", "已领取", "明日再来", "今日已领",
         ]
+        # 面板区索引窗口：入口 idx + 该值 = 面板上界，超出即视为对话正文，不参与已签判定
+        self.panel_window = int(desk.get("station_panel_window", 16))
         # AXPress -25202 = kAXErrorInvalidUIElement（元素引用失效）。
         # 常见于另一台机器/客户端刚重绘：重新取快照定位再点即可恢复。
         self.max_attempts = int(desk.get("click_max_attempts", 3))
@@ -78,16 +80,37 @@ class CuaDriverSigner(DesktopAdapter):
 
     @staticmethod
     def _find(payload: dict, texts: list[str],
-              roles: tuple[str, ...] | None = ("AXButton", "AXMenuItem")) -> dict | None:
+              roles: tuple[str, ...] | None = ("AXButton", "AXMenuItem"),
+              max_index: int | None = None,
+              exact: bool = False) -> dict | None:
         """返回匹配的元素（含 element_token / element_index），而不只是索引。
 
-        roles=None 表示不限 role（用于查「今日已领取」这类静态文案）。
+        roles 只认按钮类（默认）；max_index 限定搜索的元素索引上界，用于把
+        已签证据锁在「加油站面板区」，排除右侧对话正文（会含「明日再来」等
+        历史消息，2026-11-12 假阳性根因）。exact=True 时整标签精确匹配。
         """
         for el in payload.get("elements", []):
             label = str(el.get("label") or "")
-            if (roles is None or el.get("role") in roles) and any(t in label for t in texts):
+            lab = label.strip()
+            if roles is not None and el.get("role") not in roles:
+                continue
+            if max_index is not None and (el.get("element_index") or 0) > max_index:
+                continue
+            matched = (any(t == lab for t in texts) if exact
+                       else any(t in label for t in texts))
+            if matched:
                 return el
         return None
+
+    def _panel_upper_bound(self, snap: dict, entry_index: int | None) -> int | None:
+        """加油站面板元素的索引上界：入口之后的「消息中心/对话内搜索」等为界。
+
+        实测 5.11.2：面板区 idx 50-63，对话正文从 idx 71 起。用入口索引 +
+        一个保守窗口（默认 64）界定，避免把正文纳入已签判定。
+        """
+        if entry_index is None:
+            return None
+        return entry_index + self.panel_window
 
     # 签到按钮藏在「Buddy加油站」面板里，面板收起时按钮根本不在 AX 树中。
     # 必须先点开这个入口，再重新快照找「立即领取」。
@@ -170,8 +193,11 @@ class CuaDriverSigner(DesktopAdapter):
 
         btn = self._find(snap, texts)
         expanded = False
+        panel_max: int | None = None
+        entry = self._find(snap, self.station_entry_labels)
+        if entry is not None:
+            panel_max = self._panel_upper_bound(snap, entry.get("element_index"))
         if btn is None:
-            entry = self._find(snap, self.station_entry_labels)
             if entry is not None:
                 failure = self._click_element(entry, pid, wid)
                 if failure is not None:
@@ -184,20 +210,28 @@ class CuaDriverSigner(DesktopAdapter):
                 if "error" in snap:
                     return ActionResult(False, "desktop.checkin", snap["error"],
                                         {"backend": "cua-driver", "retryable": True})
-                btn = self._find(snap, texts)
+                # 面板展开后入口按钮可能位移，重新定位锚点
+                entry2 = self._find(snap, self.station_entry_labels)
+                if entry2 is not None:
+                    panel_max = self._panel_upper_bound(snap, entry2.get("element_index"))
+                btn = self._find(snap, texts, max_index=panel_max)
 
         if btn is None:
-            # 「今日已领取 / 明日再来」等文案是页面给出的强证据，优先于推断
-            evidence = self._find(snap, self.already_claimed_labels, roles=None)
+            # 「今日已领取 / 明日再来」等文案是页面给出的强证据。
+            # **只认加油站面板区内、按钮类 role**——绝不能全文搜索，否则会把
+            # 客户端右侧对话正文（含「明日再来」等历史消息）误判为已签到。
+            evidence = self._find(snap, self.already_claimed_labels,
+                                  roles=("AXButton", "AXPopUpButton"),
+                                  max_index=panel_max)
             if evidence is not None:
                 return ActionResult(
                     True, "desktop.checkin",
-                    f"already checked in today (page shows {evidence.get('label')})",
+                    f"already checked in today (panel shows {evidence.get('label')})",
                     {"backend": "cua-driver", "clicked": False, "already": True,
                      "confirmed": True, "evidence": evidence.get("label")},
                 )
             if expanded:
-                # 面板已展开仍无领取按钮 = 今天确实已领
+                # 面板已展开、且面板区内没有领取按钮 = 今天确实已领
                 return ActionResult(
                     True, "desktop.checkin",
                     "station panel open, no checkin button; already checked in today",
