@@ -84,6 +84,38 @@ def cua_driver_dep(cfg: dict) -> dict:
     }
 
 
+def agent_desktop_dep(cfg: dict) -> dict:
+    """agent-desktop 桌面签到引擎（可选，严格 headless 不抢焦点/光标）。
+
+    npm 本地安装在 tools/node_modules/.bin/agent-desktop。TCC 授权绑「实际启动
+    它的 App」（iTerm/Terminal 等），未授权会 PERM_DENIED；默认 engine=auto
+    会优先用已授权的 CuaDriver ax 引擎，故它缺失/未授权都不阻断主流程。
+    """
+    desk = cfg.get("desktop", {}) or {}
+    configured = desk.get("agent_desktop_bin") or "node_modules/.bin/agent-desktop"
+    project_root = Path(__file__).resolve().parents[2]
+    local = project_root / "tools" / configured
+    resolved = local if local.exists() else (
+        _which(Path(configured).name) if not Path(configured).is_absolute()
+        else Path(configured) if Path(configured).exists() else None
+    )
+    return {
+        "name": "agent-desktop",
+        "kind": "npm-tool",
+        "required": False,
+        "critical": False,
+        "present": resolved is not None,
+        "version": _try_version(resolved, "--version") if resolved else None,
+        "path": str(resolved) if resolved else str(local),
+        "install": (
+            "cd <项目>/tools && npm install agent-desktop@1.2.0；再把「启动它的 App」"
+            "（如 iTerm.app）加入 系统设置→隐私与安全性→辅助功能（macOS 27+ 设备控制和数据访问）。"
+            "未授权时默认 engine=auto 会回退 CuaDriver ax 引擎，不阻断签到。"
+        ),
+        "note": f"桌面签到引擎 desktop.engine={desk.get('engine', 'auto')}（可选第二引擎，严格 headless）",
+    }
+
+
 def browser_dep(cfg: dict) -> dict:
     """成长中心不限定浏览器：你用惯用的浏览器从 WorkBuddy 点开「个人中心」即可。"""
     configured = (cfg.get("growth") or {}).get("browser_app", "auto")
@@ -108,7 +140,13 @@ def browser_dep(cfg: dict) -> dict:
 
 
 def collect(cfg: dict) -> list[dict]:
-    return [python_dep(), cua_driver_dep(cfg), browser_dep(cfg)]
+    deps = [python_dep(), cua_driver_dep(cfg), agent_desktop_dep(cfg), browser_dep(cfg)]
+    # 显式指定 engine=agent 时，agent-desktop 变成必需（否则无法签到）
+    if (cfg.get("desktop", {}) or {}).get("engine") == "agent":
+        for d in deps:
+            if d["name"] == "agent-desktop":
+                d["required"] = d["critical"] = True
+    return deps
 
 
 def evaluate(cfg: dict) -> dict:

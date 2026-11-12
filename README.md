@@ -19,6 +19,42 @@
 - 受 `.gitignore` 控制的本地产物**不入库**：`config.toml`（含机器路径）、`tools/node_modules/`、`last-checkin-result.json`、`discovered.json`、`progress.txt`、`*.command`、`*.sqlite3`。
 - 新克隆后：`cp config.example.toml config.toml` 按需改即可，无 npm 安装步骤。
 
+## 桌面签到双引擎（都不与人争抢）
+
+桌面签到默认 **严格 headless 语义点击**——不激活窗口、不移动光标、不抢焦点、不合成物理输入。
+由 `desktop.engine` 选择：
+
+| engine | 实现 | TCC 授权对象 | 说明 |
+|---|---|---|---|
+| `auto`（默认） | 优先 ax，不可用回退 agent | — | 无额外配置，推荐 |
+| `ax` | CuaDriverSigner，`element_token` AX press | `com.trycua.driver`（本机已授权） | 零 npm 依赖 |
+| `agent` | AgentDesktopSigner，agent-desktop ref press | **启动它的 App**（如 iTerm/Terminal） | npm 本地安装，需给该 App 授权 |
+
+**agent-desktop 引擎（第二版）**：`tools/` 下 `npm install agent-desktop@1.2.0`。关键限制——它的
+TCC 权限绑「实际启动它的 App」（macOS 27+ 显示为"设备控制和数据访问"），不是捆绑包本身：
+`agent-desktop permissions` 若 `accessibility=denied`，先 `agent-desktop permissions --guide`
+打开系统设置，把 iTerm.app / Terminal.app 加入并勾选（**这步必须真人点，macOS 不允许脚本自授权**）。
+未授权时 `engine=auto` 自动回退已授权的 ax 引擎，签到不中断。
+
+**绝不抢焦点的实现约束**：agent-desktop 只用 `click @ref` 语义路径，不加 `--headed`、不用
+`--xy` 像素点击；动作失败时**不**降级到 headed（官方红线）。只有 CLI 明确返回
+`error.disposition.retry == 'safe'`（未投递）才重试，其余一律重新 snapshot 读实时状态，
+避免重复点击造成二次提交。
+
+**登录 / 人机验证不硬解**：snapshot 检测到扫码/密码/短信/验证码时，自动**全屏截图**落盘到
+`screenshot_dir`、写状态日志；`login_wait_sec=0`（默认）只截图+报告不阻塞，设为 >0 则轮询等待
+人工登录（超时放弃）。**绝不自动填账号密码、不绕滑块/验证码**（遵循跨项目"人机验证换路不硬解"）。
+可选做法：把 `login_wait_sec` 调大并在旁边手动登录，或改用你已登录的浏览器（成长中心走浏览器窗口，
+无需重新登录）。
+
+```bash
+# 切到 agent-desktop 引擎（需先给启动它的 App 授权辅助功能）
+desktop.engine = "agent"   # 在 config.toml [desktop] 下
+BUDDY_FREE_MODEL=1 ./run.sh checkin-now   # 验证；PERM_DENIED 会安全报错并提示授权，不降级抢焦点
+./run.sh deps check        # 检查 agent-desktop v1.2.0 是否就绪
+# 登录检测截图：~/.local/share/buddy-web-checkin/screenshots/login-*.png
+```
+
 ## 运行时依赖与免费模型约束（重要）
 
 **可作为独立服务执行**：运行时不依赖 WorkBuddy agent、不调用任何模型或在线 API。代码是纯 Python 3.11+ 标准库 + CuaDriver CLI，由 macOS LaunchAgent 直接拉起，不经 WorkBuddy 会话、不消耗模型额度。

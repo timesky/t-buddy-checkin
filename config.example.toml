@@ -6,9 +6,20 @@ state_db = "~/.local/share/buddy-web-checkin/state.sqlite3"
 log_level = "INFO"
 
 [desktop]
-# 桌面端：仅每日签到。唯一后端 CuaDriver（已授权 com.trycua.driver AX 路径，
-# 不移动光标、不抢焦点）
+# 桌面签到引擎：auto(默认,优先已授权的 ax) | ax(CuaDriverSigner) | agent(agent-desktop)
+# 两者都严格 headless 语义点击——不激活窗口、不移动光标、不与人争抢，失败绝不降级到 headed。
+engine = "auto"
+# ax 引擎：CuaDriver 已授权 com.trycua.driver AX 路径，不移动光标、不抢焦点
 cua_driver_bin = "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
+# agent 引擎：agent-desktop@1.2.0（npm 本地安装 tools/node_modules/.bin/agent-desktop）。
+# 注意 TCC 授权绑「实际启动它的 App」（如 iTerm/Terminal），需先把该 App 加入
+# 系统设置→隐私与安全性→辅助功能；未授权会 PERM_DENIED，此时自动回退 ax 或手动切 engine=ax。
+agent_desktop_bin = "node_modules/.bin/agent-desktop"
+agent_desktop_session = "buddy-checkin"
+# 检测到登录/验证码：0=只自动截图+报告不阻塞；>0=等待人工登录的秒数。
+# 绝不自动填账号密码、不绕人机验证（换路不硬解）；可选拉起有头浏览器由用户自己登录。
+login_wait_sec = 0
+screenshot_dir = "~/.local/share/buddy-web-checkin/screenshots"
 app = "WorkBuddy"
 # 面板收起时用于展开的入口按钮；不同客户端版本文案可能不同
 station_entry_labels = ["Buddy加油站", "做任务赢积分"]

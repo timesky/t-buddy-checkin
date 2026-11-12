@@ -21,6 +21,15 @@ DEFAULTS: dict[str, Any] = {
     "desktop": {
         "cua_driver_bin": "/Applications/CuaDriver.app/Contents/MacOS/cua-driver",
         "app": "WorkBuddy",
+        # 桌面签到引擎：auto(默认,优先已授权的 ax) | ax(CuaDriverSigner) | agent(agent-desktop)
+        # 两者都是严格 headless 语义点击，不激活窗口、不移动光标、不与人工争抢
+        "engine": "auto",
+        # agent-desktop 引擎（严格 headless，失败绝不降级 headed）
+        "agent_desktop_bin": "node_modules/.bin/agent-desktop",  # 相对项目 tools/ 或 PATH
+        "agent_desktop_session": "buddy-checkin",
+        # 检测到登录/验证码：0=只截图+报告不阻塞；>0=等待人工登录的秒数
+        "login_wait_sec": 0,
+        "screenshot_dir": "~/.local/share/buddy-web-checkin/screenshots",
         # 面板收起时用于展开的入口按钮；不同客户端版本文案可能不同
         "station_entry_labels": ["Buddy加油站", "做任务赢积分"],
         # 点击后出现的「今天已领」文案，作为已签到的强证据（只在面板区内认）

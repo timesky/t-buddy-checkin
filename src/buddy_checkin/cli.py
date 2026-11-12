@@ -59,12 +59,38 @@ def cmd_model_check(cfg: dict, args: argparse.Namespace) -> int:
 
 
 def build(cfg: dict):
-    """构造唯一后端组合：CuaDriverSigner（签到）+ GrowthCenter（礼物/派遣/兑换）。"""
+    """构造后端组合：桌面签到引擎（ax / agent-desktop）+ GrowthCenter（礼物/派遣/兑换）。
+
+    两个桌面引擎都保持「静默、不抢焦点/光标」：
+      - ax    : CuaDriverSigner，走 element_token AX press（默认，已授权 com.trycua.driver）
+      - agent : AgentDesktopSigner，走 agent-desktop 的 ref 语义 press（严格 headless）
+    auto 优先 ax（已授权、零额外配置），ax 不可用时回退 agent-desktop。
+    """
     state = State(config.state_db_path(cfg))
-    desktop = CuaDriverSigner(cfg)
+    engine = (cfg.get("desktop", {}) or {}).get("engine", "auto")
+    desktop = _build_desktop(cfg, engine)
     growth = GrowthCenter(cfg, state=state) if cfg.get("growth", {}).get("enabled") else None
     actions = Actions(cfg, state, desktop, growth=growth)
     return state, desktop, actions
+
+
+def _build_desktop(cfg: dict, engine: str):
+    """按 engine 选桌面签到适配器；auto 先 ax 再 agent-desktop。"""
+    from .adapters.desktop_agent import AgentDesktopSigner
+
+    if engine == "agent":
+        return AgentDesktopSigner(cfg)
+    if engine == "ax":
+        return CuaDriverSigner(cfg)
+    # auto：优先已授权的 CuaDriver AX；不可执行时用 agent-desktop
+    ax = CuaDriverSigner(cfg)
+    try:
+        probe = ax.probe()
+        if probe.ok or "main window not found" in probe.detail:
+            return ax
+    except Exception:
+        pass
+    return AgentDesktopSigner(cfg)
 
 
 def _json(result) -> int:

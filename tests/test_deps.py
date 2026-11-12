@@ -38,10 +38,26 @@ class DepsTests(unittest.TestCase):
         self.assertIn("ok", report)
         self.assertIn("dependencies", report)
         names = [d["name"] for d in report["dependencies"]]
-        # 唯一外部工具是 CuaDriver；agent-browser / agent-desktop 均已移除
-        self.assertEqual(names, ["Python", "CuaDriver", "浏览器（任意已装）"])
+        # CuaDriver 是默认必需；agent-desktop 是可选第二引擎（engine=agent 时才必需）
+        self.assertEqual(names, ["Python", "CuaDriver", "agent-desktop", "浏览器（任意已装）"])
         self.assertNotIn("agent-browser", " ".join(names))
-        self.assertNotIn("agent-desktop", " ".join(names))
+        ad = next(d for d in report["dependencies"] if d["name"] == "agent-desktop")
+        self.assertFalse(ad["required"])  # auto/ax 模式下可选，不阻断
+        self.assertFalse(ad["critical"])
+
+    def test_agent_desktop_becomes_required_when_engine_agent(self):
+        """显式 engine=agent 时 agent-desktop 变必需；缺失则整体 not ok。"""
+        from unittest.mock import patch
+
+        cfg = {"desktop": {"engine": "agent", "agent_desktop_bin": "/nonexistent/ad"},
+               "growth": {"enabled": True,
+                          "cua_driver_bin": "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"}}
+        with patch.object(deps, "_which", return_value=None):
+            report = deps.evaluate(cfg)
+        ad = next(d for d in report["dependencies"] if d["name"] == "agent-desktop")
+        self.assertTrue(ad["required"])
+        self.assertFalse(ad["present"])
+        self.assertIn("agent-desktop", report["required_missing"])
 
     def test_cua_driver_is_the_only_required_external(self):
         """CuaDriver 是唯一必需外部工具：缺它则整体 not ok。"""

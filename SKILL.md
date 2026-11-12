@@ -72,6 +72,26 @@ description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、�
 兑换保守：`兑换奖励` 只点弹窗里已解锁的档位（未解锁则关闭跳过），`抽奖(N)` 仅 N>0，
 `开启盲盒 a/b` 仅能量满；补登卡和日期按钮永不自动消耗。
 
+## 桌面签到双引擎（严格 headless，不与人争抢）
+
+`desktop.engine` 三选一，两者都**不激活窗口、不移动光标、不抢焦点、不合成物理输入**：
+- `auto`（默认）：优先已授权的 CuaDriver ax，不可用回退 agent-desktop。
+- `ax`：CuaDriverSigner（`element_token` AX press，授权对象 `com.trycua.driver`）。
+- `agent`：AgentDesktopSigner（agent-desktop 1.2.0 的 `click @ref` 语义 press，npm 本地装于 `tools/`）。
+
+**agent-desktop 授权**：TCC 绑「实际启动它的 App」（iTerm/Terminal），非捆绑包本身。`permissions`
+显示 `accessibility=denied` 时跑 `agent-desktop permissions --guide` 打开系统设置，把启动它的 App
+加入辅助功能/设备控制和数据访问（**必须真人点，脚本不能自授权**）。未授权时 auto 自动回退 ax，
+签到不中断；显式 `engine=agent` 遇 `PERM_DENIED` 安全报错并提示，绝不降级 headed 抢焦点。
+注意：本技能作为 LaunchAgent 独立服务运行时由 launchd 拉起、不经过 agent 会话沙箱；若在某宿主
+里直接调 `permissions` 得到 denied，那是宿主进程身份（auth=0）所致，不代表服务运行时状态。
+
+**不抢焦点硬约束**：agent-desktop 只用 `click @ref`，不加 `--headed`、不用 `--xy`；失败只按
+`disposition.retry=='safe'`（未投递）重试，其余重新 snapshot 读实时状态，避免重复提交二次奖励。
+
+**登录/验证码不硬解**：检测到扫码/密码/短信/验证码 → 自动全屏截图落 `desktop.screenshot_dir`
++ 日志；`login_wait_sec=0` 只截图报告不阻塞，>0 轮询等人工登录。绝不自动填账号/绕验证码。
+
 ## 执行约束
 
 - **不激活窗口、不移动物理鼠标、不接管用户日常浏览器**：所有点击优先用 `element_token`（无则 `element_index`）走 AX press，并校验返回 `path == "ax"`；任何会移动光标的像素路径一律拒绝。成长中心只操作用户自己打开的浏览器窗口。

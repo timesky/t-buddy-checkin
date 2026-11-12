@@ -2,5 +2,8 @@
   "name": "buddy-web-checkin-tools",
   "version": "1.0.0",
   "private": true,
-  "description": "占位：本技能无 npm 依赖，唯一外部工具是 CuaDriver（GUI 应用）。保留此文件仅为未来可能的工具链预留。"
+  "description": "agent-desktop 桌面签到引擎（严格 headless，不抢焦点/光标）；ax 引擎由 CuaDriver.app 提供，无 npm 依赖。",
+  "dependencies": {
+    "agent-desktop": "^1.2.0"
+  }
 }
