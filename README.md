@@ -108,6 +108,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.workbuddy-cdp-
 - **不自动消耗补签卡**、不点「去完成」类任务、不自动登录、不填账号密码、不绕验证码
 - 不改客户端登录态，不读取/解密任何 token；日志与 `discovered.json` 走敏感键脱敏
 - CDP 不可达时明确报错并给出修复命令，不静默降级到其它通道
+- 任务结束后关闭自己打开的成长中心弹窗；用户手动打开的页面不动（`[growth].close_page_after_action`，默认 true）
 
 ## 故障排查
 

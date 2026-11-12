@@ -87,6 +87,9 @@ DEFAULTS: dict[str, Any] = {
         "scene": "",              # 留空用页面默认场景
         "claim_offset_sec": 3,    # 倒计时归零后再等 3 秒，避免服务端未结算
         "auto_exchange": True,    # 自动兑换连登奖励/抽奖/满能量盲盒；补登卡永不自动消耗
+        # 任务结束（领取/派遣/兑换/签到校验）后关闭成长中心弹窗。
+        # 只关「本次由工具打开」的弹窗；用户自己开着的页面保持不动，不抢界面。
+        "close_page_after_action": True,
     },
     "notify": {"webhook": "", "macos": False},
     "log_level": "INFO",

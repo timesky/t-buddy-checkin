@@ -58,6 +58,8 @@ open_wait_sec = 6
 scene = ""              # 可填 咖啡馆 / 商场店铺 / 健身房 / 古镇客栈；留空用默认
 claim_offset_sec = 3
 auto_exchange = true    # 补登卡等有限资源不会自动消耗
+# 任务结束后关闭成长中心弹窗；只关本次工具自己打开的，用户开着的不动
+close_page_after_action = true
 
 [travel]
 enabled = true

@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import functools
 import json
 import re
 import shutil
@@ -52,6 +53,28 @@ def _norm(t: str) -> str:
     return re.sub(r"\s+", " ", t or "").strip()
 
 
+def _auto_close(method: Callable) -> Callable:
+    """任务级收尾：最外层方法结束后关掉本次自己打开的弹窗。
+
+    嵌套调用（tick → claim_gift/dispatch）只在最外层收一次，不会中途把关掉的
+    页面又打开一遍。用户在页面里自己操作时（页面本来就开着）只收内部弹层。
+    """
+    @functools.wraps(method)
+    def wrapper(self: "GrowthBrowser", *args: Any, **kwargs: Any) -> Any:
+        depth = getattr(self, "_depth", 0)
+        self._depth = depth + 1
+        if depth == 0:
+            self._opened_this_run = False
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._depth = depth
+            if depth == 0:
+                self._wrap_up_session()
+
+    return wrapper
+
+
 class GrowthBrowser:
     """用 CDP 操作成长中心：读状态、领礼物、兑换、派遣。"""
 
@@ -67,6 +90,9 @@ class GrowthBrowser:
         self.node_bin = self._resolve_node()
         self.cdp_js = ROOT / "tools" / "cdp_client.mjs"
         self.block: tuple[str, str] | None = None
+        self.last_close_ok: bool = False
+        self._depth: int = 0
+        self._opened_this_run: bool = False
 
     # ---- 依赖定位 -----------------------------------------------------------
     @staticmethod
@@ -164,12 +190,22 @@ class GrowthBrowser:
             return 124, "agent-browser timeout"
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
-    def _ensure_connected(self) -> bool:
-        code, out = self._ab("tab", timeout=30)
-        if code == 0 and "t1" in out:
-            return True
-        code, out = self._ab("connect", str(self.port), timeout=60)
-        return code == 0
+    def _ensure_connected(self, attempts: int = 2) -> bool:
+        """复用已有 tab，必要时重新 connect。
+
+        2026-11-12 实测：会话被其它 agent-browser 进程抢占时 `tab` 会瞬时失败，
+        重试一次即可恢复，不必把整轮任务判成失败。
+        """
+        for i in range(attempts):
+            code, out = self._ab("tab", timeout=30)
+            if code == 0 and "t1" in out:
+                return True
+            code, _ = self._ab("connect", str(self.port), timeout=60)
+            if code == 0:
+                return True
+            if i + 1 < attempts:
+                time.sleep(1.5)
+        return False
 
     def _click_label(self, label: str, attempts: int = 3) -> tuple[bool, str]:
         """在聚合快照里按按钮文案找 ref 并点击（可跨 webContents）。
@@ -249,6 +285,8 @@ class GrowthBrowser:
             for _ in range(int(self.wait_sec * 2)):
                 if self._iframe_ws():
                     ready = self._wait_page_ready()
+                    # 本次亲手打开的页面，任务结束后要关掉（不把弹窗留给用户）
+                    self._opened_this_run = True
                     return ActionResult(
                         True, "growth_open", f"opened via {label}",
                         {"opened": True, "entry": label, "ready": ready},
@@ -373,7 +411,44 @@ class GrowthBrowser:
             return True
         return False
 
+    # ---- 收尾（关闭本次打开的弹窗） -----------------------------------------
+    def close_page(self, attempts: int = 2) -> bool:
+        """关闭成长中心整个弹窗，返回是否已关闭。
+
+        只在「本次由工具打开」时由 _wrap_up 调用：用户自己开着的页面不碰，
+        避免和人抢界面。点弹层「关闭」为主，按 ESC 兜底。
+        """
+        for _ in range(attempts):
+            if not self._iframe_ws():
+                self.last_close_ok = True
+                return True
+            self._close_dialog()                      # 先收内部弹层，避免遮挡关闭按钮
+            if not self._iframe_ws():
+                self.last_close_ok = True
+                return True
+            ok, _ = self._click_text("关闭")
+            if not ok:
+                self._ab("press", "Escape", timeout=30)
+            time.sleep(0.6)
+        closed = not self._iframe_ws()
+        self.last_close_ok = closed
+        return closed
+
+    def _wrap_up_session(self) -> None:
+        """任务收尾：内部弹层一律收掉；整个弹窗只在本次自己打开时关闭。"""
+        try:
+            self._close_dialog()
+        except Exception:
+            pass
+        if not getattr(self, "_opened_this_run", False):
+            self.last_close_ok = False
+            return
+        if not bool((self.cfg.get("growth", {}) or {}).get("close_page_after_action", True)):
+            return
+        self.close_page()
+
     # ---- 业务动作 -----------------------------------------------------------
+    @_auto_close
     def claim_gift(self) -> ActionResult:
         opened = self.ensure_page()
         if not opened.ok:
@@ -433,6 +508,7 @@ class GrowthBrowser:
                 found.append((label, "blindbox"))
         return found
 
+    @_auto_close
     def claim_exchanges(self, claimed_before: Callable[[str], bool] | None = None) -> list[ActionResult]:
         opened = self.ensure_page()
         if not opened.ok:
@@ -505,6 +581,7 @@ class GrowthBrowser:
         self._close_dialog()
         return results
 
+    @_auto_close
     def dispatch(self) -> ActionResult:
         opened = self.ensure_page()
         if not opened.ok:
@@ -566,6 +643,7 @@ class GrowthBrowser:
             {"remaining_sec": info["remaining_sec"], "due_at": due,
              "scene": self.scene or "default"})
 
+    @_auto_close
     def tick(self, force: bool = False) -> ActionResult:
         """一轮：旅行中→记录真实到期；可领→领奖并再派遣；空闲→派遣。"""
         opened = self.ensure_page()
@@ -608,6 +686,7 @@ class GrowthBrowser:
         return ActionResult(False, "travel", f"unknown growth-center state: {state}", info)
 
     # ---- 签到（状态校验） ---------------------------------------------------
+    @_auto_close
     def checkin(self) -> ActionResult:
         """签到 = 活跃地图今日是否已有记录；不再点击任何按钮。"""
         opened = self.ensure_page()
