@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -47,10 +48,53 @@ DISPATCH_EXHAUSTED_MARKERS = (
 )
 # 弹层关闭按钮（精确匹配，避免误点资源类按钮）
 DIALOG_CLOSE_LABELS = ("关闭", "×", "✕", "X", "我知道了", "知道了", "好的", "收到")
+# 内部子页的「返回」：5.11.2 的兑换子页（.gs-embed-subpage）右上角是有 SVG 的
+# <button class="gs-embed-back" aria-label="返回">，textContent 为空，按文案点不到。
+# 实测结构（2026-11-12）：
+#   主页面 subpage=0 back=0 close=1     <- close 是「关闭整个成长中心」
+#   兑换子页 subpage=1 back=1 close=2   <- 多出来的 back 才是「回到上一层」
+# 所以收内部弹层只许点 back；点 close 会把整个成长中心一起关掉（会打断同一轮
+# 后续的派遣，表现为 state=unknown）。
+DIALOG_BACK_SELECTORS = (".gs-embed-back", '[aria-label="返回"]')
+# 整个成长中心弹窗的关闭按钮（只在 close_page 里用）
+PAGE_CLOSE_SELECTORS = (".gs-embed-close", 'button[aria-label="关闭"]', 'button[title="关闭"]')
+
+# 兑换弹层里**不是**里程碑奖励的文案。2026-11-12 实测：弹层打开与否，主面板
+# 常驻按钮（领取礼物 / 抽奖 / 盲盒 / 派猫猫旅行）都留在 DOM 且 enabled，
+# 只按「含 领取|兑换」筛选会把「领取礼物」当成奖励点掉（误触发旅行领奖）。
+EXCHANGE_NOT_REWARD = (
+    "礼物", "抽奖", "盲盒", "派猫猫", "旅行", "兑换奖励",
+    "关闭", "取消", "补签",
+    "还差", "未解锁", "已领取", "已兑换", "已兑完", "本月已兑", "本月已领",
+    "已达上限", "兑换完毕", "暂不可兑",
+)
 
 
 def _norm(t: str) -> str:
     return re.sub(r"\s+", " ", t or "").strip()
+
+
+def is_exchange_reward(label: str) -> bool:
+    """按钮文案是否「兑换弹层里的里程碑奖励项」。
+
+    2026-11-12 实测弹层（5.11.2）：里程碑奖励按钮文案就是**纯两字「兑换」**，
+    已兑过的是 disabled + 文案「已兑换」；主面板的「领取礼物」在弹层打开时
+    仍留在 DOM 且 enabled。因此：
+
+      「兑换」        -> True   （真奖励项，别漏）
+      「已兑换」      -> False  （已领完，且 disabled）
+      「领取礼物」    -> False  （旅行线资源，误点会打乱 travel 时间线）
+
+    保守原则：宁可漏点（返回 False，本轮 skipped），绝不误点面板按钮。
+    """
+    t = _norm(label)
+    if not t or t in ("领取", "兑换奖励"):
+        return False
+    if any(k in t for k in EXCHANGE_NOT_REWARD):
+        return False
+    if t == "兑换":
+        return True
+    return any(k in t for k in ("领取", "兑换"))
 
 
 def _auto_close(method: Callable) -> Callable:
@@ -91,6 +135,7 @@ class GrowthBrowser:
         self.cdp_js = ROOT / "tools" / "cdp_client.mjs"
         self.block: tuple[str, str] | None = None
         self.last_close_ok: bool = False
+        self._owner_ok: bool = False
         self._depth: int = 0
         self._opened_this_run: bool = False
 
@@ -127,13 +172,62 @@ class GrowthBrowser:
         with urllib.request.urlopen(url, timeout=3) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
 
+    def _version(self) -> dict:
+        try:
+            data = self._http("/json/version")
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def port_owner(self, targets: list[dict] | None = None) -> tuple[bool, str]:
+        """判定 cdp_port 上跑的是不是 WorkBuddy 客户端。
+
+        9222 是 Chrome 的默认调试端口，被别的浏览器/Electron 应用占用时，
+        旧实现会当成「CDP 可达」，随后把 agent-browser 连到错误的浏览器上，
+        报错只剩一句 "iframe never appeared"（2026-11-12 用假 CDP 复现）。
+        返回 (是否 WorkBuddy, 归属描述)。
+        """
+        ver = self._version()
+        ua = str(ver.get("User-Agent") or "")
+        low = ua.lower()
+        if "workbuddy" in low:
+            return True, f"WorkBuddy ({ua[:60]})"
+        for t in targets or []:
+            blob = f"{t.get('url') or ''} {t.get('title') or ''}".strip()
+            if "workbuddy" in blob.lower():
+                return True, f"WorkBuddy ({ua[:60] or blob[:60]})"
+        if not ua:
+            # 拿不到 UA（极老版本/响应异常）时不新增拦截，保持原有行为
+            return True, "unknown (no /json/version user-agent)"
+        browser = str(ver.get("Browser") or "unknown browser")
+        if "electron" not in low:
+            return False, f"{browser}, not Electron ({ua[:70]})"
+        return False, f"other Electron app ({ua[:70]})"
+
     def targets(self) -> list[dict]:
         try:
             data = self._http("/json/list")
-            return data if isinstance(data, list) else []
         except Exception as exc:
             self.block = ("cdp_unavailable", f"CDP {self.port} unreachable: {exc}")
             return []
+        lst = data if isinstance(data, list) else []
+        if not lst:
+            # 端口活着但暂无 target（客户端刚启动/窗口未建），不算错误
+            if self.block and self.block[0] == "cdp_unavailable":
+                self.block = None
+            return lst
+        if not self._owner_ok:
+            owned, who = self.port_owner(lst)
+            if not owned:
+                self.block = (
+                    "cdp_port_foreign",
+                    f"port {self.port} is not WorkBuddy: {who}; "
+                    f"确认 [growth].cdp_port 与 WORKBUDDY_REMOTE_DEBUGGING_PORT 一致，"
+                    f"或换一个没被浏览器占用的端口",
+                )
+                return []
+            self._owner_ok = True
+        return lst
 
     def available(self) -> bool:
         return bool(self.targets())
@@ -179,12 +273,32 @@ class GrowthBrowser:
         return True, val
 
     # ---- agent-browser（打开页面） -----------------------------------------
+    def _ab_env(self) -> dict[str, str]:
+        """给 agent-browser 补 PATH。
+
+        2026-11-12 实测：tools/node_modules/.bin/agent-browser 的 shebang 是
+        ``#!/usr/bin/env node``。launchd 启动 daemon 时 PATH 只有
+        /usr/bin:/bin:/usr/sbin:/sbin，找不到 node，每轮都报
+        ``agent-browser connect failed``（手动 shell 里却有 node，所以之前没暴露）。
+        """
+        env = dict(os.environ)
+        path = env.get("PATH") or "/usr/bin:/bin:/usr/sbin:/sbin"
+        extra: list[str] = []
+        if self.node_bin:
+            extra.append(str(Path(self.node_bin).parent))
+        for p in ("/opt/homebrew/bin", "/usr/local/bin"):
+            if p not in path and p not in extra:
+                extra.append(p)
+        env["PATH"] = ":".join([p for p in extra if p] + [path])
+        return env
+
     def _ab(self, *args: str, timeout: int = 60) -> tuple[int, str]:
         if not self.ab_bin:
             return 127, "agent-browser not found"
         try:
             proc = subprocess.run(
                 [self.ab_bin, *args], capture_output=True, text=True, timeout=timeout,
+                env=self._ab_env(),
             )
         except subprocess.TimeoutExpired:
             return 124, "agent-browser timeout"
@@ -264,7 +378,8 @@ class GrowthBrowser:
             return ActionResult(True, "growth_open", "page already open",
                                 {"opened": False, "ready": ready})
         if not self.available():
-            return ActionResult(False, "growth_open", (self.block or ("cdp_unavailable", ""))[1])
+            code, msg = self.block or ("cdp_unavailable", "")
+            return ActionResult(False, "growth_open", msg, {"blocked": code})
 
         if not self._ensure_connected():
             return ActionResult(False, "growth_open", "agent-browser connect failed")
@@ -305,7 +420,8 @@ class GrowthBrowser:
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
   const btns = [...document.querySelectorAll('button')].map(b => ({
     t: norm(b.textContent), dis: !!b.disabled,
-    cls: String(b.className || ''), eid: b.getAttribute('dt-eid') || ''
+    cls: String(b.className || ''), eid: b.getAttribute('dt-eid') || '',
+    aria: b.getAttribute('aria-label') || b.getAttribute('title') || ''
   }));
   const body = norm(document.body.innerText);
   const cd = btns.find(b => /旅行倒计时/.test(b.t)) || null;
@@ -402,10 +518,37 @@ class GrowthBrowser:
     def _click_text(self, text: str) -> tuple[bool, str]:
         return self._click_by_expr(f"t === {json.dumps(text, ensure_ascii=False)}")
 
+    def _click_selectors(self, selectors: tuple[str, ...]) -> tuple[bool, str]:
+        """按 CSS 选择器点击第一个可用的（用于无文案的图标按钮）。"""
+        js = (
+            "(() => {"
+            f"  const sels = {json.dumps(list(selectors))};"
+            "  for (const s of sels) {"
+            "    const el = document.querySelector(s);"
+            "    if (el && !el.disabled) { el.click(); return JSON.stringify({ok:true, sel:s}); }"
+            "  }"
+            "  return JSON.stringify({ok:false, reason:'no_selector_hit'});"
+            "})()"
+        )
+        ok, val = self._eval(js)
+        if not ok:
+            return False, str(val)
+        info = val if isinstance(val, dict) else {}
+        if info.get("ok"):
+            return True, str(info.get("sel", ""))
+        return False, str(info.get("reason", "no_selector_hit"))
+
     def _close_dialog(self) -> bool:
+        """收掉内部子页/弹层，回到成长中心主页面。
+
+        只点「返回」（有文案的关闭按钮也兼容）；**绝不点整页的关闭图标**，
+        否则会把成长中心整个关掉，打断同一轮后续动作。
+        """
         labels = ", ".join(json.dumps(x, ensure_ascii=False) for x in DIALOG_CLOSE_LABELS)
         expr = f"[{labels}].includes(t)"
         ok, _ = self._click_by_expr(expr)
+        if not ok:
+            ok, _ = self._click_selectors(DIALOG_BACK_SELECTORS)
         if ok:
             time.sleep(0.4)
             return True
@@ -416,17 +559,20 @@ class GrowthBrowser:
         """关闭成长中心整个弹窗，返回是否已关闭。
 
         只在「本次由工具打开」时由 _wrap_up 调用：用户自己开着的页面不碰，
-        避免和人抢界面。点弹层「关闭」为主，按 ESC 兜底。
+        避免和人抢界面。先用「返回」退回主页面，再点整页关闭图标；
+        都失败才按 ESC 兜底（ESC 是真实按键，会抢焦点，所以放最后）。
         """
         for _ in range(attempts):
             if not self._iframe_ws():
                 self.last_close_ok = True
                 return True
-            self._close_dialog()                      # 先收内部弹层，避免遮挡关闭按钮
+            self._close_dialog()                      # 先退出子页，避免遮挡关闭按钮
             if not self._iframe_ws():
                 self.last_close_ok = True
                 return True
-            ok, _ = self._click_text("关闭")
+            ok, _ = self._click_selectors(PAGE_CLOSE_SELECTORS)
+            if not ok:
+                ok, _ = self._click_text("关闭")
             if not ok:
                 self._ab("press", "Escape", timeout=30)
             time.sleep(0.6)
@@ -543,11 +689,9 @@ class GrowthBrowser:
                 unlocked = [
                     _norm(b.get("t", "")) for b in after.get("buttons", [])
                     if not b.get("dis")
-                    and any(k in _norm(b.get("t", "")) for k in ("领取", "兑换"))
-                    and not any(k in _norm(b.get("t", "")) for k in
-                                ("还差", "未解锁", "已领取", "兑换奖励",
-                                 "已兑换", "已兑完", "本月已兑", "本月已领",
-                                 "已达上限", "兑换完毕", "暂不可兑"))
+                    and is_exchange_reward(b.get("t", ""))
+                    and "还差" not in str(b.get("aria") or "")
+                    and "已兑换" not in str(b.get("aria") or "")
                 ]
                 if not unlocked:
                     self._close_dialog()

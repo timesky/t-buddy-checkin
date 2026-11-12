@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -32,10 +33,36 @@ def _which(name: str) -> Path | None:
     return Path(p) if p else None
 
 
+def _bin_env() -> dict[str, str]:
+    """补 PATH 再跑子进程。
+
+    agent-browser 的 shebang 是 ``#!/usr/bin/env node``，launchd 启动时 PATH 只有
+    /usr/bin:/bin:/usr/sbin:/sbin，会报 "env: node: No such file or directory"，
+    导致 deps 把已安装的 agent-browser 显示成缺失（2026-11-12 实测）。
+    """
+    env = dict(os.environ)
+    path = env.get("PATH") or "/usr/bin:/bin:/usr/sbin:/sbin"
+    extra: list[str] = []
+    try:
+        from .adapters.growth_browser import GrowthBrowser
+
+        node = GrowthBrowser._resolve_node()
+        if node:
+            extra.append(str(Path(node).parent))
+    except Exception:
+        pass
+    for p in ("/opt/homebrew/bin", "/usr/local/bin"):
+        if p not in path and p not in extra:
+            extra.append(p)
+    env["PATH"] = ":".join([p for p in extra if p] + [path])
+    return env
+
+
 def _try_version(bin_path: Path | str, *args: str, timeout: int = 8) -> str | None:
     try:
         proc = subprocess.run(
-            [str(bin_path), *args], capture_output=True, text=True, timeout=timeout
+            [str(bin_path), *args], capture_output=True, text=True, timeout=timeout,
+            env=_bin_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -105,6 +132,11 @@ def cdp_dep(cfg: dict) -> dict:
     port = int((cfg.get("growth", {}) or {}).get("cdp_port", 9222))
     gb = GrowthBrowser(cfg)
     alive = gb.available()
+    blocked = gb.block[0] if gb.block else None
+    note = "客户端暴露的 DevTools 端口；未开启时无法读取成长中心页面"
+    if blocked == "cdp_port_foreign":
+        note = (f"该端口被其它浏览器占用（{gb.block[1]}）；"
+                "换一个空闲端口或确认 WORKBUDDY_REMOTE_DEBUGGING_PORT")
     return {
         "name": "WorkBuddy CDP",
         "kind": "runtime-port",
@@ -117,7 +149,7 @@ def cdp_dep(cfg: dict) -> dict:
             f"launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT {port} && "
             "重启 WorkBuddy 客户端（或直接跑 scripts/launch-workbuddy-debug.sh）"
         ),
-        "note": "客户端暴露的 DevTools 端口；未开启时无法读取成长中心页面",
+        "note": note,
     }
 
 

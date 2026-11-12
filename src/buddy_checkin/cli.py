@@ -192,10 +192,18 @@ def cmd_inspect(cfg: dict, args: argparse.Namespace) -> int:
     print(f"  cdp_client.mjs  : {gb.cdp_js} {'OK' if gb.cdp_js.exists() else 'MISSING'}")
     targets = gb.targets()
     print(f"  targets         : {len(targets)} 个")
+    if targets:
+        owned, who = gb.port_owner(targets)
+        print(f"  端口归属        : {'WorkBuddy ✓' if owned else '不是 WorkBuddy ✗'}  {who}")
     for t in targets:
         print(f"    [{t.get('type'):<8}] {(t.get('title') or '')[:34]:<36} {(t.get('url') or '')[:60]}")
     if not targets:
-        print(f"  ✗ CDP 不可达：{gb.block[1] if gb.block else 'unknown'}")
+        code, msg = gb.block or ("cdp_unavailable", "unknown")
+        print(f"  ✗ CDP 不可达（{code}）：{msg}")
+        if code == "cdp_port_foreign":
+            print("    该端口被其它浏览器/Electron 应用占用，换成 WorkBuddy 的调试端口再试：")
+            print(f"    launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT {port} 并重启客户端")
+            return 1
         print("    修复：launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT "
               f"{port} && 重启 WorkBuddy 客户端")
         return 1
