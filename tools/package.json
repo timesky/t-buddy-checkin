@@ -4,6 +4,7 @@
   "private": true,
   "description": "agent-desktop 桌面签到引擎（严格 headless，不抢焦点/光标）；ax 引擎由 CuaDriver.app 提供，无 npm 依赖。",
   "dependencies": {
+    "agent-browser": "^0.42.0",
     "agent-desktop": "^1.2.0"
   }
 }

@@ -1,11 +1,14 @@
 """业务编排：签到 -> 礼物兑换 -> 派遣 -> 精确到期领礼物 -> 再次派遣。
 
-所有领取都经 State.claim_once 幂等。两条通道都走 **CuaDriver**（trycua AX 驱动）：
-  - 每日签到    : 桌面端 CuaDriverSigner 操作 WorkBuddy 客户端窗口
-  - 礼物/派遣/兑换 : 成长中心 GrowthCenter 操作已登录的个人中心浏览器窗口
+所有领取都经 State.claim_once 幂等。**全部走 CDP（agent-browser + 客户端调试端口）**：
 
-不依赖任何 headless 浏览器 CLI（agent-browser 等已移除）；浏览器由用户从 WorkBuddy
-点开，未登录时只提示登录、绝不自动登录。
+  - 每日签到      : 读成长中心「11月活跃地图」，今天有记录即已签到（5.11.2 起
+                    官方取消签到按钮，签到 = 每日一次活跃/对话记录）
+  - 礼物/派遣/兑换  : GrowthBrowser 直连成长中心 iframe，DOM 级 click
+
+旧的 CuaDriver / AX 通道（desktop.CuaDriverSigner、growth.GrowthCenter）
+已不再被 build() 装配，配置文件里的 ax 相关键仅作历史兼容。
+不自动登录、不消耗补签卡、不做「去完成」类任务。
 """
 from __future__ import annotations
 
@@ -25,44 +28,37 @@ class Actions:
         self.cfg = cfg
         self.state = state
         self.desktop = desktop
-        # growth 不为空时，礼物/派遣走 CuaDriver 的成长中心 AX 通道
+        # growth 为 GrowthBrowser（CDP）：签到状态校验 + 礼物/派遣/兑换
         self.growth = growth
 
-    # ---- 1. 每日签到（唯一依赖桌面客户端） ---------------------------------
+    # ---- 1. 每日签到（读活跃地图状态，不再点按钮） --------------------------
     def daily_checkin(self) -> ActionResult:
-        """签到时间线的一轮：只做签到，不碰成长中心。
+        """签到时间线的一轮：读成长中心活跃地图，今天有记录即已签到。
 
-        返回 data.confirmed：True 才允许当天禁用轮询。
-        只有「本轮点击并验证按钮消失」或「面板展开后确认无领取按钮」才算确认；
-        仅凭按钮不存在推测、或对话正文里的『明日再来』都不得落库。
+        5.11.2 起客户端已无「Buddy加油站 / 立即签到」按钮，签到语义改为
+        「每天在活跃地图留下一条记录（完成一次对话）」。因此本方法只做状态
+        校验，不再点击任何按钮：
 
-        满 24 小时口径（2026-11-12 用户要求）：即使跨了北京时间 0 点，若距
-        上次真实签到不足 min_interval_sec（默认 24h），仍不认定已签，继续轮询，
-        避免凌晨因活动尚未刷新而把旧状态当作新一天的签到。
+          - 今天已打卡   -> ok=True, confirmed=True，落库 last_checkin_day
+          - 今天未打卡   -> ok=False，detail 明确提示需要一次对话，不落库
+          - CDP 不可达   -> ok=False，detail 给出发送端修复指引
+
+        只有 confirmed 才允许当天禁用轮询，避免把「读不到」当成「已签到」。
         """
         if not self.cfg["daily_checkin"]["enabled"]:
             return ActionResult(True, "checkin", "disabled", {"confirmed": True})
-        cfg = self.cfg.get("daily_checkin", {})
-        min_interval = float(cfg.get("min_interval_sec", 24 * 3600))
-        last_at = self.state.kv_get_float("last_checkin_at")
-        now = time.time()
-        if last_at is not None and 0 <= now - last_at < min_interval:
-            left = int(min_interval - (now - last_at))
-            return ActionResult(
-                True, "checkin",
-                f"last real checkin < {int(min_interval/3600)}h ago; wait {left}s",
-                {"confirmed": True, "waiting_cooldown": True, "last_checkin_at": last_at},
-            )
         if self.state.kv_get("last_checkin_day") == day_key():
             return ActionResult(True, "checkin", "already checked in today",
                                 {"confirmed": True})
-        result = self.desktop.claim_daily(self.cfg["dom_fallback"]["checkin"])
-        # 只有「确认」才落库：面板收起导致按钮找不到、或对话正文干扰，
-        # 都绝不写 last_checkin_day / last_checkin_at，否则整天不再补签。
+        if self.growth is None:
+            return ActionResult(False, "checkin",
+                                "growth channel not configured (set [growth].enabled=true)",
+                                {"confirmed": False})
+        result = self.growth.checkin()
         if result.ok and result.data.get("confirmed"):
             self.state.claim_once("checkin", "daily")
             self.state.kv_set("last_checkin_day", day_key())
-            self.state.kv_set("last_checkin_at", now)
+            self.state.kv_set("last_checkin_at", time.time())
         self.state.log("checkin", result.ok, result.detail)
         return result
 

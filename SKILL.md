@@ -1,124 +1,98 @@
 ---
 name: buddy-web-checkin
-description: 独立运行 WorkBuddy 每日签到、签到礼物自动兑换、派猫猫旅行自动派遣，并在旅行精确到期时领取礼物后立刻再次派遣。仅签到依赖桌面客户端，其余走已登录浏览器里的成长中心页面；全程后台隔离，不干扰人工操作。触发词：帮我签到、领今日礼包、自动签到、签到礼物兑换、派猫猫旅行、自动派遣、领取旅行礼物、旅行到期领奖、签到守护进程。
+description: 独立运行 WorkBuddy 每日活跃（签到）校验、签到礼物自动兑换、派猫猫旅行自动派遣，并在旅行精确到期时领取礼物后立刻再次派遣。全部通过 CDP 直连 WorkBuddy 客户端内嵌的成长中心页面，DOM 级操作，全程后台隔离、不抢焦点、不干扰人工操作。触发词：帮我签到、领今日礼包、自动签到、签到礼物兑换、派猫猫旅行、自动派遣、领取旅行礼物、旅行到期领奖、签到守护进程。
 ---
 
 # buddy-web-checkin
 
-这是一个**可作为独立服务执行的 CLI 技能**：运行时不依赖 WorkBuddy agent / 模型 / 在线 API，调度器是自带的标准库 `heapq`，状态在 SQLite，由 macOS LaunchAgent 直接拉起常驻进程。**所有自动化操作（桌面签到 + 成长中心领礼物/派遣/兑换）都走 CuaDriver 无障碍树（AX 通道，已授权）**——它是唯一的外部工具与实际后端；headless 浏览器（agent-browser / agent-desktop / CDP / computer-use）均已移除。
+这是一个**可作为独立服务执行的 CLI 技能**：运行时不依赖 WorkBuddy agent / 模型 / 在线 API，调度器是自带的标准库 `heapq`，状态在 SQLite，由 macOS LaunchAgent 直接拉起常驻进程。
 
-「被操作的对象」依赖 WorkBuddy：签到要点 WorkBuddy 桌面客户端窗口，成长中心是 WorkBuddy 个人中心网页（任意浏览器、需已登录）。这两者要开着，但不要求 agent 环境。
+**所有自动化操作都走 CDP**：`agent-browser` 打开客户端侧栏里的成长中心，`tools/cdp_client.mjs` 直连成长中心 iframe 做 DOM 级读取与点击。旧的 CuaDriver / AX 通道已整体移除（`adapters/desktop.py`、`adapters/growth.py` 已删除），`agent-desktop` 仅作可选兜底、不参与日常流程。
 
-> `BUDDY_FREE_MODEL=1` 是当初按 WorkBuddy 技能设计时的运维确认闸门，**独立服务下不消耗额度，但按约定保留**：除 `model-check` / `deps` / `install-launchd` 纯本地运维外，所有命令都要该环境变量，否则拒绝执行（见下方「免费模型约束」）。LaunchAgent plist 已内置。
+操作对象依赖 WorkBuddy：成长中心是客户端内嵌页面，客户端需带调试端口启动（`scripts/launch-workbuddy-debug.sh` 一键完成）。
+
+> `BUDDY_FREE_MODEL=1` 是按 WorkBuddy 技能设计时的运维确认闸门，**独立服务下不消耗额度，但按约定保留**：除 `model-check` / `deps` / `install-launchd` / `inspect` 纯本地运维外，所有命令都要该环境变量。LaunchAgent plist 已内置。
 
 ## 安装第三方依赖（安装 / 重新拉取技能时必跑）
 
-本技能除 Python 标准库外，**只依赖一个外部工具：CuaDriver**（trycua 出品的 GUI 应用，AX 驱动），它不会随技能仓库自动装好，且 mock 单测测不到、只在真实执行才暴露缺失。**安装（或 `git pull` 重新拉取）本技能后，agent 必须先执行以下检查再首次使用**：
-
 ```bash
-./run.sh deps check     # 逐项检查，所有必需依赖 OK 才放行；缺失则退出码非 0，必须先补齐
+cd tools && npm install && cd ..    # agent-browser（必需）+ agent-desktop（可选）
+./run.sh deps check                 # 五项依赖：Python / node / agent-browser / WorkBuddy CDP / agent-desktop
 ```
 
-依赖矩阵只有三项：**Python ≥ 3.11**（运行时）、**CuaDriver**（唯一必需外部工具：桌面签到 + 成长中心任意浏览器的 AX 操作，需在「系统设置 → 隐私与安全性 → 辅助功能」授权）、**浏览器（可选）**——Chrome/Edge/Safari 任一即可，用你惯用的浏览器从 WorkBuddy 点开「个人中心」，无需专门安装。CuaDriver 缺失时按 `deps check` 打印的指引人工安装并授权。
+| 依赖 | 必需 | 说明 |
+|---|---|---|
+| Python ≥ 3.11 | ✅ | 标准库 tomllib / sqlite3 / zoneinfo |
+| node ≥ 20 | ✅ | 跑 `tools/cdp_client.mjs`（CDP 桥） |
+| agent-browser | ✅ | 跨 webContents 聚合快照/点击，打开成长中心 |
+| WorkBuddy CDP 端口 | ✅ | `launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT 9222` + 重启客户端 |
+| agent-desktop | 可选 | AX 兜底，需给启动它的 App 授权辅助功能 |
+
+CDP 端口是全新安装最容易漏的一步：客户端**不认** `--remote-debugging-port` 启动参数，只认环境变量。跑 `scripts/launch-workbuddy-debug.sh` 会自动 setenv → 优雅退出 → 重启 → 探测端口 → 列出 targets。
 
 ## 用法
 
-手动执行：`BUDDY_FREE_MODEL=1 ./run.sh <command>`（`model-check` / `deps` / `install-launchd` / `inspect` 可不带）。
+手动执行：`BUDDY_FREE_MODEL=1 ./run.sh <command>`。
 
 | 命令 | 作用 | 是否需要人工 |
 |---|---|---|
-| `deps check` | 逐项检查第三方依赖是否就绪（安装技能后必跑） | 否 |
-| `deps install` | 打印 CuaDriver 的手动安装与授权指引（无 npm 依赖） | CuaDriver 需人工安装+授权 |
-| `deps list` | 仅列出依赖与路径 | 否 |
-| `inspect` | 只读诊断：窗口清单 + 客户端入口文案 + 成长中心探测（跨机器排查首选） | 否 |
-| `status` | 只读查看三条时间线的下次执行时间 / 最近运行 | 否 |
-| `checkin-now` | 手动跑**签到线**一轮（只签到） | 否（需 CuaDriver 授权） |
-| `exchange-now` | 手动跑**兑换检查线**一轮 | 否 |
-| `travel-now` | 手动跑**旅行线**一轮（领礼物→派遣→读真实倒计时） | 否 |
-| `once` | 手动全量一轮（四条动作一起） | 否 |
+| `deps check` | 逐项检查依赖（安装后必跑） | 否 |
+| `inspect` | 只读诊断：CDP 连通 / targets / 签到状态 / 页面按钮（跨机器排查首选） | 否 |
+| `status` | 三条时间线下次执行时间 / 最近运行 | 否 |
+| `checkin-now` | 签到线一轮（读活跃地图状态） | 否 |
+| `exchange-now` | 兑换检查线一轮 | 否 |
+| `travel-now` | 旅行线一轮（领礼物→派遣→读真实倒计时） | 否 |
+| `once` | 全量一轮 | 否 |
 | `daemon` | 统一常驻进程：三条独立时间线 | 否 |
 | `install-launchd` | 写 LaunchAgent plist（RunAtLoad+KeepAlive） | 加载命令由你确认 |
-| `model-check` | 查看免费模型策略与当前确认状态 | 否 |
+| `model-check` | 查看免费模型策略与确认状态 | 否 |
 
-## 统一常驻进程的三条时间线
+## 签到语义（5.11.2 起，重要）
 
-进程启动时**三条线都立即执行一次**，之后各自从该时刻向后滚动：
+客户端已无「Buddy加油站 / 立即签到」按钮（`app.asar` 全文 0 处命中）。**签到 = 当天在活跃地图留下一条记录，完成一次对话即自动记录**。因此本技能签到只读状态、不点击：
+
+- `.gs-cal-cell.is-today` 且底色 `rgb(111, 229, 198)` → 今天已打卡，`confirmed=True`
+- `.gs-cal-cell.is-broken.is-makeup-clickable` → 漏签可补（补签卡有限，**永不自动消耗**）
+- 未记录时返回 `ok=False` 并提示「完成一次对话即可签到」，**不写 `last_checkin_day`**（避免整天假阳性）
+
+## 三条时间线
+
+进程启动时**三条线都立即执行一次**，之后各自向后滚动：
 
 | 线 | 周期 | 停止条件 |
 |---|---|---|
-| `checkin` | 每天 0 点恢复，每小时检查 | **确认**签到成功 → 禁用到当天 23:59 |
-| `exchange` | 每天 0 点恢复，每小时检查 | 兑换成功 **或** 确认无可兑换 → 禁用到当天 23:59 |
+| `checkin` | 每天 0 点恢复，每小时检查 | 确认已打卡 → 禁用到当天 23:59 |
+| `exchange` | 每天 0 点恢复，每小时检查 | 兑换成功 **或** 确认「本月已兑」→ 禁用到 23:59 |
 | `travel` | 按页面真实倒计时滚动（唯一动态） | 不停，领奖→再派遣→读新倒计时 |
 
-签到「确认」= DB 已记录今日成功 或 点击后按钮消失；仅凭按钮不存在推测已签不算确认，隔一小时再查（避免客户端页面未渲染就漏签）。兑换失败/窗口不可用同样隔一小时重试。三条线的下次时刻写入 SQLite，`status` 可查。
+**派遣时长每次不同**：页面只提示 1～4 小时，必须派遣后重读「旅行倒计时 HH:MM:SS」算 `due_at`，禁止写死间隔。
 
-**领取成功判定**：出现「已领取」或页面回到可派遣（idle）/旅行中即成功；仍停在可领/弹窗/未知不算。**动作后清弹窗（三级）**：精确匹配的关闭按钮 → Escape（`CGEventPostToPid`，不移动光标）→ 复核快照确认；不碰浏览器标签页、不误点「确定派出」。领奖后弹窗未关会让派遣按钮 `AXEnabled=false`（2026-11-10 实测）。
-
-**派遣次数当天用尽**：页面出现「明天再来 / 今日已派完 / 次数已用完」，或强关浮层后按钮仍 `AXEnabled=false`，判定 `dispatch_blocked=exhausted` → 旅行线禁用到当晚 23:00（`travel.exhausted_retry_at`，已过则次日 0 点），不再每小时重试；到点自动再检查。标记 `travel_blocked` + `travel_blocked_day` 落库，**服务重启后跳过实际检查直接排到 23:00**（避免重启触发重复开页签），跨天自动清除。
-
-**不重复开页签**：自动打开前按标题判断「已有 WorkBuddy 个人中心页签」就不再新开；自动打开冷却写 kv 跨重启生效。CuaDriver daemon 挂掉（`driver_unavailable`）时一律不自动打开，用 `cua-driver permissions grant` 重新拉起（必须以 com.trycua.driver 身份，否则 TCC 授权不生效）。
-
-## 成长中心与派遣时长
-
-领礼物、派遣、签到兑换走 `growth` 通道：CuaDriver 读已登录成长中心页面的 AX 树（**不限定浏览器**——
-从 WorkBuddy 点开进入哪个浏览器就在哪个浏览器操作，默认 `growth.browser_app="auto"` 按页面内容探测），
-不注入 cookie、不需要 Bearer token。页面未登录时只提示用户先登录，不自动登录。状态由真实按钮判定
-（派猫猫旅行 / 旅行倒计时 / 领取礼物）。
-
-**派遣时长每次不同**：页面事前只提示「预计出行时间为1～4小时」。派遣后必须重新读
-`旅行倒计时 HH:MM:SS`，用真实剩余秒数算 `due_at`，写入 SQLite；到期唤醒后领礼物、
-立刻再派遣、再读新倒计时生成下一次 due。禁止使用固定间隔或写死 4 小时。
-
-兑换保守：`兑换奖励` 只点弹窗里已解锁的档位（未解锁则关闭跳过），`抽奖(N)` 仅 N>0，
-`开启盲盒 a/b` 仅能量满；补登卡和日期按钮永不自动消耗。
-
-## 桌面签到双引擎（严格 headless，不与人争抢）
-
-`desktop.engine` 三选一，两者都**不激活窗口、不移动光标、不抢焦点、不合成物理输入**：
-- `auto`（默认）：优先已授权的 CuaDriver ax，不可用回退 agent-desktop。
-- `ax`：CuaDriverSigner（`element_token` AX press，授权对象 `com.trycua.driver`）。
-- `agent`：AgentDesktopSigner（agent-desktop 1.2.0 的 `click @ref` 语义 press，npm 本地装于 `tools/`）。
-
-**agent-desktop 授权**：TCC 绑「实际启动它的 App」（iTerm/Terminal），非捆绑包本身。`permissions`
-显示 `accessibility=denied` 时跑 `agent-desktop permissions --guide` 打开系统设置，把启动它的 App
-加入辅助功能/设备控制和数据访问（**必须真人点，脚本不能自授权**）。未授权时 auto 自动回退 ax，
-签到不中断；显式 `engine=agent` 遇 `PERM_DENIED` 安全报错并提示，绝不降级 headed 抢焦点。
-注意：本技能作为 LaunchAgent 独立服务运行时由 launchd 拉起、不经过 agent 会话沙箱；若在某宿主
-里直接调 `permissions` 得到 denied，那是宿主进程身份（auth=0）所致，不代表服务运行时状态。
-
-**不抢焦点硬约束**：agent-desktop 只用 `click @ref`，不加 `--headed`、不用 `--xy`；失败只按
-`disposition.retry=='safe'`（未投递）重试，其余重新 snapshot 读实时状态，避免重复提交二次奖励。
-
-**登录/验证码不硬解**：检测到扫码/密码/短信/验证码 → 自动全屏截图落 `desktop.screenshot_dir`
-+ 日志；`login_wait_sec=0` 只截图报告不阻塞，>0 轮询等人工登录。绝不自动填账号/绕验证码。
+**派遣次数用尽**：页面出现「明天再来 / 今日已派完 / 次数已用完」→ `dispatch_blocked=exhausted`，旅行线禁用到 23:00（已过则次日 0 点）；标记落库，重启跳过实际检查，跨天自动清除。
 
 ## 执行约束
 
-- **不激活窗口、不移动物理鼠标、不接管用户日常浏览器**：所有点击优先用 `element_token`（无则 `element_index`）走 AX press，并校验返回 `path == "ax"`；任何会移动光标的像素路径一律拒绝。成长中心只操作用户自己打开的浏览器窗口。
-- **签到按钮需要先展开面板**：客户端「Buddy加油站」面板收起时 AX 树里没有「立即领取」。必须先点开入口再重新快照定位；展开后仍无按钮、或面板内出现「今日已领取」= 确认已签；连入口都找不到则报「状态不确定」、隔一小时再查，**绝不写 `last_checkin_day`**。
-- **已签证据只认面板区内的按钮**（2026-11-12 WorkBuddy 5.11.2 实测）：客户端右侧对话正文会含「明日再来」等历史消息，绝不能当已签证据。搜索范围限定在加油站面板区（入口索引 + `desktop.station_panel_window`），且只认 `AXButton/AXPopUpButton`。
-- **签到满 24 小时**：落库 `last_checkin_at` 真实时刻，`daily_checkin.min_interval_sec` 默认 86400；跨 0 点但距上次真实签到不足 24h 不重复签。
-- **web 动作前先刷新页面**：`growth.refresh_before_action=true` 时，领礼物/派遣/兑换前用纯 AX 点工具栏「刷新」（不移动光标）、等待后重建快照，避免读到久置旧状态；同轮只刷一次。
-- **派遣场景弹窗**：点「派猫猫旅行」后才出场景弹窗，须重读快照再点「确定派出」，点击后异步复核 traveling，避免误判失败。
-- **兑换确定性结论**：弹窗「本月已兑换 / 已兑完」判 ok=True 禁用到 23:59，不每小时重试。
-- **跨机器**：`AXPress -25202`（元素引用失效）已内置 3 次「重新快照定位」重试；入口文案用 `desktop.station_entry_labels` / `growth.auto_open_labels` 配置，差异先用 `./run.sh inspect` 只读查看。
-- **页面免人工打开**：`growth.auto_open_page=true` 时，没有成长中心页面会先点客户端「做任务赢积分」入口，仍找不到则 `open -g` 后台打开目标 URL（不抢焦点，300 秒冷却）。未登录只提示、不自动登录。
-- **状态判定只认 `AXButton`**：客户端里打开的 README/对话若含「派猫猫旅行」「领取 7 积分」等字样，不能被误判为成长中心页面；客户端窗口由 `growth.exclude_apps` 排除。
-- **幂等**：所有领取经 SQLite 唯一键去重，重复运行不重复领。
-- **时间口径**：一律北京时间；naive 时间按北京时间解释，不按 UTC。
-- **凭据**：输出脱敏，不读取或导出客户端登录态与令牌；不自动登录。
-- 活动入口与字段随版本变化，接口/文字定位失败时如实报告，不盲目重试。
+- **不抢焦点**：所有操作走 CDP 协议（DOM 级 click），不激活窗口、不移动光标、不合成物理输入
+- **状态只认结构**：用 `.gs-cal-cell` 类名、`button` 的 disabled、`旅行倒计时` 文本判定；不靠模糊文案猜测
+- **兑换保守**：`兑换奖励` 只点弹窗里已解锁档位，`抽奖(N)` 仅 N>0，`开启盲盒 a/b` 仅能量满；补登卡与日期按钮永不自动消耗
+- **不做任务**：`去完成` 一类任务按钮永不点击
+- **幂等**：所有领取经 SQLite 唯一键去重，重复运行不重复领
+- **失败不换通道**：CDP 不可达时明确报错并给修复命令，不静默降级
+- **不自动登录**：不填账号密码、不绕验证码
+- **时间口径**：一律北京时间；naive 时间按北京时间解释
+- **凭据**：输出脱敏，不读取或导出客户端登录态与令牌
 
-详细架构、人工步骤与故障排查见 `README.md`。需求拆解与验收状态见 `prd.json`。
+## 跨机器排查
+
+另一台机器失败时按顺序跑：`./run.sh deps check` → `./run.sh inspect` → 对照 README 故障排查表。入口文案不同改 `[growth].open_labels`（如 `["成长计划"]`）。
+
+详细架构与故障排查见 `README.md`。
 
 ## 免费模型约束（历史约定，独立服务下不耗额度）
 
-运行时不依赖 WorkBuddy agent / 模型，但 `BUDDY_FREE_MODEL=1` 闸门按约定保留：
-
 1. 手动执行前以 `BUDDY_FREE_MODEL=1` 显式确认，否则命令拒绝执行（退出码 2）。
-2. `install-launchd` 生成的 plist 已内置 `BUDDY_FREE_MODEL=1`，常驻进程无需额外操作。
-3. 查看策略：`run.sh model-check`（纯本地运维，不需要该变量）。
+2. `install-launchd` 生成的 plist 已内置 `BUDDY_FREE_MODEL=1`。
+3. 查看策略：`./run.sh model-check`（纯本地运维）。
 
 ## Git 管理
 
-代码托管于 `https://github.com/timesky/t-buddy-checkin`（`main`）。本机通过 SSH key（`~/.ssh/id_rsa_tangming` / `lcc_op_rsa`，`timesky` 身份）读写。受 `.gitignore` 控制的本地产物（`config.toml`、`tools/node_modules/`、`*.png`、`*.json` 运行时产物、`*.sqlite3` 等）不入库。
+仓库 `https://github.com/timesky/t-buddy-checkin`（`main`）。`.gitignore` 排除 `config.toml`、`tools/node_modules/`、`*.png`、`*.sqlite3`、`last-checkin-result.json` 等本地产物。

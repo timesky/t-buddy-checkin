@@ -11,8 +11,7 @@ from pathlib import Path
 
 from . import config
 from .actions import Actions
-from .adapters.desktop import CuaDriverSigner
-from .adapters.growth import GrowthCenter
+from .adapters.growth_browser import GrowthBrowser
 from .deps import cmd_deps
 from .scheduler import Scheduler
 from .state import State
@@ -59,38 +58,31 @@ def cmd_model_check(cfg: dict, args: argparse.Namespace) -> int:
 
 
 def build(cfg: dict):
-    """构造后端组合：桌面签到引擎（ax / agent-desktop）+ GrowthCenter（礼物/派遣/兑换）。
+    """构造后端组合：全部走 CDP（agent-browser + 客户端调试端口）。
 
-    两个桌面引擎都保持「静默、不抢焦点/光标」：
-      - ax    : CuaDriverSigner，走 element_token AX press（默认，已授权 com.trycua.driver）
-      - agent : AgentDesktopSigner，走 agent-desktop 的 ref 语义 press（严格 headless）
-    auto 优先 ax（已授权、零额外配置），ax 不可用时回退 agent-desktop。
+    - 签到        : 读活跃地图状态（growth.checkin）
+    - 礼物/派遣/兑换 : GrowthBrowser 直连成长中心 iframe 做 DOM 级操作
+
+    旧 CuaDriver/AX 通道（desktop.CuaDriverSigner、growth.GrowthCenter）
+    已不再装配；[growth].engine="ax" 只是为回退排查保留的显式开关。
     """
     state = State(config.state_db_path(cfg))
-    engine = (cfg.get("desktop", {}) or {}).get("engine", "auto")
-    desktop = _build_desktop(cfg, engine)
-    growth = GrowthCenter(cfg, state=state) if cfg.get("growth", {}).get("enabled") else None
-    actions = Actions(cfg, state, desktop, growth=growth)
-    return state, desktop, actions
+    growth = _build_growth(cfg, state)
+    # 签到不再依赖桌面端点击，desktop 传 None（Actions 仅在 growth 缺失时提示）
+    actions = Actions(cfg, state, None, growth=growth)
+    return state, None, actions
 
 
-def _build_desktop(cfg: dict, engine: str):
-    """按 engine 选桌面签到适配器；auto 先 ax 再 agent-desktop。"""
-    from .adapters.desktop_agent import AgentDesktopSigner
+def _build_growth(cfg: dict, state):
+    """构造成长中心适配器：唯一实现是 GrowthBrowser（CDP）。
 
-    if engine == "agent":
-        return AgentDesktopSigner(cfg)
-    if engine == "ax":
-        return CuaDriverSigner(cfg)
-    # auto：优先已授权的 CuaDriver AX；不可执行时用 agent-desktop
-    ax = CuaDriverSigner(cfg)
-    try:
-        probe = ax.probe()
-        if probe.ok or "main window not found" in probe.detail:
-            return ax
-    except Exception:
-        pass
-    return AgentDesktopSigner(cfg)
+    旧 CuaDriver/AX 通道已移除，这里没有回退分支——CDP 不可达时由
+    GrowthBrowser 返回明确的 blocked 结果，而不是静默换通道。
+    """
+    g = cfg.get("growth", {}) or {}
+    if not g.get("enabled"):
+        return None
+    return GrowthBrowser(cfg, state=state)
 
 
 def _json(result) -> int:
@@ -136,10 +128,18 @@ def cmd_once(cfg: dict, args: argparse.Namespace) -> int:
 
 
 def cmd_status(cfg: dict, args: argparse.Namespace) -> int:
-    state, desktop, _actions = build(cfg)
+    state, _desktop, _actions = build(cfg)
     print("== buddy-web-checkin status ==")
     print(f"今日(北京时间)      : {config.scrub(state.kv_get('last_checkin_day')) or '未签到'}")
-    print(f"桌面端后端          : {desktop.probe().data.get('backend') or 'none (需安装/授权)'}")
+    g = cfg.get("growth", {}) or {}
+    engine = (g.get("engine") or "browser").strip().lower()
+    port = g.get("cdp_port", 9222)
+    print(f"成长中心引擎        : {engine} (cdp_port={port})")
+    if engine == "browser":
+        gb = GrowthBrowser(cfg)
+        alive = gb.available()
+        page = "已打开" if alive and gb._iframe_ws() else ("未打开" if alive else "-")
+        print(f"CDP {port:<16}: {'可达' if alive else '不可达（客户端未带调试端口启动）'}  页面: {page}")
     print("-- 三条时间线（统一常驻进程）--")
     for name, label in (("checkin", "签到检查"), ("exchange", "兑换检查"), ("travel", "旅行/派遣")):
         due = state.kv_get_float(f"next_{name}_at")
@@ -177,58 +177,55 @@ def cmd_daemon(cfg: dict, args: argparse.Namespace) -> int:
 
 
 def cmd_inspect(cfg: dict, args: argparse.Namespace) -> int:
-    """只读诊断：打印客户端/浏览器窗口与关键 AX 文案，供跨机器 UI 差异排查。
+    """只读诊断：打印 CDP 连通性、targets、成长中心页面状态与签到判定。
 
-    不点击、不改状态、不移动光标。另一台机器签到失败时先跑它，把输出贴回来即可
-    判断入口文案、页面是否打开、是否登录。
+    不点击、不改状态。另一台机器签到/派遣失败时先跑它，把输出贴回来即可判断
+    是客户端没带调试端口、页面没打开、还是签到未记录。
     """
-    import subprocess
+    g = cfg.get("growth", {}) or {}
+    port = g.get("cdp_port", 9222)
+    gb = GrowthBrowser(cfg)
+    print("== CDP 诊断 ==")
+    print(f"  port            : {port}")
+    print(f"  agent-browser   : {gb.ab_bin or '未找到（tools/node_modules/.bin/agent-browser）'}")
+    print(f"  node            : {gb.node_bin or '未找到'}")
+    print(f"  cdp_client.mjs  : {gb.cdp_js} {'OK' if gb.cdp_js.exists() else 'MISSING'}")
+    targets = gb.targets()
+    print(f"  targets         : {len(targets)} 个")
+    for t in targets:
+        print(f"    [{t.get('type'):<8}] {(t.get('title') or '')[:34]:<36} {(t.get('url') or '')[:60]}")
+    if not targets:
+        print(f"  ✗ CDP 不可达：{gb.block[1] if gb.block else 'unknown'}")
+        print("    修复：launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT "
+              f"{port} && 重启 WorkBuddy 客户端")
+        return 1
 
-    bin_path = cfg["desktop"].get("cua_driver_bin") or \
-        "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
+    ws = gb._iframe_ws()
+    print(f"  成长中心 iframe : {'已打开' if ws else '未打开'}")
+    if not ws:
+        print("    （运行 exchange-now / travel-now 会自动从客户端入口打开）")
+        return 0
 
-    def call(tool: str, payload: dict) -> dict:
-        proc = subprocess.run(
-            [bin_path, "call", tool, json.dumps(payload, ensure_ascii=False)],
-            capture_output=True, text=True, timeout=30,
-        )
-        raw = proc.stdout or ""
-        i = raw.find("{")
-        return json.loads(raw[i:]) if i >= 0 else {"error": (raw or proc.stderr)[:200]}
+    st = gb.checkin_status()
+    print("\n== 签到状态（活跃地图）==")
+    if st.get("ok"):
+        print(f"  今日已打卡  : {st.get('checked')}")
+        print(f"  连续登录    : {st.get('streak')} 天")
+        print(f"  今日格子底色: {st.get('bg')}")
+        if st.get("makeup"):
+            print(f"  漏签可补    : {','.join(st['makeup'])}（补签卡不自动消耗）")
+    else:
+        print(f"  读取失败: {st.get('detail')}")
 
-    data = call("list_windows", {})
-    wins = [w for w in data.get("windows", []) if w.get("is_on_screen")]
-    print("== 可见窗口 ==")
-    for w in wins:
-        b = w.get("bounds") or {}
-        print(f"  {str(w.get('app_name')):22} pid={w.get('pid'):>7} "
-              f"wid={w.get('window_id'):>5} {b.get('width')}x{b.get('height')} "
-              f"{str(w.get('title'))[:48]}")
-
-    keys = ("签到", "领取", "任务", "积分", "加油站", "成长", "计划", "好礼",
-            "连登", "旅行", "倒计时", "兑换", "盲盒", "抽奖", "登录")
-    app_name = cfg["desktop"].get("app", "WorkBuddy")
-    client = next((w for w in wins if w.get("app_name") == app_name), None)
-    if client:
-        snap = call("get_window_state", {
-            "pid": client["pid"], "window_id": client["window_id"],
-            "include_screenshot": False, "max_elements": 2500,
-        })
-        print(f"\n== {app_name} 客户端关键元素（可交互/短标签，最多 40 条）==")
-        roles = ("AXButton", "AXLink", "AXMenuItem", "AXRadioButton",
-                 "AXPopUpButton", "AXCheckBox", "AXStaticText")
-        shown = 0
-        for el in snap.get("elements", []):
-            lab = str(el.get("label") or "").strip()
-            if (shown < 40 and lab and len(lab) <= 60
-                    and el.get("role") in roles and any(k in lab for k in keys)):
-                print(f"  idx={el.get('element_index'):>4} {str(el.get('role')):<14} {lab}")
-                shown += 1
-
-    growth = GrowthCenter(cfg)
-    growth.auto_open_page = False  # 诊断时绝不触发点击
-    win = growth._window()
-    print(f"\n== 成长中心探测 ==\n  {'已找到 ' + str(win) if win else (growth._block or ('?', '?'))[1]}")
+    page = gb.read_state()
+    print("\n== 页面状态 ==")
+    print(f"  state       : {page['state']}")
+    print(f"  remaining   : {page['remaining_sec']}s")
+    print("  buttons     :")
+    for b in (page.get("buttons") or [])[:20]:
+        flag = " [disabled]" if b.get("dis") else ""
+        eid = f" ({b.get('eid')})" if b.get("eid") else ""
+        print(f"    - {b.get('t')}{flag}{eid}")
     return 0
 
 

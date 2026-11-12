@@ -1,24 +1,28 @@
 """第三方依赖的检查与安装引导。
 
-本技能除 Python 标准库外，只依赖**一个**外部工具：**CuaDriver**（trycua 出品的 AX 驱动）。
-它是签到（WorkBuddy 桌面客户端）与成长中心（已登录的个人中心浏览器窗口）的唯一通道，
-也是本机唯一拿到 TCC 辅助功能授权的后端（auth=2），其它候选（agent-browser /
-agent-desktop / cdp / computer-use）要么未授权、要么已废弃，**均未使用**，故不列入依赖。
+当前运行时链路（2026-11-12 起）：**agent-browser + WorkBuddy 客户端 CDP**。
 
-安装技能时由 agent 先跑 `./run.sh deps check`，确认 CuaDriver 已安装并在辅助功能里授权；
-缺失只在真实执行时才暴露（mock 单测测不到）。
+  - 成长中心是客户端内嵌的 OOPIF，必须通过 CDP 连接才能做 DOM 级操作
+  - 打开页面入口（侧栏「成长计划」→「立即前往」）靠 agent-browser 的跨
+    webContents 聚合 snapshot/click
+  - 客户端需带 WORKBUDDY_REMOTE_DEBUGGING_PORT 环境变量启动，才会暴露调试端口
+
+必需依赖：Python ≥3.11、node（CDP 桥）、agent-browser、客户端调试端口。
+可选依赖：agent-desktop（AX 兜底，不参与日常流程）。
+
+旧的 CuaDriver / AX 通道已整体移除，不再列为依赖。
+安装技能时由 agent 先跑 `./run.sh deps check`；缺失只在真实执行时才暴露。
 """
 
 from __future__ import annotations
 
-import json
 import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
-CUA_DEFAULT_BIN = "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _which(name: str) -> Path | None:
@@ -38,7 +42,6 @@ def _try_version(bin_path: Path | str, *args: str, timeout: int = 8) -> str | No
     out = (proc.stdout or proc.stderr or "").strip()
     if not out:
         return None
-    # 取首行里像 0.14.1 / v1.2.0 的版本片段，去掉程序名前缀
     m = re.search(r"\d+\.\d+(?:\.\d+)?", out.splitlines()[0])
     return m.group(0) if m else out.splitlines()[0].strip()[:60]
 
@@ -60,41 +63,69 @@ def python_dep() -> dict:
     }
 
 
-def cua_driver_dep(cfg: dict) -> dict:
-    bin_cfg = (
-        (cfg.get("desktop") or {}).get("cua_driver_bin")
-        or (cfg.get("growth") or {}).get("cua_driver_bin")
-        or CUA_DEFAULT_BIN
-    )
-    bin_path = Path(str(bin_cfg)).expanduser()
-    resolved = bin_path if bin_path.exists() else _which("cua-driver")
+def node_dep() -> dict:
+    from .adapters.growth_browser import GrowthBrowser
+
+    resolved = GrowthBrowser._resolve_node()
     return {
-        "name": "CuaDriver",
-        "kind": "gui-app",
+        "name": "node",
+        "kind": "runtime",
         "required": True,
         "critical": True,
-        "present": resolved is not None,
+        "present": bool(resolved),
         "version": _try_version(resolved, "--version") if resolved else None,
-        "path": str(resolved) if resolved else bin_cfg,
+        "path": resolved or "未找到（PATH 或 ~/.workbuddy/binaries/node）",
+        "install": "安装 Node.js ≥ 20，或使用 WorkBuddy 自带 node（~/.workbuddy/binaries/node）",
+        "note": "tools/cdp_client.mjs 的运行时，用于直连成长中心 iframe 执行 DOM 操作",
+    }
+
+
+def agent_browser_dep(cfg: dict) -> dict:
+    from .adapters.growth_browser import GrowthBrowser
+
+    g = cfg.get("growth", {}) or {}
+    resolved = GrowthBrowser._resolve_agent_browser(g)
+    return {
+        "name": "agent-browser",
+        "kind": "npm-tool",
+        "required": True,
+        "critical": True,
+        "present": bool(resolved),
+        "version": _try_version(resolved, "--version") if resolved else None,
+        "path": resolved or str(PROJECT_ROOT / "tools" / "node_modules" / ".bin" / "agent-browser"),
+        "install": "cd <项目>/tools && npm install",
+        "note": "跨 webContents 聚合 snapshot/click，用于从客户端侧栏打开成长中心页面",
+    }
+
+
+def cdp_dep(cfg: dict) -> dict:
+    """WorkBuddy 客户端调试端口：CDP 链路的运行前提。"""
+    from .adapters.growth_browser import GrowthBrowser
+
+    port = int((cfg.get("growth", {}) or {}).get("cdp_port", 9222))
+    gb = GrowthBrowser(cfg)
+    alive = gb.available()
+    return {
+        "name": "WorkBuddy CDP",
+        "kind": "runtime-port",
+        "required": True,
+        "critical": True,
+        "present": alive,
+        "version": None,
+        "path": f"127.0.0.1:{port}",
         "install": (
-            "安装 CuaDriver.app（trycua 出品），并到 系统设置→隐私与安全性→辅助功能 "
-            "授权其驱动；首次运行 `cua-driver permissions --guide`。"
+            f"launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT {port} && "
+            "重启 WorkBuddy 客户端（或直接跑 scripts/launch-workbuddy-debug.sh）"
         ),
-        "note": "签到（桌面客户端）与成长中心（浏览器窗口）的唯一 AX 通道",
+        "note": "客户端暴露的 DevTools 端口；未开启时无法读取成长中心页面",
     }
 
 
 def agent_desktop_dep(cfg: dict) -> dict:
-    """agent-desktop 桌面签到引擎（可选，严格 headless 不抢焦点/光标）。
-
-    npm 本地安装在 tools/node_modules/.bin/agent-desktop。TCC 授权绑「实际启动
-    它的 App」（iTerm/Terminal 等），未授权会 PERM_DENIED；默认 engine=auto
-    会优先用已授权的 CuaDriver ax 引擎，故它缺失/未授权都不阻断主流程。
-    """
+    """agent-desktop（可选）：AX 兜底工具，严格 headless 不抢焦点/光标。"""
     desk = cfg.get("desktop", {}) or {}
     configured = desk.get("agent_desktop_bin") or "node_modules/.bin/agent-desktop"
-    project_root = Path(__file__).resolve().parents[2]
-    local = project_root / "tools" / configured
+    local = PROJECT_ROOT / "tools" / configured
     resolved = local if local.exists() else (
         _which(Path(configured).name) if not Path(configured).is_absolute()
         else Path(configured) if Path(configured).exists() else None
@@ -108,45 +139,21 @@ def agent_desktop_dep(cfg: dict) -> dict:
         "version": _try_version(resolved, "--version") if resolved else None,
         "path": str(resolved) if resolved else str(local),
         "install": (
-            "cd <项目>/tools && npm install agent-desktop@1.2.0；再把「启动它的 App」"
-            "（如 iTerm.app）加入 系统设置→隐私与安全性→辅助功能（macOS 27+ 设备控制和数据访问）。"
-            "未授权时默认 engine=auto 会回退 CuaDriver ax 引擎，不阻断签到。"
+            "cd <项目>/tools && npm install；再把「启动它的 App」加入 "
+            "系统设置→隐私与安全性→辅助功能（macOS 27+ 设备控制和数据访问）"
         ),
-        "note": f"桌面签到引擎 desktop.engine={desk.get('engine', 'auto')}（可选第二引擎，严格 headless）",
-    }
-
-
-def browser_dep(cfg: dict) -> dict:
-    """成长中心不限定浏览器：你用惯用的浏览器从 WorkBuddy 点开「个人中心」即可。"""
-    configured = (cfg.get("growth") or {}).get("browser_app", "auto")
-    candidates = [
-        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Safari.app",
-    ]
-    resolved = next((Path(c) for c in candidates if Path(c).exists()), None)
-    return {
-        "name": "浏览器（任意已装）",
-        "kind": "gui-app",
-        "required": False,
-        "critical": False,
-        "present": resolved is not None,
-        "version": None,
-        "path": str(resolved) if resolved else "未检测到常见浏览器",
-        "install": "成长中心不限定浏览器：用惯用浏览器从 WorkBuddy 点开「个人中心」即可，"
-                   "无需专门安装。",
-        "note": f"growth.browser_app = {configured}（auto = 任意浏览器皆可）",
+        "note": "可选 AX 兜底（CDP 不可达时人工排查用），不参与日常流程",
     }
 
 
 def collect(cfg: dict) -> list[dict]:
-    deps = [python_dep(), cua_driver_dep(cfg), agent_desktop_dep(cfg), browser_dep(cfg)]
-    # 显式指定 engine=agent 时，agent-desktop 变成必需（否则无法签到）
-    if (cfg.get("desktop", {}) or {}).get("engine") == "agent":
-        for d in deps:
-            if d["name"] == "agent-desktop":
-                d["required"] = d["critical"] = True
-    return deps
+    return [
+        python_dep(),
+        node_dep(),
+        agent_browser_dep(cfg),
+        cdp_dep(cfg),
+        agent_desktop_dep(cfg),
+    ]
 
 
 def evaluate(cfg: dict) -> dict:
@@ -162,12 +169,10 @@ def evaluate(cfg: dict) -> dict:
 
 
 def install(cfg: dict) -> int:
-    """唯一 GUI 依赖是 CuaDriver，无 npm / 包管理器依赖，这里只给手动安装与授权指引。"""
-    print("[deps] 本技能无 npm 依赖；外部工具只有 CuaDriver（GUI 应用）。\n")
+    print("[deps] 运行时依赖：agent-browser + node + WorkBuddy 客户端 CDP 端口。\n")
     for d in collect(cfg):
-        if d["kind"] == "gui-app":
-            status = "已安装" if d["present"] else "缺失"
-            print(f"  - {d['name']} [{status}]: {d['install']}")
+        status = "已就绪" if d["present"] else "缺失"
+        print(f"  - {d['name']} [{status}]: {d['install']}")
     return 0
 
 
@@ -181,7 +186,6 @@ def cmd_deps(cfg: dict, args: Any) -> int:
             print(f"{d['name']:16} {('OK' if d['present'] else 'MISSING'):8} "
                   f"{('[required]' if d['required'] else '[optional]'):12} {d['path']}")
         return 0
-    # default: check
     print("== buddy-web-checkin 第三方依赖检查 ==")
     for d in report["dependencies"]:
         flag = "OK" if d["present"] else ("MISSING" if d["required"] else "missing(可选)")
@@ -197,5 +201,4 @@ def cmd_deps(cfg: dict, args: Any) -> int:
     print(f"❌ 缺失必需依赖：{', '.join(report['required_missing'])}")
     if report["optional_missing"]:
         print(f"⚠️  可选依赖缺失（不影响主流程）：{', '.join(report['optional_missing'])}")
-    print("   请先按上方指引安装并授权 CuaDriver，再 `./run.sh deps check` 复查。")
     return 1

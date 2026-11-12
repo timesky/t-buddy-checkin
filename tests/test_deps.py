@@ -4,10 +4,22 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from buddy_checkin import deps  # noqa: E402
+from buddy_checkin.adapters import growth_browser  # noqa: E402
+
+BASE_CFG = {
+    "desktop": {},
+    "growth": {"enabled": True, "cdp_port": 9222, "agent_browser_bin": ""},
+}
+
+
+def _offline_targets(self) -> bool:
+    """让 CDP 探测在单测里恒定返回不可达，避免依赖本机客户端状态。"""
+    return False
 
 
 class DepsTests(unittest.TestCase):
@@ -17,70 +29,54 @@ class DepsTests(unittest.TestCase):
         self.assertTrue(d["required"] and d["critical"])
 
     def test_try_version_extracts_semver_only(self):
-        from unittest.mock import patch
-
         class _P:
-            stdout = "cua-driver 0.14.1\n"
+            stdout = "agent-browser 0.42.0\n"
             stderr = ""
             returncode = 0
 
         with patch.object(deps.subprocess, "run", return_value=_P()):
-            ver = deps._try_version("/fake/cua-driver", "--version", timeout=1)
-        self.assertEqual(ver, "0.14.1")  # 只取版本号，不带程序名前缀
+            ver = deps._try_version("/fake/agent-browser", "--version", timeout=1)
+        self.assertEqual(ver, "0.42.0")  # 只取版本号，不带程序名前缀
 
-    def test_evaluate_returns_ok_flag(self):
-        cfg = {
-            "desktop": {"cua_driver_bin": "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"},
-            "growth": {"enabled": True, "browser_app": "auto",
-                       "cua_driver_bin": "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"},
-        }
-        report = deps.evaluate(cfg)
-        self.assertIn("ok", report)
-        self.assertIn("dependencies", report)
+    def test_dependency_names_reflect_cdp_chain(self):
+        """依赖清单必须体现 CDP 链路，且不再包含已移除的 CuaDriver。"""
+        with patch.object(growth_browser.GrowthBrowser, "available", _offline_targets):
+            report = deps.evaluate(BASE_CFG)
         names = [d["name"] for d in report["dependencies"]]
-        # CuaDriver 是默认必需；agent-desktop 是可选第二引擎（engine=agent 时才必需）
-        self.assertEqual(names, ["Python", "CuaDriver", "agent-desktop", "浏览器（任意已装）"])
-        self.assertNotIn("agent-browser", " ".join(names))
-        ad = next(d for d in report["dependencies"] if d["name"] == "agent-desktop")
-        self.assertFalse(ad["required"])  # auto/ax 模式下可选，不阻断
-        self.assertFalse(ad["critical"])
+        self.assertEqual(names, ["Python", "node", "agent-browser", "WorkBuddy CDP", "agent-desktop"])
+        self.assertNotIn("CuaDriver", names)
+        self.assertNotIn("浏览器（任意已装）", names)
 
-    def test_agent_desktop_becomes_required_when_engine_agent(self):
-        """显式 engine=agent 时 agent-desktop 变必需；缺失则整体 not ok。"""
-        from unittest.mock import patch
-
-        cfg = {"desktop": {"engine": "agent", "agent_desktop_bin": "/nonexistent/ad"},
-               "growth": {"enabled": True,
-                          "cua_driver_bin": "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"}}
-        with patch.object(deps, "_which", return_value=None):
-            report = deps.evaluate(cfg)
-        ad = next(d for d in report["dependencies"] if d["name"] == "agent-desktop")
-        self.assertTrue(ad["required"])
-        self.assertFalse(ad["present"])
-        self.assertIn("agent-desktop", report["required_missing"])
-
-    def test_cua_driver_is_the_only_required_external(self):
-        """CuaDriver 是唯一必需外部工具：缺它则整体 not ok。"""
-        from unittest.mock import patch
-
-        cfg = {"desktop": {"cua_driver_bin": "/nonexistent/cua-driver"},
-               "growth": {"enabled": True}}
-        # 屏蔽 PATH 回退（本机 cua-driver 就在 PATH 上，会误判 present）
-        with patch.object(deps, "_which", return_value=None):
-            report = deps.evaluate(cfg)
-        cua = next(d for d in report["dependencies"] if d["name"] == "CuaDriver")
-        self.assertTrue(cua["required"])
-        self.assertFalse(cua["present"])
+    def test_agent_browser_and_cdp_are_required(self):
+        with patch.object(growth_browser.GrowthBrowser, "available", _offline_targets), \
+             patch.object(deps, "_which", return_value=None), \
+             patch.object(growth_browser.GrowthBrowser, "_resolve_agent_browser", return_value=None):
+            report = deps.evaluate(BASE_CFG)
+        ab = next(d for d in report["dependencies"] if d["name"] == "agent-browser")
+        cdp = next(d for d in report["dependencies"] if d["name"] == "WorkBuddy CDP")
+        self.assertTrue(ab["required"] and ab["critical"])
+        self.assertFalse(ab["present"])
+        self.assertTrue(cdp["required"] and cdp["critical"])
+        self.assertFalse(cdp["present"])
         self.assertFalse(report["ok"])
-        self.assertEqual(report["required_missing"], ["CuaDriver"])
-        # 浏览器为可选信息项，缺失不阻塞
-        browser = next(d for d in report["dependencies"] if "浏览器" in d["name"])
-        self.assertFalse(browser["required"])
+        self.assertIn("agent-browser", report["required_missing"])
+        self.assertIn("WorkBuddy CDP", report["required_missing"])
 
-    def test_browser_dep_is_informational(self):
-        d = deps.browser_dep({"growth": {"browser_app": "auto"}})
-        self.assertFalse(d["required"])
-        self.assertFalse(d["critical"])
+    def test_cdp_present_when_port_alive(self):
+        with patch.object(growth_browser.GrowthBrowser, "available", return_value=True):
+            report = deps.evaluate(BASE_CFG)
+        cdp = next(d for d in report["dependencies"] if d["name"] == "WorkBuddy CDP")
+        self.assertTrue(cdp["present"])
+
+    def test_agent_desktop_stays_optional(self):
+        """agent-desktop 只作 AX 兜底，任何配置下都不阻断主流程。"""
+        with patch.object(growth_browser.GrowthBrowser, "available", return_value=True), \
+             patch.object(deps, "_which", return_value=None):
+            report = deps.evaluate({"desktop": {"engine": "agent"}, "growth": {"enabled": True}})
+        ad = next(d for d in report["dependencies"] if d["name"] == "agent-desktop")
+        self.assertFalse(ad["required"])
+        self.assertFalse(ad["critical"])
+        self.assertNotIn("agent-desktop", report["required_missing"])
 
 
 if __name__ == "__main__":

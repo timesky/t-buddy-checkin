@@ -150,14 +150,30 @@ class AgentDesktopTests(unittest.TestCase):
         clicks = [c for c in runner.calls if c[1] == "click"]
         self.assertEqual(len(clicks), 1)  # 绝不因非 safe 失败再点第二次
 
-    def test_build_selects_ax_by_default(self):
-        """默认 engine=auto 选已授权的 ax，不强行切 agent-desktop。"""
+    def test_build_uses_growth_browser_only(self):
+        """装配层只产出 GrowthBrowser；旧 CuaDriver/AX 通道已移除，无可选分支。"""
+        import tempfile
+
         from buddy_checkin import cli
-        cfg_ax = {"desktop": {"engine": "auto", "cua_driver_bin": "/nonexistent"},
-                  "growth": {"enabled": False}}
-        # probe 失败且非「窗口未找到」→ 回退 agent-desktop
-        d = cli._build_desktop(cfg_ax, "auto")
-        self.assertIsInstance(d, AgentDesktopSigner)
+        from buddy_checkin.adapters.growth_browser import GrowthBrowser
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg = {"state_db": f"{td}/state.sqlite3",
+                   "growth": {"enabled": True, "cdp_port": 9222}}
+            state, desktop, actions = cli.build(cfg)
+            try:
+                self.assertIsNone(desktop)          # 签到不再依赖桌面端
+                self.assertIsInstance(actions.growth, GrowthBrowser)
+            finally:
+                state.close()
+
+    def test_old_cua_modules_are_gone(self):
+        """回归：旧通道模块必须已物理删除，避免被误引用触发。"""
+        import importlib
+
+        for mod in ("buddy_checkin.adapters.desktop", "buddy_checkin.adapters.growth"):
+            with self.assertRaises(ModuleNotFoundError):
+                importlib.import_module(mod)
 
 
 if __name__ == "__main__":

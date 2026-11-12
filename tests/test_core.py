@@ -18,8 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from buddy_checkin import config  # noqa: E402
 from buddy_checkin.actions import Actions  # noqa: E402
 from buddy_checkin.adapters.base import ActionResult, DesktopAdapter  # noqa: E402
-from buddy_checkin.adapters.desktop import CuaDriverSigner  # noqa: E402
-from buddy_checkin.adapters.growth import GrowthCenter, parse_hms  # noqa: E402
 from buddy_checkin.scheduler import Scheduler  # noqa: E402
 from buddy_checkin.state import State  # noqa: E402
 from buddy_checkin.timeutil import (  # noqa: E402
@@ -56,8 +54,19 @@ class FakeDesktop(DesktopAdapter):
 
 
 class FakeGrowth:
-    def __init__(self, due: float):
+    """假成长中心：checkin 为状态校验（不再点按钮），其余同旧接口。"""
+
+    def __init__(self, due: float, checkin_ok: bool = True):
         self.due = due
+        self.checkin_ok = checkin_ok
+        self.checkin_calls = 0
+
+    def checkin(self):
+        self.checkin_calls += 1
+        if self.checkin_ok:
+            return ActionResult(True, "checkin", "today recorded in heatmap",
+                                {"confirmed": True, "checked": True, "streak": 10})
+        return ActionResult(False, "checkin", "today NOT recorded", {"confirmed": False})
 
     def claim_gift(self):
         return ActionResult(True, "gift", "ok")
@@ -150,10 +159,13 @@ class ConfigTests(unittest.TestCase):
         cfg = config.load("/nonexistent/config.toml")
         self.assertTrue(cfg["growth"]["enabled"])
         self.assertEqual(cfg["desktop"]["app"], "WorkBuddy")
-        self.assertIn("cua-driver", cfg["desktop"]["cua_driver_bin"])
-        # 唯一外部工具是 CuaDriver：不再有任何 headless 浏览器通道
-        self.assertNotIn("web", cfg)
-        self.assertNotIn("bin", cfg["desktop"])
+        # 默认引擎是 CDP，且指向客户端的 9222 调试端口
+        self.assertEqual(cfg["growth"]["engine"], "browser")
+        self.assertEqual(cfg["growth"]["cdp_port"], 9222)
+        # 旧 CuaDriver / AX 通道的配置键必须已清除
+        self.assertNotIn("cua_driver_bin", cfg["desktop"])
+        self.assertNotIn("cua_driver_bin", cfg["growth"])
+        self.assertNotIn("dom_fallback", cfg)
         scrubbed = config.scrub({"accessToken": "abc", "nested": {"cookie": "x", "ok": 1}})
         self.assertEqual(scrubbed["accessToken"], "<redacted>")
         self.assertEqual(scrubbed["nested"]["cookie"], "<redacted>")
@@ -207,44 +219,43 @@ class ActionsTests(unittest.TestCase):
 
     def test_full_loop_is_idempotent(self):
         growth = FakeGrowth(due=time.time() + 1200)
-        desktop = FakeDesktop()
-        actions = Actions(self.cfg, self.state, desktop, growth=growth)
+        actions = Actions(self.cfg, self.state, None, growth=growth)
         summary = actions.reconcile_all()
         self.assertTrue(summary["ok"])
-        self.assertEqual(desktop.calls, 1)
+        self.assertEqual(growth.checkin_calls, 1)
         self.assertEqual(self.state.kv_get("last_checkin_day"), day_key())
         due = self.state.kv_get_float("travel_due_at")
         self.assertIsNotNone(due)
         self.assertGreater(due, time.time())
 
         actions.reconcile_all()
-        self.assertEqual(desktop.calls, 1)  # 当天不重复签到
+        self.assertEqual(growth.checkin_calls, 1)  # 当天不重复读签到
         # travel_due_at 仍由 growth 的真实倒计时刷新
         self.assertAlmostEqual(self.state.kv_get_float("travel_due_at"),
                                self.state.kv_get_float("travel_due_at"))
 
     def test_unconfirmed_checkin_does_not_write_state(self):
-        """回归（2026-11-10）：按钮找不到只是推测，绝不能写 last_checkin_day，
+        """回归（2026-11-10）：读不到/未记录只是推测，绝不能写 last_checkin_day，
         否则当天所有后续轮询都被跳过，整天漏签。"""
-        actions = Actions(self.cfg, self.state, FakeDesktop(confirmed=False),
-                          growth=FakeGrowth(due=time.time() + 1200))
+        growth = FakeGrowth(due=time.time() + 1200, checkin_ok=False)
+        actions = Actions(self.cfg, self.state, None, growth=growth)
         result = actions.daily_checkin()
         self.assertFalse(result.data.get("confirmed"))
         self.assertIsNone(self.state.kv_get("last_checkin_day"))
-        # 下一轮仍会真正调用桌面端检查，而不是被幂等跳过
+        # 下一轮仍会真正检查，而不是被幂等跳过
         actions.daily_checkin()
-        self.assertEqual(2, actions.desktop.calls)
+        self.assertEqual(2, growth.checkin_calls)
 
     def test_force_claim_then_redispatch_records_due(self):
         due = time.time() + 3
-        actions = Actions(self.cfg, self.state, FakeDesktop(), growth=FakeGrowth(due))
+        actions = Actions(self.cfg, self.state, None, growth=FakeGrowth(due))
         result = actions.travel_tick(force=True)
         self.assertTrue(result.ok)
         self.assertAlmostEqual(self.state.kv_get_float("travel_due_at"), due, places=2)
 
     def test_missing_growth_channel_is_reported(self):
         """growth 未启用时必须明确报错，不能静默吞掉。"""
-        actions = Actions(self.cfg, self.state, FakeDesktop(), growth=None)
+        actions = Actions(self.cfg, self.state, None, growth=None)
         travel = actions.travel_tick()
         self.assertFalse(travel.ok)
         self.assertIn("growth channel not configured", travel.detail)
@@ -365,371 +376,6 @@ class SchedulerTests(unittest.TestCase):
         executed = self.scheduler.run_forever(max_iterations=3)
         self.assertEqual(executed, 3)
         self.assertEqual(set(self.actions.calls), {"checkin", "exchange", "travel"})
-
-
-def desktop_snap(*buttons) -> dict:
-    elements = [{"element_index": 0, "role": "AXWindow", "label": "WorkBuddy"}]
-    elements.extend(buttons)
-    return {"elements": elements, "element_count": len(elements)}
-
-
-class CuaFakeRunner:
-    """按快照序列模拟 cua-driver call，可注入 click 的 path / 错误序列。"""
-
-    def __init__(self, snaps: list[dict] | None = None, *, click_path: str = "ax",
-                 click_results: list[dict] | None = None):
-        self.snaps = list(snaps) if snaps else [desktop_snap()]
-        self.click_path = click_path
-        self.click_results = list(click_results) if click_results else None
-        self.calls: list[list[str]] = []
-        self.snap_count = 0
-
-    def __call__(self, cmd, **_kwargs):
-        self.calls.append(cmd)
-        tool = cmd[2]
-        if tool == "list_windows":
-            out = {"windows": [{
-                "app_name": "WorkBuddy", "pid": 452, "window_id": 66,
-                "is_on_screen": True, "bounds": {"width": 1920, "height": 960},
-            }]}
-        elif tool == "get_window_state":
-            self.snap_count += 1
-            out = self.snaps.pop(0) if len(self.snaps) > 1 else self.snaps[0]
-        elif tool == "click":
-            if self.click_results:
-                out = (self.click_results.pop(0) if len(self.click_results) > 1
-                       else self.click_results[0])
-            else:
-                out = {"effect": "unverifiable", "path": self.click_path, "verified": False}
-        else:
-            out = {}
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(out), stderr="")
-
-
-class CuaDriverTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.cfg = test_cfg(Path(self.tmp.name))
-        self.cfg["desktop"]["cua_driver_bin"] = "/fake/cua-driver"
-        # 大多数用例不需要重试；专门的重试用例会自行调大
-        self.cfg["desktop"]["click_max_attempts"] = 1
-        self.cfg["desktop"]["click_retry_delay_sec"] = 0
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_clicks_checkin_button_and_verifies_disappearance(self):
-        snaps = [
-            desktop_snap({"element_index": 65, "role": "AXButton", "label": "立即领取"}),
-            desktop_snap(),  # 点击后按钮消失
-        ]
-        runner = CuaFakeRunner(snaps)
-        result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
-        self.assertTrue(result.ok)
-        self.assertTrue(result.data["verified"])
-        clicks = [c for c in runner.calls if c[2] == "click"]
-        self.assertEqual(len(clicks), 1)
-        self.assertEqual(json.loads(clicks[0][3]),
-                         {"pid": 452, "window_id": 66, "element_index": 65})
-        self.assertEqual(runner.snap_count, 2)
-
-    def test_opens_collapsed_station_panel_then_clicks_checkin(self):
-        """回归（2026-11-10）：面板收起时 AX 树里只有入口按钮，没有「立即领取」。
-        必须先展开加油站、重新快照定位，否则整天假阳性不签到。"""
-        snaps = [
-            desktop_snap({"element_index": 58, "role": "AXButton", "label": "Buddy加油站"}),
-            desktop_snap({"element_index": 64, "role": "AXButton", "label": "立即领取",
-                          "element_token": "s2:64"}),
-            desktop_snap(),  # 点击签到后按钮消失
-        ]
-        runner = CuaFakeRunner(snaps)
-        result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
-        self.assertTrue(result.ok, result.detail)
-        self.assertTrue(result.data["confirmed"])
-        self.assertTrue(result.data["station_expanded"])
-        clicks = [json.loads(c[3]) for c in runner.calls if c[2] == "click"]
-        self.assertEqual(len(clicks), 2)
-        self.assertEqual(clicks[0]["element_index"], 58)       # 先展开面板
-        self.assertEqual(clicks[1].get("element_token"), "s2:64")  # 重新定位并优先用 token
-
-    def test_no_button_after_expanding_means_already_checked_in(self):
-        snaps = [
-            desktop_snap({"element_index": 58, "role": "AXButton", "label": "Buddy加油站"}),
-            desktop_snap(),  # 展开后仍无领取按钮
-        ]
-        runner = CuaFakeRunner(snaps)
-        result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
-        self.assertTrue(result.ok)
-        self.assertTrue(result.data["confirmed"])
-        self.assertTrue(result.data["already"])
-
-    def test_missing_button_and_entry_is_uncertain_not_checked_in(self):
-        """连入口都找不到：不能推断已签，交给调度器隔一小时再查。"""
-        runner = CuaFakeRunner([desktop_snap()])
-        result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
-        self.assertFalse(result.ok)
-        self.assertFalse(result.data["confirmed"])
-        self.assertTrue(result.data["uncertain"])
-        self.assertFalse(any(c[2] == "click" for c in runner.calls))
-
-    def test_refuses_non_ax_click_path(self):
-        """非 AX 路径会合成鼠标事件把光标甩到左上角，必须拒绝。"""
-        runner = CuaFakeRunner([
-            desktop_snap({"element_index": 65, "role": "AXButton", "label": "立即领取"}),
-        ], click_path="cg_event")
-        result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
-        self.assertFalse(result.ok)
-        self.assertIn("non-AX", result.detail)
-
-    def test_retries_after_stale_ax_element(self):
-        """回归（另一台机器 -25202）：元素引用失效后必须重新快照定位再点。"""
-        self.cfg["desktop"]["click_max_attempts"] = 3
-        btn = {"element_index": 65, "role": "AXButton", "label": "立即领取"}
-        runner = CuaFakeRunner(
-            [desktop_snap(btn), desktop_snap(btn), desktop_snap()],
-            click_results=[
-                {"error": "AX action failed: AXUIElementPerformAction(AXPress) returned -25202"},
-                {"effect": "unverifiable", "path": "ax", "verified": False},
-            ],
-        )
-        result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
-        self.assertTrue(result.ok, result.detail)
-        self.assertTrue(result.data["confirmed"])
-        self.assertEqual(runner.snap_count, 3)
-
-    def test_already_claimed_evidence_is_accepted(self):
-        """展开面板后页面明确显示「今日已领取」= 已签到的强证据。"""
-        runner = CuaFakeRunner([
-            desktop_snap({"element_index": 58, "role": "AXButton", "label": "Buddy加油站"}),
-            desktop_snap({"element_index": 64, "role": "AXButton", "label": "今日已领取"}),
-        ])
-        result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
-        self.assertTrue(result.ok)
-        self.assertTrue(result.data["confirmed"])
-        self.assertEqual(result.data.get("evidence"), "今日已领取")
-
-    def test_conversation_body_mingri_is_not_checkin_evidence(self):
-        """回归（2026-11-12 假阳性）：客户端右侧对话正文里的「明日再来」
-        绝不能被当成页面已签证据。已签判定只在加油站面板区内、只认按钮。"""
-        body = {"element_index": 200, "role": "AXStaticText",
-                "label": "新增「明日再来 / 今日已派完」等文案识别"}
-        runner = CuaFakeRunner([
-            desktop_snap({"element_index": 58, "role": "AXButton", "label": "Buddy加油站"}),
-            desktop_snap(body),  # 展开后：面板区内无领取按钮，正文有「明日再来」
-        ])
-        result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
-        # 面板已展开且面板区内确实无按钮 -> 仍可信已签，但证据不能来自正文
-        self.assertTrue(result.ok)
-        self.assertNotIn("evidence", result.data)  # 没有拿正文当证据
-        self.assertTrue(result.data.get("station_expanded"))
-
-    def test_body_mingri_without_expand_is_uncertain(self):
-        """未展开面板、只有正文含「明日再来」时：状态不确定，不落库。"""
-        body = {"element_index": 200, "role": "AXStaticText",
-                "label": "明日再来（历史聊天）"}
-        runner = CuaFakeRunner([desktop_snap(body)])
-        result = CuaDriverSigner(self.cfg, runner).claim_daily(["立即领取"])
-        self.assertFalse(result.ok)
-        self.assertFalse(result.data.get("confirmed"))
-
-    def test_24h_cooldown_blocks_second_checkin(self):
-        """24 小时口径：距上次真实签到不足 24h 不重复签。"""
-        from buddy_checkin.actions import Actions
-
-        state = State(Path(self.tmp.name) / "cooldown.sqlite3")
-        state.kv_set("last_checkin_at", time.time() - 3600)  # 1 小时前签过
-        actions = Actions(self.cfg, state, FakeDesktop(), growth=None)
-        res = actions.daily_checkin()
-        self.assertTrue(res.ok)
-        self.assertTrue(res.data.get("waiting_cooldown"))
-        self.assertIsNone(state.kv_get("last_checkin_day"))
-        state.close()
-
-
-def growth_snap(labels: list[str]) -> dict:
-    return {
-        "elements": [
-            {"element_index": i, "role": "AXButton", "label": lab}
-            for i, lab in enumerate(labels)
-        ],
-        "element_count": len(labels),
-    }
-
-
-class GrowthFakeRunner:
-    def __init__(self, snaps: list[dict]):
-        self.snaps = list(snaps)
-        self.calls: list[list[str]] = []
-
-    def __call__(self, cmd, **_kwargs):
-        self.calls.append(cmd)
-        tool = cmd[2]
-        if tool == "list_windows":
-            out = {"windows": [{
-                "app_name": "Microsoft Edge", "pid": 446, "window_id": 60,
-                "title": "WorkBuddy - 个人中心", "is_on_screen": True,
-                "bounds": {"width": 1900, "height": 940},
-            }]}
-        elif tool == "get_window_state":
-            out = self.snaps.pop(0) if len(self.snaps) > 1 else self.snaps[0]
-        else:
-            out = {"ok": True}
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(out), stderr="")
-
-
-class GrowthCenterTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.cfg = test_cfg(Path(self.tmp.name))
-        self.cfg["growth"] = {
-            "enabled": True, "cua_driver_bin": "/fake/cua-driver",
-            "browser_app": "Microsoft Edge", "title_hint": "个人中心",
-            "scene": "", "claim_offset_sec": 3,
-        }
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_parse_hms(self):
-        self.assertEqual(parse_hms("旅行倒计时 00:59:56 "), 3596)
-        self.assertEqual(parse_hms("02:15:30"), 8130)
-        self.assertIsNone(parse_hms("预计出行时间为1～4小时"))
-
-    def test_read_state_variants(self):
-        cases = [
-            (["派猫猫旅行", "开启盲盒 8/10"], "idle"),
-            (["旅行倒计时 00:59:56", "Buddy 正在咖啡馆采风中..."], "traveling"),
-            (["领取礼物", "查看 Buddy 图鉴"], "claimable"),
-            (["领取 7 积分", "关闭"], "gift_dialog"),
-            (["确定派出", "预计出行时间为1～4小时"], "scene_dialog"),
-        ]
-        for labels, expected in cases:
-            info = GrowthCenter.read_state(growth_snap(labels))
-            self.assertEqual(info["state"], expected, labels)
-        self.assertEqual(
-            GrowthCenter.read_state(growth_snap(["旅行倒计时 00:17:55"]))["remaining_sec"], 1075
-        )
-
-    def test_dispatch_due_varies_with_real_countdown(self):
-        """核心需求：每次派遣时长不同，到期时间必须按真实倒计时算。"""
-        dues = []
-        for countdown in ("00:59:56", "02:15:30"):
-            runner = GrowthFakeRunner([
-                growth_snap(["派猫猫旅行", "开启盲盒 8/10"]),
-                growth_snap(["确定派出", "咖啡馆", "预计出行时间为1～4小时"]),
-                growth_snap(["旅行倒计时 " + countdown, "Buddy 正在咖啡馆采风中..."]),
-            ])
-            result = GrowthCenter(self.cfg, runner).dispatch()
-            self.assertTrue(result.ok, result.detail)
-            self.assertIn("real duration", result.detail)
-            dues.append(result.data["due_at"])
-        self.assertAlmostEqual(dues[1] - dues[0], 8130 - 3596, delta=5)
-
-    def test_dispatch_scene_dialog_rebuilds_snapshot(self):
-        """回归（2026-11-12）：点「派猫猫旅行」后场景弹窗才出现，
-        定位「确定派出」必须重建快照，不能用弹窗出现前的旧索引。"""
-        main = growth_snap(["派猫猫旅行", "兑换奖励"])
-        scene = growth_snap(["确定派出", "切换到 咖啡馆", "预计出行时间为1～4小时"])
-        traveling = growth_snap(["旅行倒计时 02:59:58", "Buddy 正在采风中"])
-
-        def runner(cmd, **_kw):
-            tool = cmd[2]
-            if tool == "list_windows":
-                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"windows": [
-                    {"app_name": "Microsoft Edge", "pid": 446, "window_id": 60,
-                     "title": "WorkBuddy - 个人中心", "is_on_screen": True,
-                     "bounds": {"width": 1900, "height": 940}},
-                ]}), stderr="")
-            if tool == "get_window_state":
-                # 第1次=dispatch入口取快照(此时idle)；点过派猫猫旅行后=scene_dialog；
-                # 点过确定派出后=traveling
-                dispatch_clicked = any(c[2] == "click" for c in runner_calls)
-                confirm_clicked = len([c for c in runner_calls if c[2] == "click"]) >= 2
-                out = traveling if confirm_clicked else (scene if dispatch_clicked else main)
-                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(out), stderr="")
-            if tool == "click":
-                runner_calls.append(cmd)
-            return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
-
-        runner_calls: list = []
-        # 关掉预刷新，让快照序列只由 dispatch 自己的动作推进，聚焦 scene_dialog
-        cfg = dict(self.cfg)
-        cfg["growth"] = dict(self.cfg["growth"])
-        cfg["growth"]["refresh_before_action"] = False
-        gc = GrowthCenter(cfg, runner=runner)
-        res = gc.dispatch()
-        self.assertTrue(res.ok, res.detail)
-        self.assertIn("real duration", res.detail)
-        self.assertEqual(res.data.get("remaining_sec"), 10798)  # 02:59:58
-
-    def test_scan_exchanges_is_conservative(self):
-        snap = growth_snap([
-            "兑换奖励", "抽奖(0)", "开启盲盒 8/10", "抽奖(2)", "开启盲盒 10/10", "1", "2",
-        ])
-        pairs = GrowthCenter.scan_exchanges(snap)
-        labels = [p[0] for p in pairs]
-        self.assertIn("兑换奖励", labels)
-        self.assertIn("抽奖(2)", labels)
-        self.assertIn("开启盲盒 10/10", labels)
-        self.assertNotIn("抽奖(0)", labels)
-        self.assertNotIn("开启盲盒 8/10", labels)
-        self.assertNotIn("1", labels)  # 补登卡/日期按钮永不自动点
-
-    def test_claim_exchanges_skips_already_claimed(self):
-        runner = GrowthFakeRunner([growth_snap(["兑换奖励", "旅行倒计时 00:10:00"])])
-        gc = GrowthCenter(self.cfg, runner)
-        results = gc.claim_exchanges(claimed_before=lambda _key: True)
-        self.assertEqual(len(results), 1)
-        self.assertTrue(results[0].data["skipped"])
-        self.assertFalse(any(c[2] == "click" for c in runner.calls))
-
-    def test_benefit_exhausted_is_conclusive_not_retried(self):
-        """回归（2026-11-12）：兑换弹窗显示「本月已兑换」= 确定性无法兑换，
-        必须回 ok=True（让兑换线禁用到 23:59），而不是 ok=False 每小时重试。"""
-        win_snap = growth_snap(["兑换奖励", "旅行倒计时 00:10:00"])
-        dialog = growth_snap(["本月已兑换", "还差 3 天", "关闭"])
-        clicked = {"any": False}
-
-        def runner(cmd, **_kw):
-            tool = cmd[2]
-            if tool == "list_windows":
-                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"windows": [
-                    {"app_name": "Microsoft Edge", "pid": 446, "window_id": 60,
-                     "title": "WorkBuddy - 个人中心", "is_on_screen": True,
-                     "bounds": {"width": 1900, "height": 940}},
-                ]}), stderr="")
-            if tool == "get_window_state":
-                out = dialog if clicked["any"] else win_snap
-                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(out), stderr="")
-            if tool == "click":
-                clicked["any"] = True  # 点过「兑换奖励」后进入弹窗
-            return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
-
-        gc = GrowthCenter(self.cfg, runner)
-        results = gc.claim_exchanges(claimed_before=lambda _key: False)
-        self.assertTrue(len(results) >= 1)
-        self.assertTrue(results[-1].ok, results[-1].detail)  # 确定性结论 -> ok
-        self.assertTrue(results[-1].data.get("skipped"))
-        self.assertTrue(results[-1].data.get("conclusive"))
-        self.assertIn("本月已兑换", results[-1].detail)
-
-    def test_traveling_tick_records_due_from_countdown(self):
-        runner = GrowthFakeRunner([growth_snap(["旅行倒计时 00:17:55"])])
-        result = GrowthCenter(self.cfg, runner).tick()
-        self.assertTrue(result.ok)
-        self.assertEqual(result.data["remaining_sec"], 1075)
-        self.assertAlmostEqual(result.data["due_at"], time.time() + 1075 + 3, delta=5)
-
-    def test_actions_persists_growth_due(self):
-        state = State(Path(self.tmp.name) / "growth.sqlite3")
-        try:
-            due = time.time() + 1234
-            actions = Actions(self.cfg, state, FakeDesktop(), growth=FakeGrowth(due))
-            result = actions.travel_tick()
-            self.assertTrue(result.ok)
-            self.assertAlmostEqual(state.kv_get_float("travel_due_at"), due, places=2)
-        finally:
-            state.close()
 
 
 class CliTests(unittest.TestCase):
