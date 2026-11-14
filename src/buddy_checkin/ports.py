@@ -383,6 +383,7 @@ def report(cfg: dict | None = None) -> dict:
             "state": state,
             "detail": detail,
             "listener": f"{info['cmd']} pid={info['pid']}" if info else "",
+            "pid": info["pid"] if info else None,
             "exe_owned": bool(info and info["owned"]),
         })
     res = resolve(cfg)
@@ -403,8 +404,21 @@ def format_report(rep: dict) -> str:
     """把 report() 渲染成给人看的段落。"""
     lines = ["== CDP 端口 =="]
     lines.append(f"  机器            : {rep['machine']}  WorkBuddy {rep['client_version'] or '?'}")
+    res = rep["resolved"]
+    # pgrep -f 会同时命中 --prewarm 之类的 CLI 辅助进程，直接列首项会指错人；
+    # 优先报「真正监听解析端口」的那个 PID。
+    listen_pid = next(
+        (r["pid"] for r in rep["probes"] if r["port"] == res.get("port") and r.get("pid")),
+        None,
+    )
     pids = rep["client_pids"]
-    lines.append(f"  客户端进程      : {', '.join(map(str, pids)) if pids else '未运行'}")
+    if listen_pid:
+        note = f"（监听 {res['port']} 的进程"
+        note += f"；同名 Electron 进程共 {len(pids)} 个，含 CLI/prewarm 辅助）" \
+            if len(pids) > 1 else "）"
+        lines.append(f"  客户端进程      : {listen_pid}{note}")
+    else:
+        lines.append(f"  客户端进程      : {', '.join(map(str, pids)) if pids else '未运行'}")
     env = rep["env"]["port"]
     lines.append(f"  {ENV_KEY} : {env if env else '(未设置)'}")
     act = rep["active_file"]
@@ -419,7 +433,6 @@ def format_report(rep: dict) -> str:
         mark = {"owned": "WorkBuddy ✓", "foreign": "非 WorkBuddy ✗",
                 "closed": "无监听", "unknown": "UA 缺失"}[row["state"]]
         lines.append(f"    {row['port']:<6} {mark:<14} {row['detail'][:70]}")
-    res = rep["resolved"]
     if res["ok"]:
         lines.append(f"  判定            : 使用 {res['port']}（来源 {res['source']}）")
     else:
