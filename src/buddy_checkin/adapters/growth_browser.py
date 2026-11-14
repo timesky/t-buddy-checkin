@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 import os
 import re
 import shutil
@@ -30,8 +31,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .base import ActionResult
+from ..timeutil import day_key
 
 ROOT = Path(__file__).resolve().parents[3]
+logger = logging.getLogger(__name__)
 
 # 页面状态判定用的按钮文案（与旧 AX 版保持一致，避免行为漂移）
 COUNTDOWN_RE = re.compile(r"(\d{1,2}):([0-5]\d):([0-5]\d)")
@@ -136,6 +139,9 @@ class GrowthBrowser:
         self.block: tuple[str, str] | None = None
         self.last_close_ok: bool = False
         self._owner_ok: bool = False
+        self._stale_hits: int = 0
+        self._last_open_errors: list[str] = []
+        self._last_open_clicked: bool = False
         self._depth: int = 0
         self._opened_this_run: bool = False
 
@@ -371,29 +377,19 @@ class GrowthBrowser:
             time.sleep(0.6)
         return False
 
-    def ensure_page(self) -> ActionResult:
-        """确保成长中心 iframe 存在且已渲染；不存在就从客户端入口打开。"""
-        if self._iframe_ws():
-            ready = self._wait_page_ready()
-            return ActionResult(True, "growth_open", "page already open",
-                                {"opened": False, "ready": ready})
-        if not self.available():
-            code, msg = self.block or ("cdp_unavailable", "")
-            return ActionResult(False, "growth_open", msg, {"blocked": code})
-
-        if not self._ensure_connected():
-            return ActionResult(False, "growth_open", "agent-browser connect failed")
-
-        labels = ["成长计划"] + list((self.cfg.get("growth", {}) or {}).get("open_labels") or [])
-        opened = False
+    def _open_via_labels(self, labels: list[str]) -> ActionResult | None:
+        """依次点入口文案打开成长中心；全部失败返回 None 并记下原因。"""
+        fails: list[str] = []
+        clicked_any = False
         for label in labels:
             ok, detail = self._click_label(label)
             if not ok:
+                fails.append(f"{label}: {detail}")
                 continue
+            clicked_any = True
             time.sleep(1.0)
             # 点入口后会出现「立即前往」
             ok2, _ = self._click_label("立即前往", attempts=2)
-            opened = True
             if not ok2:
                 # 有些版本入口直接打开页面，无需二次点击
                 time.sleep(1.5)
@@ -407,12 +403,68 @@ class GrowthBrowser:
                         {"opened": True, "entry": label, "ready": ready},
                     )
                 time.sleep(0.5)
-            _ = detail
-        return ActionResult(
-            False, "growth_open",
-            "opened entry but growth-center iframe never appeared" if opened
-            else "no growth entry found in client",
+            fails.append(f"{label}: clicked but iframe never appeared")
+        self._last_open_errors = fails
+        self._last_open_clicked = clicked_any
+        return None
+
+    def _looks_like_client(self) -> bool:
+        """快照里能否看到 WorkBuddy 客户端窗口。"""
+        code, out = self._ab("snapshot", "-i", timeout=45)
+        return code == 0 and "workbuddy" in out.lower()
+
+    def _maybe_self_heal(self) -> None:
+        """连续多轮连客户端窗口都看不到，判定 agent-browser 会话坏了，退出进程。
+
+        2026-11-14 事故：客户端从 5.11.2 静默升级到 5.11.3 并重启，daemon 里
+        长驻的 agent-browser 会话仍指向旧窗口，之后 8 小时每轮都报
+        "no growth entry found in client"，自己不会好；手动重启进程立刻恢复。
+        daemon 由 launchd KeepAlive 托管，退出后秒级拉起即重建会话。
+        """
+        if self._looks_like_client():
+            self._stale_hits = 0
+            return
+        self._stale_hits += 1
+        logger.warning(
+            "agent-browser 看不到 WorkBuddy 窗口（连续 %d 次），疑似客户端升级/重启后"
+            "会话失效", self._stale_hits,
         )
+        if self._stale_hits >= 3:
+            logger.error("会话连续失效 3 轮，退出进程交由 launchd 重建：%s",
+                         self._last_open_errors)
+            raise SystemExit(75)
+
+    def ensure_page(self) -> ActionResult:
+        """确保成长中心 iframe 存在且已渲染；不存在就从客户端入口打开。"""
+        if self._iframe_ws():
+            ready = self._wait_page_ready()
+            return ActionResult(True, "growth_open", "page already open",
+                                {"opened": False, "ready": ready})
+        if not self.available():
+            code, msg = self.block or ("cdp_unavailable", "")
+            return ActionResult(False, "growth_open", msg, {"blocked": code})
+
+        labels = ["成长计划"] + list((self.cfg.get("growth", {}) or {}).get("open_labels") or [])
+        self._last_open_errors = []
+        self._last_open_clicked = False
+        for attempt in range(2):
+            if not self._ensure_connected():
+                return ActionResult(False, "growth_open", "agent-browser connect failed")
+            res = self._open_via_labels(labels)
+            if res is not None:
+                self._stale_hits = 0
+                return res
+            if attempt == 0:
+                # 客户端升级/重启后会话可能还指着旧窗口：重连一次再试
+                self._ab("connect", str(self.port), timeout=60)
+
+        self._maybe_self_heal()
+        detail = ("opened entry but growth-center iframe never appeared"
+                  if self._last_open_clicked
+                  else "no growth entry found in client")
+        if self._last_open_errors:
+            detail += "（" + "; ".join(self._last_open_errors)[:240] + "）"
+        return ActionResult(False, "growth_open", detail)
 
     # ---- 页面状态读取 -------------------------------------------------------
     READ_JS = r"""
@@ -445,22 +497,43 @@ class GrowthBrowser:
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
   const today = document.querySelector('.gs-cal-cell.is-today');
   const cells = [...document.querySelectorAll('.gs-cal-cell')];
-  let checked = false, bg = '';
+  let checked = false, bg = '', day_label = '';
   if (today) {
     bg = getComputedStyle(today).backgroundColor || '';
     checked = today.classList.contains('is-checked') || /111,\s*229,\s*198/.test(bg);
+    day_label = norm(today.textContent || today.getAttribute('aria-label') || '');
+  }
+  // 跨零点假阳性守卫：刚过 0 点时页面可能还没切日，is-today 仍指向前一天。
+  // 2026-11-13 00:00:51 就是这样把 11-12 的 streak=10d 当成了 11-13 已签到，
+  // 导致当天不再检查、真漏签。
+  // 实测（5.11.3）：今日格子的文本是「今日」而非日号，但它的**前一个兄弟格子**
+  // 就是昨天，文本为日号（今天 14 号 → prev 是 "13"）。用 prev 与「今天-1」比对
+  // 即可判断日历是否已经切日；1 号则比对 28~31（上月最后一天）。
+  const prev = today ? today.previousElementSibling : null;
+  const prev_txt = prev ? norm(prev.textContent) : '';
+  const prev_num = /^\d{1,2}$/.test(prev_txt) ? parseInt(prev_txt, 10) : null;
+  const expected = %d;
+  let switched = true;
+  if (today && prev_num !== null) {
+    if (expected >= 2) switched = (prev_num === expected - 1);
+    else switched = (prev_num >= 28 && prev_num <= 31);
   }
   const makeup = cells
     .filter(c => c.classList.contains('is-broken'))
     .map(c => norm(c.textContent));
   const m = norm(document.body.innerText).match(/当前连续登录\s*(\d+)\s*天/);
   return JSON.stringify({
-    has_today: !!today, checked, bg, makeup,
+    has_today: !!today, checked, bg, makeup, switched, day_label,
     streak: m ? parseInt(m[1], 10) : null,
     days: cells.length
   });
 })()
 """
+
+    def _checkin_js(self) -> str:
+        """把北京时间的今天日号注入签到判定脚本（跨零点守卫用）。"""
+        day = int(day_key().rsplit("-", 1)[-1])
+        return self.CHECKIN_JS % day
 
     def read_state(self) -> dict:
         ok, val = self._eval(self.READ_JS)
@@ -476,7 +549,7 @@ class GrowthBrowser:
 
     def checkin_status(self) -> dict:
         """读活跃地图判定今天是否已打卡（签到）。"""
-        ok, val = self._eval(self.CHECKIN_JS)
+        ok, val = self._eval(self._checkin_js())
         if not ok:
             return {"ok": False, "detail": str(val)}
         info = val if isinstance(val, dict) else {}
@@ -484,6 +557,8 @@ class GrowthBrowser:
             "ok": True,
             "checked": bool(info.get("checked")),
             "has_today": bool(info.get("has_today")),
+            "switched": bool(info.get("switched", True)),
+            "day_label": info.get("day_label") or "",
             "streak": info.get("streak"),
             "makeup": info.get("makeup") or [],
             "bg": info.get("bg"),
@@ -840,6 +915,15 @@ class GrowthBrowser:
         if not st.get("ok"):
             return ActionResult(False, "checkin", f"read heatmap failed: {st.get('detail')}",
                                 {"confirmed": False})
+        if not st.get("switched", True):
+            # 日历还没切到今天：此刻读到的绿色格子是昨天的，绝不能据此落库
+            # （2026-11-13 00:00:51 就是这样误判，导致 11-13 真漏签）
+            return ActionResult(
+                False, "checkin",
+                f"calendar still on {st.get('day_label') or 'previous day'}; "
+                f"wait for date rollover before judging",
+                {"confirmed": False, "switched": False,
+                 "day_label": st.get("day_label")})
         streak = st.get("streak")
         makeup = st.get("makeup") or []
         data = {"confirmed": bool(st.get("checked")), "checked": st.get("checked"),
