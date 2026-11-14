@@ -9,7 +9,7 @@ import sys
 import threading
 from pathlib import Path
 
-from . import config
+from . import config, launchd, ports
 from .actions import Actions
 from .adapters.fuel_card import FuelCard
 from .adapters.growth_browser import GrowthBrowser
@@ -21,6 +21,24 @@ from .timeutil import format_ts
 
 ROOT = Path(__file__).resolve().parents[2]
 logger = logging.getLogger("buddy-checkin")
+
+
+def inject_port(cfg: dict) -> ports.Resolution:
+    """把「客户端实际用的 CDP 端口」注入配置 —— 全流程唯一的端口来源。
+
+    客户端端口由启动时的环境变量决定，可能与本机 config.toml 不同（另一台
+    机器是 9223）。这里先探一遍真实状态，再下发；各适配器不再各自兜底 9222。
+    """
+    res = ports.resolve(cfg)
+    growth = cfg.setdefault("growth", {})
+    if res.ok:
+        if growth.get("cdp_port") != res.port:
+            logger.info("cdp: %s 端口 %s → %s（来源 %s）",
+                        ports.ENV_KEY, growth.get("cdp_port"), res.port, res.source)
+        growth["cdp_port"] = res.port
+    growth["cdp_port_source"] = res.source if res.ok else "none"
+    return res
+
 
 # 依赖 WorkBuddy：本技能运行在 WorkBuddy agent 内会消耗模型额度，必须运行在免费模型下。
 # 脚本无法读取当前选中的模型，所以以环境变量 BUDDY_FREE_MODEL=1 作为运维侧显式确认。
@@ -184,8 +202,9 @@ def cmd_status(cfg: dict, args: argparse.Namespace) -> int:
     print(f"今日(北京时间)      : {config.scrub(state.kv_get('last_checkin_day')) or '未签到'}")
     g = cfg.get("growth", {}) or {}
     engine = (g.get("engine") or "browser").strip().lower()
-    port = g.get("cdp_port", 9222)
-    print(f"成长中心引擎        : {engine} (cdp_port={port})")
+    port = g.get("cdp_port", ports.DEFAULT_PORT)
+    src = g.get("cdp_port_source", "?")
+    print(f"成长中心引擎        : {engine} (cdp_port={port}, 来源 {src})")
     if engine == "browser":
         gb = GrowthBrowser(cfg)
         alive = gb.available()
@@ -226,6 +245,17 @@ def cmd_daemon(cfg: dict, args: argparse.Namespace) -> int:
         signal.signal(signal.SIGINT, _stop)
     except (ImportError, ValueError):
         pass
+    # 端口：daemon 是 launchd job，具有 gui 域写权限，能替我们把端口 setenv
+    # 并落进 cdp-env plist（agent 自己的 shell 没这个权限，实测 setenv 返回
+    # "Not privileged to set domain environment."）。这一步保证「重启电脑后端口不丢」。
+    try:
+        env_res = ports.ensure_env(cfg)
+        logger.info("端口落地：%s", json.dumps(env_res, ensure_ascii=False)[:240])
+        if not env_res.get("setenv"):
+            logger.warning("setenv 未成功（%s）；下次登录由 plist 自动加载补偿",
+                           env_res.get("setenv_error", "?"))
+    except Exception as exc:  # noqa: BLE001 - 端口落盘失败不该阻断任务
+        logger.warning("端口落地失败：%s", exc)
     # 重启不受静默控制：initial_jobs 让五个任务立刻各跑一遍（真实状态复核），
     # 只有复核后仍全部终态才重新静默。账本里写错的 done 会在这一轮被纠正。
     print("[daemon] started: 五个任务(签到/补签/兑换/抽奖/派遣)立即各复核一遍；"
@@ -244,10 +274,10 @@ def cmd_inspect(cfg: dict, args: argparse.Namespace) -> int:
     是客户端没带调试端口、页面没打开、还是签到未记录。
     """
     g = cfg.get("growth", {}) or {}
-    port = g.get("cdp_port", 9222)
+    port = g.get("cdp_port", ports.DEFAULT_PORT)
     gb = GrowthBrowser(cfg)
     print("== CDP 诊断 ==")
-    print(f"  port            : {port}")
+    print(f"  port            : {port}（来源 {g.get('cdp_port_source', '?')}）")
     print(f"  agent-browser   : {gb.ab_bin or '未找到（tools/node_modules/.bin/agent-browser）'}")
     print(f"  node            : {gb.node_bin or '未找到'}")
     print(f"  cdp_client.mjs  : {gb.cdp_js} {'OK' if gb.cdp_js.exists() else 'MISSING'}")
@@ -262,11 +292,11 @@ def cmd_inspect(cfg: dict, args: argparse.Namespace) -> int:
         code, msg = gb.block or ("cdp_unavailable", "unknown")
         print(f"  ✗ CDP 不可达（{code}）：{msg}")
         if code == "cdp_port_foreign":
-            print("    该端口被其它浏览器/Electron 应用占用，换成 WorkBuddy 的调试端口再试：")
-            print(f"    launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT {port} 并重启客户端")
+            print("    该端口被其它浏览器/Electron 应用占用。先看端口全貌，再协商空闲端口：")
+            print("    ./run.sh ports status")
+            print("    ./run.sh ports negotiate --apply   # 写端口并提示重启客户端")
             return 1
-        print("    修复：launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT "
-              f"{port} && 重启 WorkBuddy 客户端")
+        print("    先确认客户端在跑且开了调试端口：./run.sh ports status")
         return 1
 
     fc = FuelCard(cfg)
@@ -332,40 +362,93 @@ def cmd_inspect(cfg: dict, args: argparse.Namespace) -> int:
 
 
 def cmd_install_launchd(cfg: dict, args: argparse.Namespace) -> int:
-    """只写 plist，不自动 load —— 加载动作留给你确认。"""
-    script = ROOT / "run.sh"
-    plist_path = Path.home() / "Library/LaunchAgents/com.local.buddy-web-checkin.plist"
-    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    """写 daemon plist（默认不加载），顺带把端口持久化到登录项。
+
+    端口持久化是必须的：手动 `launchctl setenv` 只活在当次登录会话里，
+    重启电脑就丢；另一台机器 9223 之所以稳定，是因为它的 cdp-env plist 已加载。
+    """
     log_path = config.expand("~/.local/share/buddy-web-checkin/daemon.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.local.buddy-web-checkin</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>BUDDY_FREE_MODEL</key><string>1</string>
-  </dict>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/sh</string>
-    <string>{script}</string>
-    <string>daemon</string>
-  </array>
-  <key>WorkingDirectory</key><string>{ROOT}</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>{log_path}</string>
-  <key>StandardErrorPath</key><string>{log_path}</string>
-</dict>
-</plist>
-"""
-    plist_path.write_text(plist, encoding="utf-8")
-    print(f"[install] wrote {plist_path}")
-    print("[install] 未自动加载。确认后执行：")
-    print(f"  launchctl bootstrap gui/$(id -u) {plist_path}")
+    load_now = bool(getattr(args, "load", False))
+    res = launchd.install_daemon(ROOT, log_path, do_bootstrap=load_now)
+    print(f"[install] wrote {res['path']} (mode {res['mode']})")
+    if load_now:
+        boot = res.get("bootstrap") or {}
+        if boot.get("ok"):
+            print("[install] bootstrap OK，守护已加载")
+        else:
+            print(f"[install] bootstrap 失败：{boot.get('error', '')}")
+    else:
+        print("[install] 未自动加载。确认后执行：")
+        print(f"  launchctl bootstrap gui/$(id -u) {res['path']}")
+        print("  （若报 `Bootstrap failed: 5`，多为同 label 已加载：先 "
+              f"`launchctl bootout gui/$(id -u)/{launchd.DAEMON_LABEL}` 再 bootstrap）")
+
+    port_res = ports.resolve(cfg)
+    port = port_res.port
+    pinfo = launchd.install_cdp_env(port)
+    print(f"[install] 端口持久化 {pinfo['path']} → {port}")
+    if launchd.loaded(launchd.CDP_ENV_LABEL):
+        print("[install] cdp-env 已加载：重启电脑后端口自动恢复")
+    else:
+        print("[install] cdp-env 尚未加载 —— 它会在**下次登录**被 launchd 自动加载。")
+        print("          想让本次会话立刻生效，二选一：")
+        print(f"            launchctl bootstrap gui/$(id -u) {pinfo['path']}   # 在终端里跑")
+        print("            重启 daemon（它启动时会 launchctl setenv，见 daemon 日志）")
     return 0
+
+
+def cmd_ports(cfg: dict, args: argparse.Namespace) -> int:
+    """端口只读报告 / 协商。跨机器排查时把 `ports status` 的输出整段贴回来即可。"""
+    action = getattr(args, "action", "status")
+    if action == "status":
+        rep = ports.report(cfg)
+        print(ports.format_report(rep))
+        cs = launchd.service_state(launchd.CDP_ENV_LABEL)
+        path = launchd.cdp_env_plist_path()
+        if cs.get("loaded"):
+            persisted = "已加载"
+        elif path.exists():
+            persisted = "已写入（下次登录由 launchd 自动加载）"
+        else:
+            persisted = "未写入 —— 重启电脑后端口会丢"
+        print(f"  端口持久化      : {persisted}  ({path})")
+        if cs.get("loaded") and rep["env"]["port"] is None:
+            print("                    ⚠️ plist 已加载但域环境里读不到端口，建议重跑 "
+                  "`ports negotiate --apply`")
+        return 0 if rep["resolved"]["ok"] else 1
+
+    plan = ports.negotiate(cfg)
+    pin_port = getattr(args, "port", None)
+    if pin_port:
+        plan = ports.pin(cfg, int(pin_port))
+    print(f"  建议     : {plan['action']}  端口 {plan['port']}")
+    print(f"  原因     : {plan['reason']}")
+    if plan.get("needs_restart"):
+        print("  生效条件 : 需要重启 WorkBuddy 客户端（本工具不会自动重启，避免打断会话）")
+    apply_now = bool(getattr(args, "apply", False))
+    if not apply_now:
+        print("\n  （dry-run：未改动任何文件。加 --apply 落盘）")
+        return 1 if plan["action"] in ("client_not_running", "no_free_port") else 0
+    if plan["action"] in ("client_not_running", "no_free_port"):
+        print("  未落盘：先满足上面的前置条件")
+        return 1
+    done = ports.apply_port(cfg, plan["port"])
+    print("\n  已落盘：")
+    setenv_ok = bool(done.get("setenv"))
+    print(f"    launchctl setenv : {'OK' if setenv_ok else '未生效 ' + done.get('setenv_error', '')}")
+    if not setenv_ok:
+        print("      （agent 进程没有 gui 域写权限是正常的：daemon 启动时会补 setenv，"
+              "或下次登录由 plist 自动加载）")
+    pl = done.get("plist") or {}
+    print(f"    cdp-env plist    : {'OK' if pl.get('ok') else '失败 ' + str(pl.get('error', ''))}  "
+          f"{pl.get('path', '')}")
+    print(f"    config.toml      : {'已更新' if done.get('config') else '未改动'}  "
+          f"{done.get('config_path', '')}")
+    if plan.get("needs_restart"):
+        print("\n  下一步：重启 WorkBuddy 客户端，然后 ./run.sh ports status 复核")
+    return 0
+
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -382,8 +465,16 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="只读状态：账本 + 各任务下次检查时间")
     sub.add_parser("inspect", help="只读诊断：CDP/签到服务端状态/补签/抽奖（跨机器排查）")
     sub.add_parser("daemon", help="统一常驻进程：五个任务滚动，全终态静默到 23:59")
-    sub.add_parser("install-launchd", help="写 LaunchAgent plist（开机常驻，不自动加载）")
+    il = sub.add_parser("install-launchd", help="写 LaunchAgent plist（端口持久化 + 开机常驻）")
+    il.add_argument("--load", action="store_true", help="写完直接 bootstrap 加载（默认只写）")
     sub.add_parser("model-check", help="show free-model policy and current acknowledgment state")
+    # 端口：只读报告 / 协商空闲端口
+    prt = sub.add_parser("ports", help="CDP 调试端口：status 只读报告 / negotiate 协商空闲端口")
+    prt_sub = prt.add_subparsers(dest="action", required=True)
+    prt_sub.add_parser("status", help="打印端口全貌与判定（跨机器排查时贴这段）")
+    neg = prt_sub.add_parser("negotiate", help="给出建议端口；加 --apply 才落盘")
+    neg.add_argument("--apply", action="store_true", help="真正写入 setenv + plist + config.toml")
+    neg.add_argument("--port", type=int, help="指定端口（脚本传参用）；不给则自动挑空闲端口")
     # 第三方依赖：安装技能时必跑 deps check，确认 CuaDriver 已安装并授权
     dep = sub.add_parser("deps", help="第三方依赖检查（安装技能时必跑）")
     dep_sub = dep.add_subparsers(dest="action", required=True)
@@ -400,10 +491,13 @@ def main(argv: list[str] | None = None) -> int:
     # 依赖 WorkBuddy：执行前必须确认运行在免费模型下（model-check / deps /
     # install-launchd / inspect 属本地运维或只读诊断，不消耗模型额度，放行；
     # plist 内已内置 BUDDY_FREE_MODEL=1，daemon 运行时仍受闸门约束）
-    if args.command not in ("model-check", "deps", "install-launchd", "inspect"):
+    if args.command not in ("model-check", "deps", "install-launchd", "inspect", "ports"):
         rc = preflight_model_check(cfg)
         if rc:
             return rc
+    # 端口：任何需要 CDP 的命令都先探真实端口再下发（唯一注入点）
+    if args.command not in ("model-check", "ports"):
+        inject_port(cfg)
     handlers = {
         "checkin-now": cmd_checkin_now,
         "makeup-now": cmd_makeup_now,
@@ -416,6 +510,7 @@ def main(argv: list[str] | None = None) -> int:
         "inspect": cmd_inspect,
         "daemon": cmd_daemon,
         "install-launchd": cmd_install_launchd,
+        "ports": cmd_ports,
         "model-check": cmd_model_check,
         "deps": cmd_deps,
     }

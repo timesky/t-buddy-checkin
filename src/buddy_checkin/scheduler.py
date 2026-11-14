@@ -142,6 +142,13 @@ class Scheduler:
         """
         out: dict[str, str] = {}
         self._next_at.clear()
+        # 客户端可能已重启换端口：每轮自检先重探一次，避免整轮打在旧端口上
+        refresh = getattr(self.actions, "refresh_port", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("port refresh failed: %s", exc)
         session = getattr(self.actions, "growth_session", None)
         ctx = session() if callable(session) else contextlib.nullcontext()
         with ctx:

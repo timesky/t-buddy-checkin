@@ -79,9 +79,12 @@ DEFAULTS: dict[str, Any] = {
         "enabled": True,
         # browser(默认, CDP) | ax(历史 CuaDriver 通道，仅回退排查时显式启用)
         "engine": "browser",
-        # WorkBuddy 客户端调试端口：需 WORKBUDDY_REMOTE_DEBUGGING_PORT 环境变量
-        # 与客户端重启配合（见 scripts/launch-workbuddy-debug.sh）
+        # WorkBuddy 客户端调试端口。语义已降级为「回退值」：
+        # 运行时优先跟随客户端自报的 DevToolsActivePort 与 gui 域环境变量，
+        # 只有两者都拿不到时才用它（详见 ports.py）。
         "cdp_port": 9222,
+        # 协商时按顺序找空闲端口的区间 [起, 止]
+        "cdp_port_range": [9222, 9242],
         # agent-browser 可执行文件；留空按 tools/node_modules/.bin → PATH 顺序探测
         "agent_browser_bin": "",
         # 从客户端侧栏打开成长中心的入口文案（依次尝试）
@@ -132,10 +135,15 @@ def load(path: str | Path | None = None) -> dict[str, Any]:
     """未指定路径时读项目根 config.toml；不存在则使用纯默认配置。"""
     cfg_path = expand(path) if path else DEFAULT_CONFIG_PATH
     if not cfg_path.exists():
-        return copy.deepcopy(DEFAULTS)
+        cfg = copy.deepcopy(DEFAULTS)
+        cfg["_config_path"] = str(cfg_path)
+        return cfg
     with cfg_path.open("rb") as fh:
         user_cfg = tomllib.load(fh) or {}
-    return _merge(DEFAULTS, user_cfg)
+    cfg = _merge(DEFAULTS, user_cfg)
+    # 记录实际读的文件，端口协商落盘时才知道该改哪个（不参与 merge）
+    cfg["_config_path"] = str(cfg_path)
+    return cfg
 
 
 def state_db_path(cfg: dict) -> Path:

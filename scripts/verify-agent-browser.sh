@@ -1,11 +1,17 @@
 #!/bin/zsh
 # CDP 链路验证：连上 WorkBuddy 客户端 → 列出 targets → 读成长中心状态
-# 前置：launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT 9222 且客户端已重启
+# 前置：客户端已带 WORKBUDDY_REMOTE_DEBUGGING_PORT 启动（./run.sh ports status 可确认）
 # 用法：./scripts/verify-agent-browser.sh [port]
+#   不给端口时取客户端自报的 DevToolsActivePort（跟随客户端实际端口）
 
 set -u
-PORT="${1:-9222}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PORT="${1:-}"
+if [ -z "$PORT" ]; then
+  PF="$HOME/.workbuddy/app/session/DevToolsActivePort"
+  [ -f "$PF" ] && PORT="$(head -1 "$PF" | tr -d '[:space:]')"
+fi
+PORT="${PORT:-9222}"
 AB="$ROOT/tools/node_modules/.bin/agent-browser"
 
 step() { echo "\n===== $* ====="; }
@@ -17,9 +23,8 @@ if [ ! -x "$AB" ]; then
 fi
 "$AB" --version 2>&1 | tail -1
 if ! curl -s -m 2 "http://127.0.0.1:$PORT/json/version" | grep -q "Browser"; then
-  echo "FAIL: CDP 未就绪（port $PORT）。先执行："
-  echo "  launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT $PORT"
-  echo "  然后重启客户端，或跑 $ROOT/scripts/launch-workbuddy-debug.sh"
+  echo "FAIL: CDP 未就绪（port $PORT）。先看端口全貌：$ROOT/run.sh ports status"
+  echo "  需要重挂端口并重启客户端：$ROOT/scripts/launch-workbuddy-debug.sh $PORT"
   exit 2
 fi
 echo "OK: CDP alive"

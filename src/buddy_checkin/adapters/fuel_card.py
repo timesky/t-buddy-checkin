@@ -55,9 +55,11 @@ class FuelCard:
     """操作主窗口左下角浮层的签到卡片（CDP，不抢焦点）。"""
 
     def __init__(self, cfg: dict) -> None:
-        g = cfg.get("growth", {}) or {}
         self.cfg = cfg
-        self.port = int(g.get("cdp_port", 9222))
+        # 端口由 cli.inject_port() 注入；这里只做回退取值
+        from .. import ports
+
+        self.port = ports.config_port(cfg)
         self.node_bin = self._resolve_node()
         self.cdp_js = ROOT / "tools" / "cdp_client.mjs"
         self.block: tuple[str, str] | None = None

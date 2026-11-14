@@ -25,10 +25,10 @@ cd tools && npm install && cd ..    # agent-browser（必需）+ agent-desktop�
 | Python ≥ 3.11 | ✅ | 标准库 tomllib / sqlite3 / zoneinfo |
 | node ≥ 20 | ✅ | 跑 `tools/cdp_client.mjs`（CDP 桥） |
 | agent-browser | ✅ | 跨 webContents 聚合快照/点击，打开成长中心 |
-| WorkBuddy CDP 端口 | ✅ | `launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT 9222` + 重启客户端 |
+| WorkBuddy CDP 端口 | ✅ | 端口自适应（跟随客户端自报的 `DevToolsActivePort`）；缺失时 `ports negotiate --apply` + 重启客户端 |
 | agent-desktop | 可选 | AX 兜底，需给启动它的 App 授权辅助功能 |
 
-CDP 端口是全新安装最容易漏的一步：客户端**不认** `--remote-debugging-port` 启动参数，只认环境变量。跑 `scripts/launch-workbuddy-debug.sh` 会自动 setenv → 优雅退出 → 重启 → 探测端口 → 列出 targets。
+CDP 端口是全新安装最容易漏的一步：客户端**不认** `--remote-debugging-port` 启动参数，只认环境变量，且端口被占时没有任何回退。先 `./run.sh ports status` 看全貌（它会把每个候选端口的归属标出来），需要换端口用 `./run.sh ports negotiate --apply`，再重启客户端；`install-launchd` 会把端口写进登录项，避免重启电脑后失效。
 
 ## 用法
 
@@ -46,7 +46,9 @@ CDP 端口是全新安装最容易漏的一步：客户端**不认** `--remote-d
 | `travel-now` | 派遣一轮（领礼物→派遣→读真实倒计时） | 否 |
 | `once` / `verify` | 按账本跑完五个任务（= 一次重启自检） | 否 |
 | `daemon` | 常驻：五个任务滚动，全终态静默到 23:59 | 否 |
-| `install-launchd` | 写 LaunchAgent plist（RunAtLoad+KeepAlive） | 加载命令由你确认 |
+| `install-launchd` | 写 daemon plist + 端口持久化（`--load` 立即加载） | 加载命令由你确认 |
+| `ports status` | 端口全貌与判定（只读；跨机器排查把这段贴回即可） | 否 |
+| `ports negotiate` | 协商空闲端口（`--apply` 落盘，需重启客户端生效） | 落盘可选 |
 | `model-check` | 查看免费模型策略与确认状态 | 否 |
 
 ## 签到语义（2026-11-14 更正，重要）

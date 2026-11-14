@@ -1,58 +1,67 @@
 #!/bin/zsh
-# 用 --remote-debugging-port 重启 WorkBuddy 客户端，供 agent-browser (CDP) 连接。
-# 用途：browser 引擎在客户端内嵌 webview 上 DOM 级操作签到/领礼物/派遣/兑换/抽奖。
-# 安全：优雅退出（osascript，保存会话）；若带参数启动失败，自动不带参数拉起客户端兜底。
-
+# 让 WorkBuddy 客户端暴露 CDP 调试端口（供 agent-browser / 本技能连接）。
+#
+# 关键事实（2026-11-14 读 app.asar + 两台 5.11.3 实测）：
+#   - 客户端启动时只读一次 WORKBUDDY_REMOTE_DEBUGGING_PORT（正则 /^\d+$/），
+#     然后 appendSwitch('remote-debugging-port', n)；
+#     命令行参数 --remote-debugging-port 会被忽略，别再用 open --args 那套。
+#   - 端口被占时**没有任何回退**，Chromium 直接起不来调试服务。
+#   - 手动 launchctl setenv 只活在当次登录会话，重启电脑就丢；
+#     持久化靠 com.local.workbuddy-cdp-env 这个 LaunchAgent。
+#
+# 用法：./scripts/launch-workbuddy-debug.sh [port]
+#   不给端口时依次取：客户端自报的 DevToolsActivePort → 9222
 set -u
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="WorkBuddy"
-PORT="${1:-9222}"
-CDP_URL="http://127.0.0.1:$PORT/json/version"
-LIST_URL="http://127.0.0.1:$PORT/json/list"
+PORT="${1:-}"
+PORT_FILE="$HOME/.workbuddy/app/session/DevToolsActivePort"
 
-cdp_ok() { curl -s -m 2 "$CDP_URL" 2>/dev/null | grep -q '"webSocketDebuggerUrl"\|"Browser"'; }
+cdp_ok() { curl -s -m 2 "http://127.0.0.1:$1/json/version" 2>/dev/null | grep -q '"Browser"'; }
 
-# 0) 设置 WorkBuddy 官方 CDP 环境变量（主进程读 WORKBUDDY_REMOTE_DEBUGGING_PORT）
-#    在 iTerm/Terminal 里运行本脚本时有权限；从受限上下文调用失败则提示手动执行。
-launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT "$PORT" 2>/dev/null || {
-  echo "NOTE: launchctl setenv 被拒绝。请在 iTerm 里先手动执行一次："
-  echo "      launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT $PORT"
-  [ "$(launchctl getenv WORKBUDDY_REMOTE_DEBUGGING_PORT 2>/dev/null)" = "$PORT" ] || exit 3
-}
+if [ -z "$PORT" ] && [ -f "$PORT_FILE" ]; then
+  PORT="$(head -1 "$PORT_FILE" | tr -d '[:space:]')"
+fi
+PORT="${PORT:-9222}"
 
-# 1) 已带调试端口运行 → 直接成功
-if cdp_ok; then
+if cdp_ok "$PORT"; then
   echo "OK: CDP already listening on port $PORT"
   exit 0
 fi
 
-# 2) 优雅退出客户端
+# 1) 写端口：setenv 立即生效 + plist 保证重启后仍在 + 同步 config.toml
+echo "Pinning CDP port $PORT ..."
+"$ROOT/run.sh" ports negotiate --apply --port "$PORT" || {
+  echo "FAIL: 端口写入失败（多半是 $PORT 已被别的程序占用）。先看："
+  echo "  $ROOT/run.sh ports status"
+  exit 3
+}
+
+# 2) 优雅退出客户端（保存会话，不强杀）
 echo "Quitting $APP gracefully..."
 osascript -e "tell application \"$APP\" to quit" 2>/dev/null || true
-for i in {1..15}; do
+for i in {1..20}; do
   sleep 1
   pgrep -x "$APP" >/dev/null 2>&1 || break
-  if [ "$i" -eq 15 ]; then
-    echo "WARN: $APP still running after 15s; aborting to avoid force-kill."
+  if [ "$i" -eq 20 ]; then
+    echo "WARN: $APP still running after 20s; aborting to avoid force-kill."
     exit 1
   fi
 done
 sleep 2
 
-# 3) 带调试端口重启
-echo "Launching $APP with --remote-debugging-port=$PORT ..."
-open -a "$APP" --args --remote-debugging-port="$PORT"
+# 3) 正常拉起（端口由环境变量带入，不需要也不该带命令行参数）
+echo "Launching $APP ..."
+open -a "$APP"
 
 # 4) 探测 CDP（最长 30s）
-ok=0
 for i in {1..30}; do
   sleep 1
-  if cdp_ok; then ok=1; break; fi
-done
-
-if [ "$ok" -eq 1 ]; then
-  echo "OK: CDP enabled on port $PORT"
-  echo "--- targets ---"
-  curl -s -m 3 "$LIST_URL" | python3 -c "
+  if cdp_ok "$PORT"; then
+    echo "OK: CDP enabled on port $PORT"
+    echo "--- targets ---"
+    curl -s -m 3 "http://127.0.0.1:$PORT/json/list" | python3 -c "
 import json,sys
 try:
     ts=json.load(sys.stdin)
@@ -61,10 +70,11 @@ try:
 except Exception as e:
     print('  (target list parse failed:', e, ')')
 "
-  exit 0
-fi
+    exit 0
+  fi
+done
 
-# 5) 兜底：不带参数拉起客户端，保证 App 恢复运行
-echo "FAIL: CDP did not come up. Relaunching $APP WITHOUT debug flag (fallback)..."
-open -a "$APP"
+echo "FAIL: 客户端已启动但 $PORT 上没有 CDP。排查："
+echo "  launchctl print gui/\$(id -u) | grep -i WORKBUDDY   # 环境变量是否生效"
+echo "  $ROOT/run.sh ports status                          # 端口全貌与归属"
 exit 2

@@ -47,10 +47,13 @@ max_claims_per_run = 20
 enabled = true
 # 唯一实现：browser = GrowthBrowser（CDP + DOM 级点击）
 engine = "browser"
-# WorkBuddy 客户端调试端口。开启方式（二选一）：
-#   1) launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT 9222 && 重启客户端
-#   2) 直接跑 scripts/launch-workbuddy-debug.sh（自动 setenv + 优雅重启 + 探测）
+# WorkBuddy 客户端调试端口。这只是**回退值**：运行时优先跟随客户端自报的
+# DevToolsActivePort 与 gui 域环境变量，被占用会自动换端口（ports.py）。
+#   ./run.sh ports status / ports negotiate --apply
+#   ./scripts/launch-workbuddy-debug.sh   写端口并优雅重启客户端
 cdp_port = 9222
+# 协商时按顺序找空闲端口的区间 [起, 止]
+cdp_port_range = [9222, 9242]
 # agent-browser 可执行文件；留空按 tools/node_modules/.bin → PATH 顺序探测
 agent_browser_bin = ""
 # 页面未打开时，从客户端侧栏入口点开的按钮文案（依次尝试）。

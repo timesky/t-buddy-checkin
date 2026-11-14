@@ -44,21 +44,45 @@ cd tools && npm install && cd ..
 cp config.example.toml config.toml
 
 # 4. 开 CDP 调试端口（关键，必须做一次）
-launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT 9222
-# 然后退出并重启 WorkBuddy 客户端（或直接跑下面的脚本，自动完成）
-./scripts/launch-workbuddy-debug.sh
+./run.sh ports status            # 只读：客户端是否已暴露端口、端口归谁
+./run.sh install-launchd         # 写 daemon plist + 端口持久化（登录项）
+# 端口没开时（status 显示无监听）：
+./scripts/launch-workbuddy-debug.sh   # 写端口 → 优雅重启客户端 → 等 CDP 就绪
 
 # 5. 验证
 ./run.sh deps check      # 五条依赖应全绿
 ./run.sh inspect         # 应看到 [iframe] growth-center + 签到状态
 ```
 
-`launchctl setenv` 重启后失效。想开机自动生效，把
-`~/Library/LaunchAgents/com.local.workbuddy-cdp-env.plist`（`scripts/` 里有模板）加载进登录项：
+### 端口是自适应的（不用再手填 9222）
+
+客户端启动时只读一次环境变量 `WORKBUDDY_REMOTE_DEBUGGING_PORT`（只认纯数字），
+然后 `appendSwitch('remote-debugging-port', n)`，**端口被占没有任何回退**。所以
+本技能不再假设端口，按下面的优先级取真实值（`src/buddy_checkin/ports.py`）：
+
+| 级别 | 来源 | 说明 |
+|---|---|---|
+| 1 | `~/.workbuddy/app/session/DevToolsActivePort` | Chromium 自己写的**当前**端口，再用 `/json/version` 的 UA 复核归属 |
+| 2 | gui 域环境变量 | 「下次启动的意图」，文件陈旧时用它 |
+| 3 | `[growth].cdp_port` | 回退值（`9222`） |
+| 4 | 区间扫描 `9222–9242` | 兜底：`lsof` 可执行路径落在 `WorkBuddy.app/Contents/MacOS/` 才算 |
 
 ```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.workbuddy-cdp-env.plist
+./run.sh ports status                 # 端口全貌 + 判定（跨机器排查直接贴这段）
+./run.sh ports negotiate              # dry-run：该不该换端口、换成哪个
+./run.sh ports negotiate --apply      # 落盘：setenv + plist + config.toml（需重启客户端）
 ```
+
+端口被别的东西占用（9222 是 Chrome 默认调试端口）时，`status` 会标成
+`非 WorkBuddy ✗`，`negotiate` 从区间里挑空闲端口。工具**绝不自动重启客户端**
+（会掐掉你正在用的会话），只写文件并提示重启。
+
+端口持久化由 `com.local.workbuddy-cdp-env` 这个 LaunchAgent 负责（`install-launchd`
+自动生成并 bootstrap）。只手动 `launchctl setenv` 的话，重启电脑就丢 —— 这正是
+「昨天还好、今天端口没了」的根因。
+
+遇到 `Bootstrap failed: 5: Input/output error`：通常是同 label 已加载，
+先 `launchctl bootout gui/$(id -u)/com.local.buddy-web-checkin` 再 bootstrap。
 
 ## 签到语义（2026-11-14 更正，重要）
 
@@ -99,7 +123,9 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.workbuddy-cdp-
 ./run.sh once              # 按账本跑完五个任务一遍（= 一次重启自检）
 ./run.sh verify            # 同 once：用真实状态纠正账本并补做未完成任务
 ./run.sh daemon            # 常驻：五个任务滚动，全终态静默到 23:59
-./run.sh install-launchd   # 写 LaunchAgent plist（不自动加载）
+./run.sh install-launchd   # 写 daemon plist + 端口持久化（--load 立即加载）
+./run.sh ports status      # 端口全貌与判定（只读，跨机器排查贴这段）
+./run.sh ports negotiate   # 协商端口（--apply 落盘，--port N 指定）
 ```
 
 除 `deps` / `inspect` / `install-launchd` / `model-check` 外都要带 `BUDDY_FREE_MODEL=1`（免费模型闸门，plist 内已内置）。

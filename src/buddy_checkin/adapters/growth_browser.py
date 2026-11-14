@@ -132,7 +132,12 @@ class GrowthBrowser:
         g = cfg.get("growth", {}) or {}
         self.cfg = cfg
         self.state = state
-        self.port = int(g.get("cdp_port", 9222))
+        # 端口由 cli.inject_port() 注入（跟随客户端实际使用的端口）；
+        # config_port 只是「不知道真实端口时」的回退，不再各处硬编码 9222。
+        from .. import ports
+
+        self.port = ports.config_port(cfg)
+        self.port_source = g.get("cdp_port_source") or "config"
         self.offset_sec = float(g.get("claim_offset_sec", 3))
         self.scene = (g.get("scene") or "").strip()
         self.wait_sec = float(g.get("open_wait_sec", 6))
@@ -214,30 +219,63 @@ class GrowthBrowser:
             return False, f"{browser}, not Electron ({ua[:70]})"
         return False, f"other Electron app ({ua[:70]})"
 
-    def targets(self) -> list[dict]:
+    def _heal(self) -> bool:
+        """端口对不上（客户端换了端口/被占）时重探一次。
+
+        客户端重启后可能换端口，中途换了不该让整轮任务失败；这里只换端口，
+        不启动/重启客户端（那会打断用户正在用的会话）。
+        """
+        from .. import ports
+
         try:
-            data = self._http("/json/list")
-        except Exception as exc:
-            self.block = ("cdp_unavailable", f"CDP {self.port} unreachable: {exc}")
-            return []
-        lst = data if isinstance(data, list) else []
-        if not lst:
-            # 端口活着但暂无 target（客户端刚启动/窗口未建），不算错误
-            if self.block and self.block[0] == "cdp_unavailable":
-                self.block = None
-            return lst
-        if not self._owner_ok:
-            owned, who = self.port_owner(lst)
-            if not owned:
-                self.block = (
-                    "cdp_port_foreign",
-                    f"port {self.port} is not WorkBuddy: {who}; "
-                    f"确认 [growth].cdp_port 与 WORKBUDDY_REMOTE_DEBUGGING_PORT 一致，"
-                    f"或换一个没被浏览器占用的端口",
-                )
+            res = ports.resolve(self.cfg, timeout=0.4)
+        except Exception:  # noqa: BLE001 - 自愈失败按原错误上报
+            return False
+        if not res.ok or res.port == self.port:
+            return False
+        old = self.port
+        self.port = res.port
+        self.port_source = res.source
+        self.cfg.setdefault("growth", {})["cdp_port"] = res.port
+        self.cfg["growth"]["cdp_port_source"] = res.source
+        self._owner_ok = False
+        self.block = None
+        logger.info("cdp: 端口自愈 %s → %s（%s）", old, res.port, res.source)
+        return True
+
+    def targets(self) -> list[dict]:
+        healed = False
+        while True:
+            try:
+                data = self._http("/json/list")
+            except Exception as exc:
+                if not healed and self._heal():
+                    healed = True
+                    continue
+                self.block = ("cdp_unavailable", f"CDP {self.port} unreachable: {exc}")
                 return []
-            self._owner_ok = True
-        return lst
+            lst = data if isinstance(data, list) else []
+            if not lst:
+                # 端口活着但暂无 target（客户端刚启动/窗口未建），不算错误
+                if self.block and self.block[0] == "cdp_unavailable":
+                    self.block = None
+                return lst
+            if not self._owner_ok:
+                owned, who = self.port_owner(lst)
+                if not owned:
+                    if not healed and self._heal():
+                        healed = True
+                        continue
+                    self.block = (
+                        "cdp_port_foreign",
+                        f"port {self.port} is not WorkBuddy: {who}; "
+                        f"跑 `./run.sh ports status` 看端口全貌，"
+                        f"`./run.sh ports negotiate --apply` 协商空闲端口",
+                    )
+                    return []
+                self._owner_ok = True
+            return lst
+
 
     def available(self) -> bool:
         return bool(self.targets())

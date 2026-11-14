@@ -50,6 +50,34 @@ class Actions:
         # fuel 为 FuelCard（CDP）：左下角「Buddy加油站」浮层，签到的唯一真实入口
         self.fuel = fuel
 
+    # ---- 0. 端口：每轮开工前重新对齐客户端实际端口 --------------------------
+    def refresh_port(self) -> int | None:
+        """客户端可能中途重启换了端口；每轮验证/自检开头重探一次。
+
+        只读 + 只改内存里的端口，不写文件、不重启客户端。
+        """
+        try:
+            from . import ports
+
+            res = ports.resolve(self.cfg, timeout=0.4)
+        except Exception:  # noqa: BLE001 - 端口探测失败不该让整轮任务崩掉
+            return None
+        if not res.ok:
+            return None
+        growth = self.cfg.setdefault("growth", {})
+        growth["cdp_port"] = res.port
+        growth["cdp_port_source"] = res.source
+        for adapter in (self.growth, self.fuel):
+            if adapter is not None and getattr(adapter, "port", None) != res.port:
+                logger.info("cdp: %s 端口 %s → %s（%s）",
+                            type(adapter).__name__, getattr(adapter, "port", "?"),
+                            res.port, res.source)
+                adapter.port = res.port
+                if hasattr(adapter, "_owner_ok"):
+                    adapter._owner_ok = False
+        return res.port
+
+
     # ---- 1. 每日签到（点左下角浮层的「立即领取」，服务端状态确认） ----------
     def daily_checkin(self) -> ActionResult:
         if not self.cfg["daily_checkin"]["enabled"]:

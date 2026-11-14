@@ -127,16 +127,24 @@ def agent_browser_dep(cfg: dict) -> dict:
 
 def cdp_dep(cfg: dict) -> dict:
     """WorkBuddy 客户端调试端口：CDP 链路的运行前提。"""
+    from . import ports
     from .adapters.growth_browser import GrowthBrowser
 
-    port = int((cfg.get("growth", {}) or {}).get("cdp_port", 9222))
+    g = cfg.get("growth", {}) or {}
+    port = ports.config_port(cfg)
+    source = g.get("cdp_port_source") or "config"
     gb = GrowthBrowser(cfg)
     alive = gb.available()
     blocked = gb.block[0] if gb.block else None
     note = "客户端暴露的 DevTools 端口；未开启时无法读取成长中心页面"
+    if alive:
+        note = f"已连通（端口来源 {source}）"
     if blocked == "cdp_port_foreign":
-        note = (f"该端口被其它浏览器占用（{gb.block[1]}）；"
-                "换一个空闲端口或确认 WORKBUDDY_REMOTE_DEBUGGING_PORT")
+        note = (f"端口 {port} 被其它浏览器占用（{gb.block[1]}）；"
+                "跑 ./run.sh ports status 看全貌，或 ports negotiate --apply 换端口")
+    elif not alive:
+        note = ("客户端未暴露调试端口。先跑 ./run.sh ports status；"
+                "需要写端口时用 ./run.sh ports negotiate --apply，再重启客户端")
     return {
         "name": "WorkBuddy CDP",
         "kind": "runtime-port",
@@ -147,7 +155,7 @@ def cdp_dep(cfg: dict) -> dict:
         "path": f"127.0.0.1:{port}",
         "install": (
             f"launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT {port} && "
-            "重启 WorkBuddy 客户端（或直接跑 scripts/launch-workbuddy-debug.sh）"
+            "重启 WorkBuddy 客户端（或跑 ./run.sh install-launchd 持久化端口）"
         ),
         "note": note,
     }
