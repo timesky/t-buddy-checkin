@@ -1,20 +1,22 @@
-"""统一常驻进程内的三条独立时间线，用堆精确调度。
+"""常驻进程的任务调度：五个任务各自滚动，全部终态后静默到当天 23:59。
 
-进程启动时三条线**都立即执行一次**，然后各自从该时刻向后滚动：
+规则（2026-11-14 按用户要求重写）：
 
-  checkin   每天 0 点恢复；每小时轮询签到状态，*确认*成功后禁用到当天 23:59
-            （DB 已记录今日签到 / 点击后按钮消失 = 确认；仅凭按钮不存在推测
-             = 未确认，隔一小时再查，避免客户端页面未渲染就整天漏签）
-  exchange  每天 0 点恢复；每小时检查兑换，兑换成功或确认无可兑换后禁用到
-            当天 23:59；检查失败/窗口不可用则隔一小时重试
-  travel    唯一动态滚动：重启先领礼物/派遣，之后按页面真实倒计时设置下次
-            检查时间（派遣时长每次不同，绝不套固定间隔）
+1. 五个任务：签到 / 补签 / 兑换 / 抽奖 / 派遣。每个任务独立排程。
+2. 失败就重试：pending 的任务按 60s → 120s → 300s → 600s 退避重试，
+   直到成功或确认「今天确实做不了」。
+3. 静默：**所有**任务都进入 done / impossible（= 当日 100% 完成且无法继续）
+   才静默到当天 23:59，期间不再打开任何页面。次日 0 点账本翻页、全部重置。
+4. 重启不受静默控制：进程启动时五个任务**立刻各跑一遍**（用真实状态复核，
+   不信任账本里写的 done），只有复核后仍全部终态才重新静默。这样即使上一
+   进程把状态写错，重启也能立刻纠正。
 
-签到线与兑换线是相对固定的日周期，只有 travel 随真实到期时间动态变化。
-每次排 Job 都把下次时刻写入 kv，供 `status` 只读查看。
+派遣是唯一按真实倒计时滚动的任务：派生完按页面读到的剩余时间设下一次检查，
+领奖后再派，直到页面明确「次数用尽」且没有可领奖励，才记为 done。
 """
 from __future__ import annotations
 
+import contextlib
 import heapq
 import logging
 import threading
@@ -23,6 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+from .progress import DONE, IMPOSSIBLE, PENDING, TASK_LABELS, TASK_ORDER, Progress
 from .timeutil import CN_TZ, day_key, next_daily_at
 
 logger = logging.getLogger(__name__)
@@ -44,6 +47,7 @@ class Scheduler:
         cfg: dict,
         state: Any,
         actions: Any,
+        progress: Progress,
         *,
         now: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
@@ -51,127 +55,221 @@ class Scheduler:
         self.cfg = cfg
         self.state = state
         self.actions = actions
+        self.progress = progress
         self.now = now or time.time
         self.sleep = sleep or time.sleep
         sched = cfg.get("schedule", {}) or {}
         self.day_boundary = sched.get("day_boundary", "00:00")
-        self.hourly = float(sched.get("hourly_interval_sec", 3600))
+        self.retry_backoff = list(
+            sched.get("retry_backoff_sec") or [60, 120, 300, 600])
+        self.silent_at = sched.get("silent_at", "23:59")
         self.fallback = float(cfg["travel"].get("fallback_interval_sec", 3600))
-        self.exhausted_retry_at = cfg["travel"].get("exhausted_retry_at", "23:00")
+        self._next_at: dict[str, float] = {}
 
-    # ---- 排程辅助 -----------------------------------------------------------
-    def _next_boundary(self) -> float:
-        """下一个北京时间 00:00（= 当天 23:59 之后）。"""
+    # ---- 时间辅助 -----------------------------------------------------------
+    def _today_at(self, hhmm: str) -> float:
+        hh, mm = (int(x) for x in hhmm.split(":"))
+        dt = datetime.fromtimestamp(self.now(), CN_TZ)
+        return dt.replace(hour=hh, minute=mm, second=0, microsecond=0).timestamp()
+
+    def _next_midnight(self) -> float:
         now_dt = datetime.fromtimestamp(self.now(), CN_TZ)
         return next_daily_at(self.day_boundary, now_dt).timestamp()
 
-    def _retry(self) -> float:
-        """未得到确定结论：从当前时刻向后滚动一个轮询间隔。"""
-        return self.now() + self.hourly
+    def _backoff(self, attempts: int) -> float:
+        if not self.retry_backoff:
+            return 300.0
+        idx = min(max(attempts - 1, 0), len(self.retry_backoff) - 1)
+        return float(self.retry_backoff[idx])
 
-    def _next_exhausted(self) -> float:
-        """派遣次数当天用尽 -> 禁用到晚上 23:00；若已过 23:00 则次日 0 点。"""
-        hh, mm = (int(x) for x in self.exhausted_retry_at.split(":"))
-        dt = datetime.fromtimestamp(self.now(), CN_TZ)
-        cand = dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if cand > dt:
-            return cand.timestamp()
-        return (dt + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0).timestamp()
+    # ---- 任务执行 -----------------------------------------------------------
+    def _dispatch_task(self, name: str):
+        return {
+            "checkin": self.actions.daily_checkin,
+            "makeup": self.actions.missed_makeup,
+            "exchange": self.actions.check_exchanges,
+            "lottery": self.actions.draw_lottery,
+            "travel": self.actions.travel_tick,
+        }[name]
 
-    def _schedule(self, name: str, due: float) -> Job:
+    def run_task(self, name: str) -> tuple[str, str, float | None]:
+        """跑一个任务，写账本，返回 (state, detail, next_at 或 None 表示今天结束)。"""
+        result = self._dispatch_task(name)()
+        data = result.data or {}
+        # 任务自己给出的 state 是权威值（例如「派遣次数用尽」ok=False 但当天确实
+        # 做不了，要记为 done，否则会一直重试）。没有 state 时才按 ok 推断。
+        state = str(data.get("state") or (DONE if result.ok else PENDING))
+        rec = self.progress.mark(name, state, result.detail, data.get("evidence") or {
+            k: v for k, v in data.items() if k in ("today_credit", "streak_days",
+                                                   "made_up", "broken_left",
+                                                   "tickets_left", "due_at", "state")})
+
+        if state in (DONE, IMPOSSIBLE):
+            self.state.kv_set(f"next_{name}_at", None)
+            logger.info("%s: %s (%s)", name, state, result.detail[:120])
+            return state, result.detail, None
+
+        next_at = None
+        if name == "travel":
+            due = data.get("due_at")
+            if due is not None:
+                try:
+                    next_at = float(due)
+                except (TypeError, ValueError):
+                    next_at = None
+        if next_at is None:
+            next_at = self.now() + self._backoff(rec.attempts)
+        logger.info("%s: %s retry in %.0fs (%s)", name, state, next_at - self.now(),
+                    result.detail[:120])
+        return state, result.detail, next_at
+
+    def _make_job(self, name: str, due: float) -> Job:
         self.state.kv_set(f"next_{name}_at", due)
-        return Job(due, name, getattr(self, f"_{name}"))
+        return Job(due, name, self._job_runner)
 
-    # ---- 线 1：签到 ---------------------------------------------------------
-    def _checkin(self, _job: Job) -> Job | None:
-        if not self.cfg["daily_checkin"]["enabled"]:
-            return self._schedule("checkin", self._next_boundary())
-        result = self.actions.daily_checkin()
-        confirmed = bool(result.ok and result.data.get("confirmed"))
-        # 确认成功 -> 禁用到当天 23:59；否则每小时继续轮询
-        due = self._next_boundary() if confirmed else self._retry()
-        logger.info("checkin line: confirmed=%s next=%s", confirmed, due)
-        return self._schedule("checkin", due)
+    def _job_runner(self, job: Job) -> "Job | None":
+        _, _, next_at = self.run_task(job.name)
+        if next_at is None:
+            return None
+        return self._make_job(job.name, next_at)
 
-    # ---- 线 2：兑换检查 -----------------------------------------------------
-    def _exchange(self, _job: Job) -> Job | None:
-        result = self.actions.check_exchanges()
-        # 兑换成功或确认无可兑换 -> 禁用到当天 23:59；失败则每小时重试
-        due = self._next_boundary() if result.ok else self._retry()
-        logger.info("exchange line: ok=%s next=%s", result.ok, due)
-        return self._schedule("exchange", due)
+    # ---- 启动：不受静默控制，五个任务立刻复核一遍（见 verify_pass） --------
+    def verify_pass(self) -> dict[str, str]:
+        """重启自检：按顺序把五个任务各跑一遍并写回账本（会真的动作）。
 
-    # ---- 线 3：派遣 / 领礼物（动态滚动） ------------------------------------
-    def _travel(self, _job: Job) -> Job | None:
-        # 先读持久化标记：当天已判定派遣次数用尽时，重启/定时都直接跳到夜间，
-        # 不再实际检查（否则重启后 initial_jobs 会立即重试并触发自动开页签）。
-        # 2026-11-10 实测：14:36 已排到 23:00，14:42 服务重启后又重试并新开页签。
-        if self.state.kv_get("travel_blocked") == "exhausted" \
-                and self.state.kv_get("travel_blocked_day") == day_key(self.now()):
-            due = self._next_exhausted()
-            logger.info("travel line: exhausted for today (%s), skip until %s",
-                        day_key(self.now()), due)
-            return self._schedule("travel", due)
+        五个任务共用一次打开的页面（makeup/exchange/lottery/travel 都在成长中心
+        里），避免一轮开关好几次窗口。
+        """
+        out: dict[str, str] = {}
+        self._next_at.clear()
+        session = getattr(self.actions, "growth_session", None)
+        ctx = session() if callable(session) else contextlib.nullcontext()
+        with ctx:
+            for name in TASK_ORDER:
+                try:
+                    state, detail, next_at = self.run_task(name)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("verify %s crashed: %s", name, exc)
+                    self.progress.mark(name, PENDING, f"crashed: {exc}")
+                    out[name] = PENDING
+                    self._next_at[name] = self.now() + self._backoff(1)
+                    continue
+                out[name] = state
+                if next_at is not None:
+                    self._next_at[name] = next_at
+                    self.state.kv_set(f"next_{name}_at", next_at)
+        self.progress.mark_silent(self._silence_deadline() if self.progress.all_terminal() else None)
+        return out
 
-        result = self.actions.travel_tick(force=True)
-        blocked = result.data.get("dispatch_blocked")
-        if blocked == "exhausted":
-            # 当天派遣次数用完：按用户要求禁用到当晚 23:00，不再每小时重试
-            due = self._next_exhausted()
-            self.state.kv_set("travel_blocked", "exhausted")
-            self.state.kv_set("travel_blocked_day", day_key(self.now()))
-            logger.info("travel line: dispatch exhausted today, next=%s (23:00)", due)
-        else:
-            due = self.state.kv_get_float("travel_due_at")
-            if due is None or due <= self.now():
-                due = self.now() + self.fallback
-            # 正常轮次清掉旧的禁用标记（跨天后自动恢复）
-            self.state.kv_set("travel_blocked", "")
-            self.state.kv_set("travel_blocked_day", "")
-            logger.info("travel line: next=%s (real countdown)", due)
-        return self._schedule("travel", due)
-
-    def initial_jobs(self, now_ts: float | None = None) -> list[Job]:
-        """重启/启动后三条线立即各跑一次，之后由各线自行滚动。"""
-        now = now_ts if now_ts is not None else self.now()
+    def _pending_jobs(self) -> list[Job]:
+        """自检后的待办：只排账本里仍 pending 的任务。"""
         jobs: list[Job] = []
-        if self.cfg["daily_checkin"]["enabled"]:
-            jobs.append(Job(now, "checkin", self._checkin))
-        growth = self.cfg.get("growth", {}) or {}
-        if growth.get("enabled") and growth.get("auto_exchange", True):
-            jobs.append(Job(now, "exchange", self._exchange))
-        if self.cfg["travel"]["enabled"]:
-            jobs.append(Job(now, "travel", self._travel))
+        for name in TASK_ORDER:
+            if self.progress.is_terminal(name):
+                continue
+            due = self._next_at.get(name)
+            if due is None:
+                due = self.now()
+            jobs.append(self._make_job(name, max(due, self.now())))
         return jobs
 
+    def _silence_deadline(self) -> float:
+        """今天还能静默到什么时候：23:59（当天）。"""
+        target = self._today_at(self.silent_at)
+        return target if target > self.now() else self._next_midnight()
+
+    def _wake_deadline(self) -> float:
+        """静默到 23:59 之后，实际醒来干活的时刻：次日 0 点。"""
+        midnight = self._next_midnight()
+        if midnight <= self.now():
+            midnight += 86400
+        return midnight
+
+    # ---- 主循环 -------------------------------------------------------------
     def run_forever(
         self,
         stop: threading.Event | None = None,
         max_iterations: int | None = None,
     ) -> int:
-        heap = self.initial_jobs()
+        # 启动即自检：五个任务按顺序各跑一遍（共用一次打开的页面），
+        # 不信任账本里写的 done —— 上一进程写错了，这一轮就会纠正。
+        states = self.verify_pass()
+        logger.info("startup verify: %s", states)
+        heap = self._pending_jobs()
         heapq.heapify(heap)
-        executed = 0
-        while heap and (max_iterations is None or executed < max_iterations):
+        executed = len(TASK_ORDER)
+        while True:
             if stop is not None and stop.is_set():
                 break
+            if max_iterations is not None and executed >= max_iterations:
+                break
+
+            if not heap:
+                # 全部终态：静默到今天 23:59（实际睡到次日 0 点再翻页）
+                deadline = self._silence_deadline()
+                wake = self._wake_deadline()
+                self.progress.mark_silent(deadline)
+                logger.info(
+                    "all tasks terminal for %s; silent until %s, wake at %s",
+                    day_key(self.now()),
+                    datetime.fromtimestamp(deadline, CN_TZ).strftime("%H:%M:%S"),
+                    datetime.fromtimestamp(wake, CN_TZ).strftime("%m-%d %H:%M:%S"))
+                if not self._wait(wake - self.now(), stop):
+                    break
+                self.progress.reset_all()
+                self.state.kv_set("silent_until", None)
+                logger.info("new day %s: ledger rolled over, running full verify",
+                            self.progress.day)
+                states = self.verify_pass()
+                logger.info("daily verify: %s", states)
+                executed += len(TASK_ORDER)
+                heap = self._pending_jobs()
+                heapq.heapify(heap)
+                continue
+
             job = heapq.heappop(heap)
             wait = job.due_at - self.now()
             if wait > 0:
-                if stop is not None:
-                    # 一次等到期，同时保持可中断（退出/关机不卡死）
-                    if stop.wait(wait):
-                        break
-                else:
-                    self.sleep(wait)
+                if not self._wait(wait, stop):
+                    break
             try:
                 next_job = job.run()
             except Exception as exc:  # 单条线失败不能拖垮整个进程
                 logger.exception("job %s failed: %s", job.name, exc)
                 self.state.log(f"scheduler.{job.name}", False, str(exc))
-                next_job = Job(self.now() + 300, job.name, job.fn)
+                rec = self.progress.get(job.name)
+                self.progress.mark(job.name, PENDING, f"scheduler error: {exc}")
+                next_job = self._make_job(
+                    job.name, self.now() + self._backoff(rec.attempts + 1))
             executed += 1
             if next_job is not None:
                 heapq.heappush(heap, next_job)
         return executed
+
+    def _wait(self, seconds: float, stop: threading.Event | None) -> bool:
+        if seconds <= 0:
+            return True
+        if stop is not None:
+            return not stop.wait(seconds)
+        self.sleep(seconds)
+        return True
+
+    # ---- 只读概览 -----------------------------------------------------------
+    def overview(self) -> dict[str, Any]:
+        rows = []
+        for name in TASK_ORDER:
+            rec = self.progress.get(name)
+            rows.append({
+                "task": name,
+                "label": TASK_LABELS.get(name, name),
+                "state": rec.state,
+                "detail": rec.detail,
+                "attempts": rec.attempts,
+                "next_at": self.state.kv_get_float(f"next_{name}_at"),
+            })
+        return {
+            "day": self.progress.day,
+            "all_terminal": self.progress.all_terminal(),
+            "silent_until": self.progress.silent_until,
+            "tasks": rows,
+        }

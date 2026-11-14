@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from buddy_checkin import config  # noqa: E402
 from buddy_checkin.actions import Actions  # noqa: E402
 from buddy_checkin.adapters.base import ActionResult, DesktopAdapter  # noqa: E402
+from buddy_checkin.progress import Progress  # noqa: E402
 from buddy_checkin.scheduler import Scheduler  # noqa: E402
 from buddy_checkin.state import State  # noqa: E402
 from buddy_checkin.timeutil import (  # noqa: E402
@@ -70,12 +71,14 @@ class FakeFuel:
 
 
 class FakeGrowth:
-    """假成长中心：礼物/派遣/兑换；checkin 仅保留为活跃地图读取（不参与签到）。"""
+    """假成长中心：礼物/派遣/兑换/补签/抽奖；checkin 仅保留为活跃地图读取。"""
 
     def __init__(self, due: float, checkin_ok: bool = True):
         self.due = due
         self.checkin_ok = checkin_ok
         self.checkin_calls = 0
+        self.makeup_state = "done"
+        self.lottery_state = "done"
 
     def checkin(self):
         self.checkin_calls += 1
@@ -90,34 +93,59 @@ class FakeGrowth:
     def claim_exchanges(self, claimed_before):
         return []
 
+    def makeup(self):
+        if self.makeup_state == "done":
+            return ActionResult(True, "makeup", "no missed day", {"state": "done"})
+        if self.makeup_state == "impossible":
+            return ActionResult(True, "makeup", "no makeup card left",
+                                {"state": "impossible"})
+        return ActionResult(False, "makeup", "tip not shown", {"state": "pending"})
+
+    def lottery(self):
+        if self.lottery_state == "done":
+            return ActionResult(True, "lottery", "no lottery ticket",
+                                {"state": "done", "tickets": 0})
+        return ActionResult(False, "lottery", "dialog not found", {"state": "pending"})
+
     def tick(self, force: bool = False):
         return ActionResult(True, "travel", "fake growth ok", {"due_at": self.due})
 
 
 class FakeActions:
-    """调度器用的假编排：只记录三条线各自的调用与可配置的结论。"""
+    """调度器用的假编排：五个任务各自可配置结论。"""
 
     def __init__(self) -> None:
         self.calls: list[str] = []
-        self.checkin_confirmed = True
-        self.exchange_ok = True
+        self.states: dict[str, str] = {}
         self.travel_due_at: float | None = None
-        self.travel_blocked: str | None = None
+
+    def _r(self, name: str, default: str = "done"):
+        self.calls.append(name)
+        state = self.states.get(name, default)
+        return state
 
     def daily_checkin(self):
-        self.calls.append("checkin")
-        return ActionResult(True, "checkin", "fake", {"confirmed": self.checkin_confirmed})
+        state = self._r("checkin")
+        return ActionResult(state == "done", "checkin", "fake",
+                            {"confirmed": state == "done", "state": state})
+
+    def missed_makeup(self):
+        state = self._r("makeup")
+        return ActionResult(state != "pending", "makeup", "fake", {"state": state})
 
     def check_exchanges(self):
-        self.calls.append("exchange")
-        return ActionResult(self.exchange_ok, "exchange", "fake", {"count": 0})
+        state = self._r("exchange")
+        return ActionResult(state == "done", "exchange", "fake",
+                            {"count": 0, "state": state})
+
+    def draw_lottery(self):
+        state = self._r("lottery")
+        return ActionResult(state == "done", "lottery", "fake", {"state": state})
 
     def travel_tick(self, force: bool = False):
-        self.calls.append("travel")
-        data: dict = {"due_at": self.travel_due_at}
-        if self.travel_blocked:
-            data["dispatch_blocked"] = self.travel_blocked
-        return ActionResult(not self.travel_blocked, "travel", "fake", data)
+        state = self._r("travel", "pending")
+        data: dict = {"due_at": self.travel_due_at, "state": state}
+        return ActionResult(state == "done", "travel", "fake", data)
 
 
 class TimeUtilTests(unittest.TestCase):
@@ -238,18 +266,22 @@ class ActionsTests(unittest.TestCase):
         fuel = FakeFuel()
         actions = Actions(self.cfg, self.state, None, growth=growth, fuel=fuel)
         summary = actions.reconcile_all()
-        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["checkin"]["state"], "done")
+        self.assertEqual(summary["makeup"]["state"], "done")
+        self.assertEqual(summary["lottery"]["state"], "done")
+        # 派遣是滚动任务：还有倒计时没走完，当天没结束
+        self.assertEqual(summary["travel"]["state"], "pending")
+        self.assertFalse(summary["ok"])
         self.assertEqual(fuel.claim_calls, 1)
         self.assertEqual(self.state.kv_get("last_checkin_day"), day_key())
         due = self.state.kv_get_float("travel_due_at")
         self.assertIsNotNone(due)
         self.assertGreater(due, time.time())
 
-        actions.reconcile_all()
-        self.assertEqual(fuel.claim_calls, 1)  # 当天不重复领签到
-        # travel_due_at 仍由 growth 的真实倒计时刷新
-        self.assertAlmostEqual(self.state.kv_get_float("travel_due_at"),
-                               self.state.kv_get_float("travel_due_at"))
+        second = actions.reconcile_all()
+        # 第二轮仍会向服务端复核一次签到（不盲信本地文件），但结果仍必须是 done
+        self.assertEqual(second["checkin"]["state"], "done")
+        self.assertEqual(self.state.kv_get("last_checkin_day"), day_key())
 
     def test_unconfirmed_checkin_does_not_write_state(self):
         """回归（2026-11-10 / 2026-11-14）：浮层没领到只是「没证据」，绝不能写
@@ -296,116 +328,166 @@ class ActionsTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
+    """五任务调度 + 当日账本：失败重试、全终态静默、重启强制复核。"""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = test_cfg(Path(self.tmp.name))
         self.state = State(Path(self.tmp.name) / "state.sqlite3")
         self.actions = FakeActions()
-        # 固定为北京时间 2026-11-10 11:00:00，断言所有排程时刻
+        self.progress_path = Path(self.tmp.name) / "progress.json"
+        # 固定为北京时间 2026-11-10 11:00:00
         self.fixed_now = datetime(2026, 11, 10, 11, 0, 0, tzinfo=CN_TZ).timestamp()
-        self.scheduler = Scheduler(
-            self.cfg, self.state, self.actions,
-            now=lambda: self.fixed_now, sleep=lambda _s: None,
-        )
+        self.slept: list[float] = []
+        self.progress = Progress(self.progress_path)
+        self.scheduler = self._sched()
 
     def tearDown(self):
         self.state.close()
         self.tmp.cleanup()
 
-    def _sched(self):
-        return Scheduler(self.cfg, self.state, self.actions,
-                         now=lambda: self.fixed_now, sleep=lambda _s: None)
+    def _sched(self, progress=None):
+        return Scheduler(
+            self.cfg, self.state, self.actions, progress or self.progress,
+            now=lambda: self.fixed_now,
+            sleep=lambda s: self.slept.append(s),
+        )
 
     @staticmethod
     def _beijing(ts):
         return datetime.fromtimestamp(ts, CN_TZ)
 
-    def test_initial_jobs_are_all_three_and_immediate(self):
-        jobs = self.scheduler.initial_jobs(self.fixed_now)
-        self.assertEqual({j.name for j in jobs}, {"checkin", "exchange", "travel"})
-        self.assertTrue(all(j.due_at == self.fixed_now for j in jobs))
+    def test_startup_runs_all_five_tasks_immediately(self):
+        for name in ("checkin", "makeup", "exchange", "lottery", "travel"):
+            self.actions.states[name] = "done"
+        self.scheduler.run_forever(max_iterations=5)
+        self.assertEqual(self.actions.calls,
+                         ["checkin", "makeup", "exchange", "lottery", "travel"])
 
-    def test_checkin_confirmed_disables_until_next_midnight(self):
-        self.actions.checkin_confirmed = True
-        job = self.scheduler._checkin(None)
-        boundary = self._beijing(job.due_at)
-        self.assertEqual((boundary.hour, boundary.minute, boundary.second), (0, 0, 0))
-        self.assertEqual(boundary.date().isoformat(), "2026-11-11")
-        self.assertEqual(self.state.kv_get_float("next_checkin_at"), job.due_at)
+    def test_restart_ignores_silence_and_rechecks_everything(self):
+        """重启不受静默控制：账本写着今天全做完并静默，也要立刻复核。"""
+        for name in ("checkin", "makeup", "exchange", "lottery", "travel"):
+            self.progress.mark(name, "done", "上一进程写的")
+            self.actions.states[name] = "done"
+        self.progress.mark_silent(self.fixed_now + 3600)
+        fresh = Progress(self.progress_path)
+        sched = self._sched(fresh)
+        sched.run_forever(max_iterations=5)
+        self.assertEqual(len(self.actions.calls), 5, "静默状态也必须重新复核五个任务")
 
-    def test_checkin_unconfirmed_retries_in_one_hour(self):
-        """仅凭按钮不存在推测已签不算确认：从当前时刻向后滚动 1 小时。"""
-        self.actions.checkin_confirmed = False
-        job = self.scheduler._checkin(None)
-        self.assertAlmostEqual(job.due_at, self.fixed_now + 3600, places=2)
-        self.assertEqual(self._beijing(job.due_at).hour, 12)
+    def test_wrong_ledger_is_corrected_on_restart(self):
+        """账本写 done 但真实状态是没做 → 复核后必须改回 pending。"""
+        self.progress.mark("checkin", "done", "错误的 done")
+        self.actions.states["checkin"] = "pending"
+        states = self.scheduler.verify_pass()
+        self.assertEqual(states["checkin"], "pending")
+        self.assertEqual(self.progress.get("checkin").state, "pending")
+        self.assertFalse(self.progress.all_terminal())
+        self.assertIsNone(self.progress.silent_until)
 
-    def test_exchange_conclusion_disables_until_next_midnight(self):
-        self.actions.exchange_ok = True  # 兑换成功 or 确认无可兑换
-        job = self.scheduler._exchange(None)
-        self.assertEqual(self._beijing(job.due_at).hour, 0)
-        self.assertEqual(self._beijing(job.due_at).date().isoformat(), "2026-11-11")
+    def test_failed_task_retries_with_backoff(self):
+        self.actions.states["checkin"] = "pending"
+        state, _, next_at = self.scheduler.run_task("checkin")
+        self.assertEqual(state, "pending")
+        self.assertAlmostEqual(next_at - self.fixed_now, 60, places=2)
+        # 第二次失败退避到 120s
+        self.actions.states["checkin"] = "pending"
+        _, _, next_at2 = self.scheduler.run_task("checkin")
+        self.assertAlmostEqual(next_at2 - self.fixed_now, 120, places=2)
 
-    def test_exchange_failure_retries_in_one_hour(self):
-        self.actions.exchange_ok = False
-        job = self.scheduler._exchange(None)
-        self.assertAlmostEqual(job.due_at, self.fixed_now + 3600, places=2)
+    def test_terminal_task_is_not_rescheduled(self):
+        self.actions.states["exchange"] = "done"
+        state, _, next_at = self.scheduler.run_task("exchange")
+        self.assertEqual(state, "done")
+        self.assertIsNone(next_at)
+        self.assertEqual(self.progress.get("exchange").state, "done")
 
-    def test_travel_uses_real_countdown_not_fixed_interval(self):
-        """trave 线唯一动态滚动：按页面真实倒计时得到 due_at。"""
-        real_due = self.fixed_now + 2 * 3600 + 17  # 2h00m17s，非整点
-        self.state.kv_set("travel_due_at", real_due)
-        job = self.scheduler._travel(None)
-        self.assertAlmostEqual(job.due_at, real_due, places=2)
-        self.assertEqual(self._beijing(job.due_at).minute, 0)
-        self.assertEqual(self._beijing(job.due_at).second, 17)
+    def test_impossible_is_terminal(self):
+        self.actions.states["makeup"] = "impossible"
+        state, _, next_at = self.scheduler.run_task("makeup")
+        self.assertEqual(state, "impossible")
+        self.assertIsNone(next_at)
+        self.assertTrue(self.progress.is_terminal("makeup"))
 
-    def test_dispatch_exhausted_defers_to_2300(self):
-        """派遣次数当天用尽：按用户要求禁用到当晚 23:00，不再每小时重试。"""
-        self.actions.travel_blocked = "exhausted"
-        job = self.scheduler._travel(None)
-        b = self._beijing(job.due_at)
-        self.assertEqual((b.date().isoformat(), b.hour, b.minute),
-                         ("2026-11-10", 23, 0))
-        self.assertEqual(self.state.kv_get("travel_blocked"), "exhausted")
+    def test_travel_follows_real_countdown(self):
+        """派遣按页面真实倒计时滚动，不套固定间隔。"""
+        due = self.fixed_now + 2 * 3600 + 17
+        self.actions.travel_due_at = due
+        self.actions.states["travel"] = "pending"
+        _, _, next_at = self.scheduler.run_task("travel")
+        self.assertAlmostEqual(next_at, due, places=2)
+        self.assertEqual(self._beijing(next_at).second, 17)
 
-    def test_dispatch_exhausted_after_2300_defers_to_midnight(self):
-        """已过 23:00 才发现用尽 → 次日 0 点（次数通常 0 点恢复）。"""
-        self.fixed_now = datetime(2026, 11, 10, 23, 30, 0, tzinfo=CN_TZ).timestamp()
-        self.actions.travel_blocked = "exhausted"
-        job = self.scheduler._travel(None)
-        b = self._beijing(job.due_at)
-        self.assertEqual((b.date().isoformat(), b.hour, b.minute),
-                         ("2026-11-11", 0, 0))
+    def test_all_terminal_goes_silent_until_2359(self):
+        for name in ("checkin", "makeup", "exchange", "lottery", "travel"):
+            self.actions.states[name] = "done"
+        self.scheduler.verify_pass()
+        self.assertTrue(self.progress.all_terminal())
+        silent = self.progress.silent_until
+        self.assertIsNotNone(silent)
+        b = self._beijing(silent)
+        self.assertEqual((b.date().isoformat(), b.hour, b.minute), ("2026-11-10", 23, 59))
 
-    def test_exhausted_survives_restart_without_rechecking(self):
-        """回归（2026-11-10）：重启后 initial_jobs 立即跑，但当天已用尽必须
-        直接跳到 23:00，绝不重新检查（否则会触发自动开新页签）。"""
-        self.state.kv_set("travel_blocked", "exhausted")
-        self.state.kv_set("travel_blocked_day", "2026-11-10")
-        # 模拟进程重启后的新调度器：固定时间仍在 11:00，且 travel_due_at 已过期
-        self.state.kv_set("travel_due_at", self.fixed_now - 3600)
-        fresh = self._sched()
-        job = fresh._travel(None)
-        b = self._beijing(job.due_at)
-        self.assertEqual((b.date().isoformat(), b.hour, b.minute),
-                         ("2026-11-10", 23, 0))
-        self.assertEqual(self.actions.calls, [])  # 一次实际检查都没发生
+    def test_one_pending_task_prevents_silence(self):
+        for name in ("checkin", "makeup", "exchange", "lottery", "travel"):
+            self.actions.states[name] = "done"
+        self.actions.states["lottery"] = "pending"
+        self.scheduler.verify_pass()
+        self.assertFalse(self.progress.all_terminal())
+        self.assertIsNone(self.progress.silent_until)
 
-    def test_exhausted_from_previous_day_is_cleared(self):
-        """跨天：昨天的禁用标记不应影响今天。"""
-        self.state.kv_set("travel_blocked", "exhausted")
-        self.state.kv_set("travel_blocked_day", "2026-11-09")
-        self.state.kv_set("travel_due_at", self.fixed_now + 1200)
-        job = self.scheduler._travel(None)
-        self.assertAlmostEqual(job.due_at, self.fixed_now + 1200, places=2)
-        self.assertEqual(self.actions.calls, ["travel"])
-        self.assertEqual(self.state.kv_get("travel_blocked"), "")
+    def test_verify_pass_runs_tasks_in_dependency_order(self):
+        for name in ("checkin", "makeup", "exchange", "lottery", "travel"):
+            self.actions.states[name] = "done"
+        self.scheduler.verify_pass()
+        self.assertEqual(self.actions.calls,
+                         ["checkin", "makeup", "exchange", "lottery", "travel"])
 
-    def test_run_forever_executes_all_three_lines(self):
-        executed = self.scheduler.run_forever(max_iterations=3)
-        self.assertEqual(executed, 3)
-        self.assertEqual(set(self.actions.calls), {"checkin", "exchange", "travel"})
+    def test_run_forever_keeps_pending_task_scheduled(self):
+        for name in ("checkin", "makeup", "exchange", "lottery"):
+            self.actions.states[name] = "done"
+        self.actions.states["travel"] = "pending"
+        self.actions.travel_due_at = self.fixed_now + 600
+        executed = self.scheduler.run_forever(max_iterations=6)
+        self.assertEqual(executed, 6)
+        self.assertEqual(self.actions.calls.count("travel"), 2)
+
+
+class ProgressTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "progress.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_pending_until_terminal(self):
+        p = Progress(self.path)
+        self.assertFalse(p.all_terminal())
+        for name in ("checkin", "makeup", "exchange", "lottery", "travel"):
+            p.mark(name, "done", "ok")
+        self.assertTrue(p.all_terminal())
+
+    def test_day_rollover_resets_everything(self):
+        p = Progress(self.path, day="2026-11-10")
+        p.mark("checkin", "done", "ok")
+        p.mark_silent(1794672000.0)
+        p2 = Progress(self.path, day="2026-11-11")
+        self.assertEqual(p2.get("checkin").state, "pending")
+        self.assertIsNone(p2.silent_until)
+
+    def test_corrupted_file_is_ignored(self):
+        self.path.write_text("{not json", encoding="utf-8")
+        p = Progress(self.path)
+        self.assertFalse(p.all_terminal())
+        self.assertEqual(p.get("checkin").state, "pending")
+
+    def test_attempts_only_grow_for_pending(self):
+        p = Progress(self.path)
+        p.mark("checkin", "pending", "no")
+        p.mark("checkin", "pending", "no")
+        p.mark("checkin", "done", "ok")
+        self.assertEqual(p.get("checkin").attempts, 2)
 
 
 class CliTests(unittest.TestCase):

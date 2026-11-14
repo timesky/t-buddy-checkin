@@ -14,6 +14,7 @@ from .actions import Actions
 from .adapters.fuel_card import FuelCard
 from .adapters.growth_browser import GrowthBrowser
 from .deps import cmd_deps
+from .progress import IMPOSSIBLE, DONE, TASK_LABELS, TASK_ORDER, Progress, default_path
 from .scheduler import Scheduler
 from .state import State
 from .timeutil import format_ts
@@ -101,10 +102,28 @@ def _json(result) -> int:
 
 
 def cmd_checkin_now(cfg: dict, args: argparse.Namespace) -> int:
-    """手动：只做签到时间线的一轮（不碰成长中心）。"""
+    """手动：只做签到任务的一轮（不碰成长中心）。"""
     state, _desktop, actions = build(cfg)
     try:
         return _json(actions.daily_checkin())
+    finally:
+        state.close()
+
+
+def cmd_makeup_now(cfg: dict, args: argparse.Namespace) -> int:
+    """手动：只做漏签补签（成长中心日历 + 补登卡）。"""
+    state, _desktop, actions = build(cfg)
+    try:
+        return _json(actions.missed_makeup())
+    finally:
+        state.close()
+
+
+def cmd_lottery_now(cfg: dict, args: argparse.Namespace) -> int:
+    """手动：只做抽奖（把「抽奖(N)」的券抽到 0）。"""
+    state, _desktop, actions = build(cfg)
+    try:
+        return _json(actions.draw_lottery())
     finally:
         state.close()
 
@@ -127,14 +146,36 @@ def cmd_travel_now(cfg: dict, args: argparse.Namespace) -> int:
         state.close()
 
 
+def _print_ledger(progress: Progress) -> None:
+    print("-- 当日任务账本（接续文件）--")
+    print(f"  day            : {progress.day}")
+    flags = {DONE: "✓ 完成", IMPOSSIBLE: "— 今天做不了", "pending": "… 待重试"}
+    for name in TASK_ORDER:
+        rec = progress.get(name)
+        print(f"  {TASK_LABELS.get(name, name):8}: {flags.get(rec.state, rec.state):<12} "
+              f"尝试 {rec.attempts} 次  {rec.detail[:90]}")
+    verdict = "全部终态（今天 100% 完成或确实做不了）" if progress.all_terminal() \
+        else "仍有任务待重试"
+    print(f"  结论           : {verdict}")
+
+
 def cmd_once(cfg: dict, args: argparse.Namespace) -> int:
+    """手动：按账本跑完五个任务一遍（等价于一次重启自检）。"""
     state, _desktop, actions = build(cfg)
     try:
-        summary = actions.reconcile_all(reason="once")
-        print(json.dumps(config.scrub(summary), ensure_ascii=False, indent=2))
-        return 0 if summary["ok"] else 1
+        progress = Progress(default_path(cfg))
+        scheduler = Scheduler(cfg, state, actions, progress)
+        states = scheduler.verify_pass()
+        _print_ledger(progress)
+        print("\n" + json.dumps(config.scrub(states), ensure_ascii=False, indent=2))
+        return 0 if progress.all_terminal() else 1
     finally:
         state.close()
+
+
+def cmd_verify(cfg: dict, args: argparse.Namespace) -> int:
+    """只读式自检：读真实状态，把账本纠正到真实值（会补做没做的任务）。"""
+    return cmd_once(cfg, args)
 
 
 def cmd_status(cfg: dict, args: argparse.Namespace) -> int:
@@ -150,11 +191,18 @@ def cmd_status(cfg: dict, args: argparse.Namespace) -> int:
         alive = gb.available()
         page = "已打开" if alive and gb._iframe_ws() else ("未打开" if alive else "-")
         print(f"CDP {port:<16}: {'可达' if alive else '不可达（客户端未带调试端口启动）'}  页面: {page}")
-    print("-- 三条时间线（统一常驻进程）--")
-    for name, label in (("checkin", "签到检查"), ("exchange", "兑换检查"), ("travel", "旅行/派遣")):
+
+    progress = Progress(default_path(cfg))
+    print()
+    _print_ledger(progress)
+    if progress.silent_until:
+        print(f"  静默至         : {format_ts(progress.silent_until)}（次日 0 点翻页恢复）")
+    print()
+    print("-- 各任务下次检查 --")
+    for name in TASK_ORDER:
         due = state.kv_get_float(f"next_{name}_at")
-        shown = format_ts(due) if due else "首轮执行中（三条线顺序启动，稍后写入）"
-        print(f"  {label:10} 下次: {shown}")
+        shown = format_ts(due) if due else "-"
+        print(f"  {TASK_LABELS.get(name, name):8} {shown}")
     print("-- 最近运行 --")
     for row in state.recent(10):
         print(f"  {format_ts(row['ts'])}  {'OK' if row['ok'] else 'FAIL'}  {row['action']}: {row['detail'][:100]}")
@@ -165,7 +213,8 @@ def cmd_status(cfg: dict, args: argparse.Namespace) -> int:
 def cmd_daemon(cfg: dict, args: argparse.Namespace) -> int:
     state, _desktop, actions = build(cfg)
     stop = threading.Event()
-    scheduler = Scheduler(cfg, state, actions)
+    progress = Progress(default_path(cfg))
+    scheduler = Scheduler(cfg, state, actions, progress)
 
     def _stop(_signum, _frame):
         stop.set()
@@ -177,8 +226,10 @@ def cmd_daemon(cfg: dict, args: argparse.Namespace) -> int:
         signal.signal(signal.SIGINT, _stop)
     except (ImportError, ValueError):
         pass
-    print("[daemon] started: 三条时间线(checkin/exchange/travel)均已立即执行一轮；"
-          " 签到/兑换按日周期，旅行按真实倒计时滚动 (Ctrl-C 退出)")
+    # 重启不受静默控制：initial_jobs 让五个任务立刻各跑一遍（真实状态复核），
+    # 只有复核后仍全部终态才重新静默。账本里写错的 done 会在这一轮被纠正。
+    print("[daemon] started: 五个任务(签到/补签/兑换/抽奖/派遣)立即各复核一遍；"
+          " 全部终态后静默到 23:59，次日 0 点翻页 (Ctrl-C 退出)")
     try:
         scheduler.run_forever(stop=stop)
     finally:
@@ -222,7 +273,7 @@ def cmd_inspect(cfg: dict, args: argparse.Namespace) -> int:
     fst = fc.probe()
     print("\n== 签到状态（左下角 Buddy加油站 浮层）==")
     if not fst.get("ok"):
-        print(f"  读取失败: {fst.get('detail')}")
+        print(f"  外观读取失败: {fst.get('detail')}")
     else:
         card = fst.get("card") or {}
         print(f"  浮层卡片    : {card.get('title') or (fst.get('detail') or '')[:40]}")
@@ -231,10 +282,16 @@ def cmd_inspect(cfg: dict, args: argparse.Namespace) -> int:
               f"（type={(card.get('props') or {}).get('type')}）")
         print(f"  轮播        : " + ", ".join(
             f"{d.get('label')}{'*' if d.get('on') else ''}" for d in card.get("dots") or []))
-        verdict = ("今日可领（未签）" if fst.get("present")
-                   else "今日已领或浮层无签到项" if fst.get("claimed")
-                   else "状态未知")
-        print(f"  判定        : {verdict}")
+    # 权威判据：服务端 checkinData（不是卡片在不在）
+    auth = fc.status(refresh=True)
+    if auth.get("ok"):
+        print(f"  服务端已签  : {auth.get('today_checked_in')}"
+              f"（今日积分 {auth.get('today_credit')}，连签 {auth.get('streak_days')} 天）")
+        dates = auth.get("checkin_dates") or []
+        print(f"  最近签到日  : {', '.join(dates[:4]) or '-'}")
+        print(f"  判定        : {'今日已签到' if auth.get('today_checked_in') else '今日未签到（需补点）'}")
+    else:
+        print(f"  服务端状态读取失败: {auth.get('reason')}")
 
     ws = gb._iframe_ws()
     print(f"  成长中心 iframe : {'已打开' if ws else '未打开'}")
@@ -248,10 +305,19 @@ def cmd_inspect(cfg: dict, args: argparse.Namespace) -> int:
         print(f"  今日已打卡  : {st.get('checked')}")
         print(f"  连续登录    : {st.get('streak')} 天")
         print(f"  今日格子底色: {st.get('bg')}")
-        if st.get("makeup"):
-            print(f"  漏签可补    : {','.join(st['makeup'])}（补签卡不自动消耗）")
     else:
         print(f"  读取失败: {st.get('detail')}")
+
+    mk = gb.makeup_scan()
+    print("\n== 漏签补签 ==")
+    if mk.get("ok"):
+        items = mk.get("items") or []
+        print(f"  可补漏签    : {', '.join(str(i.get('date')) for i in items) or '无'}")
+        print(f"  补登卡      : {mk.get('card_text') or mk.get('card_balance')}")
+    else:
+        print(f"  读取失败: {mk.get('detail')}")
+    tickets, label = gb.lottery_tickets()
+    print(f"\n== 抽奖 ==\n  抽奖券      : {tickets}（{label or '按钮未找到'}）")
 
     page = gb.read_state()
     print("\n== 页面状态 ==")
@@ -306,13 +372,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="buddy-checkin")
     parser.add_argument("--config", help="path to config.toml")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("checkin-now", help="手动跑签到时间线一轮（只签到）")
-    sub.add_parser("exchange-now", help="手动跑兑换检查时间线一轮")
-    sub.add_parser("travel-now", help="手动跑旅行时间线一轮（领礼物→派遣→读倒计时）")
-    sub.add_parser("once", help="手动跑全量一轮（签到+礼物+兑换+旅行）")
-    sub.add_parser("status", help="只读状态：三条时间线下次执行时间")
-    sub.add_parser("inspect", help="只读诊断：打印客户端/浏览器窗口与关键 AX 文案（跨机器排查）")
-    sub.add_parser("daemon", help="统一常驻进程：三条独立时间线")
+    sub.add_parser("checkin-now", help="手动跑签到任务一轮（只签到）")
+    sub.add_parser("makeup-now", help="手动跑漏签补签（成长中心日历 + 补登卡）")
+    sub.add_parser("exchange-now", help="手动跑兑换任务一轮")
+    sub.add_parser("lottery-now", help="手动跑抽奖任务一轮")
+    sub.add_parser("travel-now", help="手动跑派遣任务一轮（领礼物→派遣→读倒计时）")
+    sub.add_parser("once", help="按账本跑完五个任务一遍（= 一次重启自检）")
+    sub.add_parser("verify", help="自检：用真实状态纠正账本并补做未完成任务")
+    sub.add_parser("status", help="只读状态：账本 + 各任务下次检查时间")
+    sub.add_parser("inspect", help="只读诊断：CDP/签到服务端状态/补签/抽奖（跨机器排查）")
+    sub.add_parser("daemon", help="统一常驻进程：五个任务滚动，全终态静默到 23:59")
     sub.add_parser("install-launchd", help="写 LaunchAgent plist（开机常驻，不自动加载）")
     sub.add_parser("model-check", help="show free-model policy and current acknowledgment state")
     # 第三方依赖：安装技能时必跑 deps check，确认 CuaDriver 已安装并授权
@@ -337,9 +406,12 @@ def main(argv: list[str] | None = None) -> int:
             return rc
     handlers = {
         "checkin-now": cmd_checkin_now,
+        "makeup-now": cmd_makeup_now,
         "exchange-now": cmd_exchange_now,
+        "lottery-now": cmd_lottery_now,
         "travel-now": cmd_travel_now,
         "once": cmd_once,
+        "verify": cmd_verify,
         "status": cmd_status,
         "inspect": cmd_inspect,
         "daemon": cmd_daemon,

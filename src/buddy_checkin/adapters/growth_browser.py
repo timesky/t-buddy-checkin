@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import logging
@@ -138,6 +139,7 @@ class GrowthBrowser:
         self.ab_bin = self._resolve_agent_browser(g)
         self.node_bin = self._resolve_node()
         self.cdp_js = ROOT / "tools" / "cdp_client.mjs"
+        self.cdp_input = ROOT / "tools" / "cdp_input.mjs"
         self.block: tuple[str, str] | None = None
         self.last_close_ok: bool = False
         self._owner_ok: bool = False
@@ -615,6 +617,317 @@ class GrowthBrowser:
             return True, str(info.get("sel", ""))
         return False, str(info.get("reason", "no_selector_hit"))
 
+    # ---- 真实输入（补签弹层只认 trusted click） -----------------------------
+    def _input_click(self, x: int, y: int, timeout: int = 15) -> tuple[bool, str]:
+        """在 iframe 视口坐标处发一次真实鼠标左键（CDP Input.dispatchMouseEvent）。"""
+        ws = self._iframe_ws()
+        if not ws:
+            return False, "growth iframe not open"
+        if not self.node_bin or not self.cdp_input.exists():
+            return False, "node / cdp_input.mjs unavailable"
+        try:
+            proc = subprocess.run(
+                [self.node_bin, str(self.cdp_input), ws, str(int(x)), str(int(y))],
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "input dispatch timeout"
+        raw = (proc.stdout or "").strip()
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return False, (raw or proc.stderr or "no output")[:200]
+        return bool(payload.get("ok")), str(payload.get("error") or "ok")
+
+    # ---- 补签（成长中心日历，消耗补登卡） -----------------------------------
+    MAKEUP_SCAN_JS = r"""
+(() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+  const cells = [...document.querySelectorAll('.gs-cal-cell.is-makeup-clickable')];
+  const items = cells.map(c => {
+    let remark = {};
+    try { remark = JSON.parse(c.getAttribute('dt-remark') || '{}'); } catch (e) {}
+    return {
+      date: remark.date || '',
+      balance: (remark.cardBalance === undefined ? null : remark.cardBalance),
+      label: norm(c.textContent)
+    };
+  });
+  const text = norm(document.body.innerText);
+  const m = text.match(/补[登签]卡\s*[×xX*]\s*(\d+)/);
+  return JSON.stringify({
+    items,
+    card_text: m ? m[0] : '',
+    card_balance: m ? parseInt(m[1], 10) : (items[0] && items[0].balance !== null ? items[0].balance : null)
+  });
+})()
+"""
+
+    def makeup_scan(self) -> dict:
+        """读漏签格（可补登）与补登卡余量。
+
+        实测（2026-11-14）：漏签格是
+        <button class="gs-cal-cell is-broken is-makeup-clickable"
+                dt-remark='{"date":"2026-11-01","cardBalance":2}'>1</button>
+        卡片余量同时出现在按钮的 dt-remark.cardBalance 和页面「补登卡 ×2」文案里。
+        """
+        ok, val = self._eval(self.MAKEUP_SCAN_JS)
+        if not ok:
+            return {"ok": False, "detail": str(val), "items": [], "card_balance": None}
+        info = val if isinstance(val, dict) else {}
+        return {
+            "ok": True,
+            "items": info.get("items") or [],
+            "card_balance": info.get("card_balance"),
+            "card_text": info.get("card_text") or "",
+        }
+
+    def _makeup_cell_rect(self, date: str) -> tuple[bool, dict | str]:
+        js = (
+            "(() => {"
+            "  const norm = s => (s || '').replace(/\\s+/g, ' ').trim();"
+            f"  const target = {json.dumps(str(date))};"
+            "  const cells = [...document.querySelectorAll('.gs-cal-cell.is-makeup-clickable')];"
+            "  const cell = cells.find(c => (c.getAttribute('dt-remark') || '').indexOf(target) >= 0);"
+            "  if (!cell) return JSON.stringify({ok:false, reason:'cell not found'});"
+            "  cell.scrollIntoView({block: 'center', behavior: 'instant'});"
+            "  const r = cell.getBoundingClientRect();"
+            "  return JSON.stringify({ok:true, cx: Math.round(r.left + r.width/2),"
+            "    cy: Math.round(r.top + r.height/2), w: Math.round(r.width), h: Math.round(r.height),"
+            "    vh: innerHeight, label: norm(cell.textContent)});"
+            "})()")
+        ok, val = self._eval(js)
+        if not ok:
+            return False, str(val)
+        return True, val if isinstance(val, dict) else {}
+
+    def _makeup_tip_rect(self) -> tuple[bool, dict | str]:
+        js = (
+            "(() => {"
+            "  const norm = s => (s || '').replace(/\\s+/g, ' ').trim();"
+            "  const tip = document.querySelector('.gs-cell-toast--makeup');"
+            "  if (!tip) return JSON.stringify({ok:false, reason:'makeup tip not shown'});"
+            "  const btn = tip.querySelector('.gs-cell-toast-action');"
+            "  if (!btn) return JSON.stringify({ok:false, reason:'use button missing'});"
+            "  const r = btn.getBoundingClientRect();"
+            "  return JSON.stringify({ok:true, cx: Math.round(r.left + r.width/2),"
+            "    cy: Math.round(r.top + r.height/2), text: norm(tip.textContent),"
+            "    btn: norm(btn.textContent)});"
+            "})()")
+        ok, val = self._eval(js)
+        if not ok:
+            return False, str(val)
+        return True, val if isinstance(val, dict) else {}
+
+    def _makeup_one(self, date: str) -> tuple[bool, str]:
+        """补签某一天：点漏签格 → 点「使用」消耗一张补登卡 → 复核格子变化。"""
+        ok, rect = self._makeup_cell_rect(date)
+        if not ok or not isinstance(rect, dict) or not rect.get("ok"):
+            return False, f"{date}: {rect}"
+        cy = int(rect.get("cy") or 0)
+        vh = int(rect.get("vh") or 0)
+        if vh and (cy < 0 or cy > vh):
+            return False, f"{date}: cell off-screen after scroll (cy={cy}, vh={vh})"
+
+        ok2, why = self._input_click(int(rect["cx"]), cy)
+        if not ok2:
+            return False, f"{date}: click cell failed ({why})"
+        time.sleep(0.8)
+
+        ok3, tip = self._makeup_tip_rect()
+        if not ok3 or not isinstance(tip, dict) or not tip.get("ok"):
+            return False, f"{date}: {tip}"
+        if "补登" not in str(tip.get("btn", "")) and "使用" not in str(tip.get("btn", "")):
+            return False, f"{date}: unexpected tip button {tip.get('btn')!r}"
+
+        ok4, why4 = self._input_click(int(tip["cx"]), int(tip["cy"]))
+        if not ok4:
+            return False, f"{date}: click 使用 failed ({why4})"
+        time.sleep(1.6)
+
+        scan = self.makeup_scan()
+        still = [i for i in scan.get("items") or [] if str(i.get("date")) == str(date)]
+        if still:
+            return False, f"{date}: still broken after 使用 (balance={scan.get('card_balance')})"
+        return True, f"{date} 补签成功"
+
+    @_auto_close
+    def makeup(self, max_cards: int | None = None) -> ActionResult:
+        """把当天能补的漏签都补掉（每补一天消耗一张补登卡）。
+
+        返回 data["state"]：
+          done         没有漏签了（补完或本来就没有）
+          impossible   还有漏签但补登卡为 0，今天补不了
+          pending      补签失败（页面没响应/点了没变化），稍后重试
+        """
+        opened = self.ensure_page()
+        if not opened.ok:
+            return ActionResult(False, "makeup", opened.detail,
+                                {"state": "pending"})
+        self._close_dialog()
+        scan = self.makeup_scan()
+        if not scan.get("ok"):
+            return ActionResult(False, "makeup", f"scan failed: {scan.get('detail')}",
+                                {"state": "pending"})
+        items = scan.get("items") or []
+        balance = scan.get("card_balance")
+        if not items:
+            return ActionResult(True, "makeup", "no missed day",
+                                {"state": "done", "broken": [], "card_balance": balance})
+        if balance == 0:
+            return ActionResult(
+                True, "makeup",
+                f"no makeup card left (missed={','.join(str(i.get('date')) for i in items)})",
+                {"state": "impossible", "broken": [i.get("date") for i in items],
+                 "card_balance": balance})
+
+        limit = len(items) if max_cards is None else min(len(items), int(max_cards))
+        if balance is not None:
+            limit = min(limit, int(balance))
+        done_days: list[str] = []
+        errors: list[str] = []
+        for item in items[:limit]:
+            date = str(item.get("date") or item.get("label") or "")
+            if not date:
+                continue
+            ok, detail = self._makeup_one(date)
+            if ok:
+                done_days.append(date)
+            else:
+                errors.append(detail)
+
+        after = self.makeup_scan()
+        left = after.get("items") or []
+        balance_after = after.get("card_balance")
+        data = {
+            "made_up": done_days,
+            "errors": errors,
+            "broken_left": [i.get("date") for i in left],
+            "card_balance": balance_after,
+        }
+        if not left:
+            data["state"] = "done"
+            return ActionResult(True, "makeup",
+                                f"made up {len(done_days)} day(s): {','.join(done_days) or '-'}",
+                                data)
+        if balance_after == 0:
+            data["state"] = "impossible"
+            return ActionResult(True, "makeup",
+                                f"made up {len(done_days)}; no card left for "
+                                f"{','.join(str(i.get('date')) for i in left)}", data)
+        data["state"] = "pending"
+        return ActionResult(
+            False, "makeup",
+            f"made up {len(done_days)}; still broken "
+            f"{','.join(str(i.get('date')) for i in left)}; errors={'; '.join(errors)[:200]}",
+            data)
+
+    # ---- 抽奖 ---------------------------------------------------------------
+    def lottery_tickets(self, st: dict | None = None) -> tuple[int, str]:
+        """读抽奖券数（按钮「抽奖(N)」）。返回 (N, 原始文案)。"""
+        state = st if st is not None else self.read_state()
+        for b in state.get("buttons", []):
+            label = _norm(b.get("t", ""))
+            m = re.search(r"抽奖\s*\((\d+)\)", label)
+            if m:
+                return int(m.group(1)), label
+        return 0, ""
+
+    @_auto_close
+    def lottery(self, max_draws: int = 10) -> ActionResult:
+        """把今天的抽奖券抽掉。
+
+        实测流程（2026-11-14，5.11.3）：
+          主面板按钮「抽奖(N)」 → 点开**子页**（不是弹层）
+          子页文案「福利抽奖 每日任务轮盘 … 当前剩余 N 次」
+          子页按钮 `button.gs-wheel-center`（文案「START抽奖」）→ 转盘
+          抽完显示「积分已发放，将在几分钟内到账 / 抽奖卡已用完 / 剩余抽奖卡 0」
+        所以「没抽到弹层」不能算失败，必须按子页结构走。
+
+        返回 data["state"]：done（券用完）/ impossible（本来就没券）/
+        pending（点了没反应，稍后重试）。
+        """
+        opened = self.ensure_page()
+        if not opened.ok:
+            return ActionResult(False, "lottery", opened.detail, {"state": "pending"})
+        self._close_dialog()
+        tickets, label = self.lottery_tickets()
+        if tickets <= 0:
+            return ActionResult(True, "lottery", "no lottery ticket",
+                                {"state": "done", "tickets": 0})
+
+        ok, clicked = self._click_text(label)
+        if not ok:
+            return ActionResult(False, "lottery", f"open lottery page failed: {clicked}",
+                                {"state": "pending", "tickets": tickets})
+        time.sleep(1.6)
+
+        draws = 0
+        errors: list[str] = []
+        for _ in range(min(tickets, max_draws)):
+            ok2, how = self._click_selectors((".gs-wheel-center",))
+            if not ok2:
+                errors.append(f"wheel button not found: {how}")
+                break
+            left = self._wait_draw_result(timeout=12.0)
+            draws += 1
+            if left is None:
+                errors.append("draw result not readable")
+                break
+            if left <= 0:
+                break
+
+        self._close_dialog()
+        time.sleep(0.5)
+        left_tickets, left_label = self.lottery_tickets()
+        data = {"draws": draws, "tickets_left": left_tickets,
+                "errors": errors, "label": left_label}
+        if left_tickets <= 0:
+            data["state"] = "done"
+            return ActionResult(True, "lottery",
+                                f"drew {draws} time(s), no ticket left", data)
+        data["state"] = "pending"
+        return ActionResult(
+            False, "lottery",
+            f"drew {draws}, {left_tickets} ticket(s) left; {('; '.join(errors))[:200]}",
+            data)
+
+    WHEEL_LEFT_JS = r"""
+(() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+  const sub = document.querySelector('.gs-embed-subpage') || document.body;
+  const t = norm(sub.innerText);
+  let left = null;
+  let m = t.match(/当前剩余\s*(\d+)\s*次/);
+  if (m) left = parseInt(m[1], 10);
+  if (left === null) {
+    m = t.match(/剩余抽奖卡\s*(\d+)/);
+    if (m) left = parseInt(m[1], 10);
+  }
+  const done = /抽奖卡已用完|抽奖次数已用完|已抽完/.test(t);
+  return JSON.stringify({
+    left: left, done: done, spinning: /转动中/.test(t),
+    text: t.slice(0, 200)
+  });
+})()
+"""
+
+    def _wait_draw_result(self, timeout: float = 12.0) -> int | None:
+        """等转盘转完，返回剩余抽奖券数；读不到返回 None。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.9)
+            ok, val = self._eval(self.WHEEL_LEFT_JS)
+            info = val if isinstance(val, dict) else {}
+            if not info:
+                continue
+            if info.get("done"):
+                return 0
+            left = info.get("left")
+            if isinstance(left, int) and not info.get("spinning"):
+                return left
+        return None
+
     def _close_dialog(self) -> bool:
         """收掉内部子页/弹层，回到成长中心主页面。
 
@@ -669,6 +982,24 @@ class GrowthBrowser:
         if not bool((self.cfg.get("growth", {}) or {}).get("close_page_after_action", True)):
             return
         self.close_page()
+
+    # ---- 批量会话（一次打开跑多个任务） ------------------------------------
+    @contextlib.contextmanager
+    def session(self):
+        """把多个任务合并到同一次打开里（补签/兑换/抽奖共用一页）。
+
+        否则每个任务各自打开→关闭，一轮要开关三四次窗口，又慢又打扰。
+        进入时 depth+1，内部方法的 _auto_close 就不会收尾；退出时统一收一次。
+        """
+        self._depth = getattr(self, "_depth", 0) + 1
+        if self._depth == 1:
+            self._opened_this_run = False
+        try:
+            yield self
+        finally:
+            self._depth -= 1
+            if self._depth == 0:
+                self._wrap_up_session()
 
     # ---- 业务动作 -----------------------------------------------------------
     @_auto_close
@@ -782,7 +1113,18 @@ class GrowthBrowser:
                     continue
                 target = unlocked[0]
                 ok2, click_label = self._click_text(target)
-                time.sleep(1.0)
+                time.sleep(1.4)
+                # 兑换后必须复核：奖励项应变成「已兑换」或从可兑列表消失，
+                # 只凭「点到了按钮」不算成功（否则账本会记成 done 而其实没兑）。
+                ver = self.read_state()
+                after_unlocked = [
+                    _norm(b.get("t", "")) for b in ver.get("buttons", [])
+                    if not b.get("dis")
+                    and is_exchange_reward(b.get("t", ""))
+                    and "还差" not in str(b.get("aria") or "")
+                    and "已兑换" not in str(b.get("aria") or "")
+                ]
+                consumed = len(after_unlocked) < len(unlocked)
                 self._close_dialog()
                 if not ok2 and any(m in str(click_label) + target for m in EXCHANGE_NO_MORE_MARKERS):
                     results.append(ActionResult(
@@ -790,8 +1132,11 @@ class GrowthBrowser:
                         {"kind": kind, "key": key, "skipped": True, "conclusive": True}))
                     continue
                 results.append(ActionResult(
-                    ok2, "exchange", f"milestone claimed: {target}",
-                    {"kind": kind, "key": key, "label": target}))
+                    ok2 and consumed, "exchange",
+                    f"milestone claimed: {target}" if consumed
+                    else f"milestone click had no effect: {target}",
+                    {"kind": kind, "key": key, "label": target, "consumed": consumed,
+                     "unlocked_before": len(unlocked), "unlocked_after": len(after_unlocked)}))
                 continue
 
             still = any(_norm(b.get("t", "")) == label for b in after.get("buttons", []))
@@ -817,6 +1162,7 @@ class GrowthBrowser:
                                 f"dispatch exhausted today (page shows {hit})",
                                 {"dispatch_blocked": "exhausted", "evidence": hit})
 
+        dispatched_now = False
         if state == "idle":
             ok, label = self._click_by_expr("/派猫猫旅行/.test(t)")
             if not ok:
@@ -827,6 +1173,7 @@ class GrowthBrowser:
                     False, "travel_dispatch", label,
                     {"dispatch_blocked": "exhausted" if hit else None})
             time.sleep(1.5)
+            dispatched_now = True
             st = self.read_state()
             state = st["state"]
 
@@ -860,9 +1207,10 @@ class GrowthBrowser:
         self._close_dialog()
         return ActionResult(
             True, "travel_dispatch",
-            f"dispatched; real duration {info['remaining_sec']}s",
+            (f"dispatched; real duration {info['remaining_sec']}s" if dispatched_now
+             else f"already traveling; real duration {info['remaining_sec']}s"),
             {"remaining_sec": info["remaining_sec"], "due_at": due,
-             "scene": self.scene or "default"})
+             "scene": self.scene or "default", "dispatched": dispatched_now})
 
     @_auto_close
     def tick(self, force: bool = False) -> ActionResult:
@@ -883,28 +1231,20 @@ class GrowthBrowser:
                 f"traveling; due from real countdown ({info['remaining_sec']}s)",
                 {"state": state, "due_at": due, "remaining_sec": info["remaining_sec"]})
 
-        if state in ("claimable", "gift_dialog") or force:
-            claimed = self.claim_gift()
-            dispatched = self.dispatch()
-            data: dict[str, Any] = {
-                "state": state, "due_at": dispatched.data.get("due_at"),
-                "claim": claimed.as_dict(), "dispatch": dispatched.as_dict(),
-            }
-            if dispatched.data.get("dispatch_blocked"):
-                data["dispatch_blocked"] = dispatched.data["dispatch_blocked"]
-            ok = dispatched.ok and (claimed.ok or claimed.data.get("state") == "traveling")
-            return ActionResult(ok, "travel",
-                                f"claim={claimed.detail}; dispatch={dispatched.detail}", data)
-
-        if state == "idle":
-            dispatched = self.dispatch()
-            data = {"state": state, "due_at": dispatched.data.get("due_at"),
-                    "dispatch": dispatched.as_dict()}
-            if dispatched.data.get("dispatch_blocked"):
-                data["dispatch_blocked"] = dispatched.data["dispatch_blocked"]
-            return ActionResult(dispatched.ok, "travel", dispatched.detail, data)
-
-        return ActionResult(False, "travel", f"unknown growth-center state: {state}", info)
+        # 不在旅行中（idle / claimable / gift_dialog / 未知）：先领奖，再派遣。
+        # 绝不能只派遣 —— 倒计时走完后页面回到 idle，「领取礼物」还在，
+        # 只派遣会把这次的奖励漏掉（2026-11-14 修正）。
+        claimed = self.claim_gift()
+        dispatched = self.dispatch()
+        data: dict[str, Any] = {
+            "state": state, "due_at": dispatched.data.get("due_at"),
+            "claim": claimed.as_dict(), "dispatch": dispatched.as_dict(),
+        }
+        if dispatched.data.get("dispatch_blocked"):
+            data["dispatch_blocked"] = dispatched.data["dispatch_blocked"]
+        ok = dispatched.ok and (claimed.ok or claimed.data.get("state") == "traveling")
+        return ActionResult(ok, "travel",
+                            f"claim={claimed.detail}; dispatch={dispatched.detail}", data)
 
     # ---- 签到（状态校验） ---------------------------------------------------
     @_auto_close

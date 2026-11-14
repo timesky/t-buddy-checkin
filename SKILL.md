@@ -38,12 +38,14 @@ CDP 端口是全新安装最容易漏的一步：客户端**不认** `--remote-d
 |---|---|---|
 | `deps check` | 逐项检查依赖（安装后必跑） | 否 |
 | `inspect` | 只读诊断：CDP 连通 / targets / 浮层签到状态 / 页面按钮（跨机器排查首选） | 否 |
-| `status` | 三条时间线下次执行时间 / 最近运行 | 否 |
-| `checkin-now` | 签到线一轮（点左下角浮层「立即领取」） | 否 |
-| `exchange-now` | 兑换检查线一轮 | 否 |
-| `travel-now` | 旅行线一轮（领礼物→派遣→读真实倒计时） | 否 |
-| `once` | 全量一轮 | 否 |
-| `daemon` | 统一常驻进程：三条独立时间线 | 否 |
+| `status` | 当日任务账本 + 各任务下次检查 + 最近运行 | 否 |
+| `checkin-now` | 每日签到一轮（点左下角浮层「立即领取」，服务端状态确认） | 否 |
+| `makeup-now` | 漏签补签（成长中心日历 + 补登卡） | 否 |
+| `exchange-now` | 兑换一轮 | 否 |
+| `lottery-now` | 抽奖一轮（抽到券为 0） | 否 |
+| `travel-now` | 派遣一轮（领礼物→派遣→读真实倒计时） | 否 |
+| `once` / `verify` | 按账本跑完五个任务（= 一次重启自检） | 否 |
+| `daemon` | 常驻：五个任务滚动，全终态静默到 23:59 | 否 |
 | `install-launchd` | 写 LaunchAgent plist（RunAtLoad+KeepAlive） | 加载命令由你确认 |
 | `model-check` | 查看免费模型策略与确认状态 | 否 |
 
@@ -58,24 +60,32 @@ CDP 端口是全新安装最容易漏的一步：客户端**不认** `--remote-d
   light DOM 永远为空（读 textContent 会误判浮层不存在）
 - 签到按钮 `#go` + `data-track-props={"type":"checkin"}`；成功后 `#tt` 出现
   「领取成功」，签到卡从轮播里消失
-- 只有「看到领取成功 / 签到卡消失」才写 `last_checkin_day`；浮层不在 = 未知，
-  下一轮重试（避免整天假阳性）
-- 漏签只能去成长中心日历消耗**补登卡**补，本技能不自动消耗
+- **权威判据是服务端状态**：React fiber 上 `AvatarTopComboSlot.checkinData`
+  （`today_checked_in` / `today_credit` / `checkin_dates`），可用
+  `onRefreshCheckin()` 现场重新拉一次。卡片在不在、toast 文案都只是外观，
+  不能当判据（卡片消失也可能是运营位换配置或被关掉）
+- 浮层被关掉时先从侧栏用户菜单重新唤起（`avatar_menu_fuel_station`），再点 `#go`
+- 漏签在成长中心日历补：漏签格 `.gs-cal-cell.is-makeup-clickable`（`dt-remark`
+  里有 date / cardBalance），点开 `.gs-cell-toast--makeup` 再点「使用」消耗一张
+  补登卡；**这些格子只认 CDP 真实鼠标事件**（`Input.dispatchMouseEvent`），
+  JS 的 `element.click()` 点了没有任何反应
 - `.gs-cal-cell.is-today` 实心绿只代表「今天有活跃记录」，仅作参考
 
-## 三条时间线
+## 五个任务与当日账本
 
-进程启动时**三条线都立即执行一次**，之后各自向后滚动：
+任务：`checkin` 签到 / `makeup` 补签 / `exchange` 兑换 / `lottery` 抽奖 / `travel` 派遣。
+每个任务给出三态之一，写进账本 `~/.local/share/buddy-web-checkin/progress.json`：
 
-| 线 | 周期 | 停止条件 |
-|---|---|---|
-| `checkin` | 每天 0 点恢复，每小时检查 | 确认已打卡 → 禁用到当天 23:59 |
-| `exchange` | 每天 0 点恢复，每小时检查 | 兑换成功 **或** 确认「本月已兑」→ 禁用到 23:59 |
-| `travel` | 按页面真实倒计时滚动（唯一动态） | 不停，领奖→再派遣→读新倒计时 |
+- `done`：用可复核证据确认完成（服务端状态 / 奖励项变已兑换 / 券为 0 / 次数用尽）
+- `impossible`：今天确实做不了（补登卡 0 / 没有抽奖券）
+- `pending`：还没成功，按 60→120→300→600s 退避重试
 
-**派遣时长每次不同**：页面只提示 1～4 小时，必须派遣后重读「旅行倒计时 HH:MM:SS」算 `due_at`，禁止写死间隔。
+**只有五项全部终态**才静默到 23:59；次日 0 点账本翻页。**重启不受静默控制**：
+启动即五项各跑一遍并用真实状态纠正账本，写错的 `done` 会被改回 `pending` 并补做。
 
-**派遣次数用尽**：页面出现「明天再来 / 今日已派完 / 次数已用完」→ `dispatch_blocked=exhausted`，旅行线禁用到 23:00（已过则次日 0 点）；标记落库，重启跳过实际检查，跨天自动清除。
+**派遣时长每次不同**：页面只提示 1～4 小时，必须派遣后重读「旅行倒计时 HH:MM:SS」
+算 `due_at`，禁止写死间隔。倒计时走完先领奖励（「领取礼物」）再派下一次；
+页面提示「明天再来 / 今日已派完 / 次数已用完」才记为今天结束。
 
 ## 执行约束
 

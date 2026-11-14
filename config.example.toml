@@ -25,13 +25,15 @@ enabled = true          # 签到时间线的总开关；周期见下方 [schedul
 # 只有看到「领取成功」/签到卡消失才落库；没有 24h 冷却。
 
 [schedule]
-# 统一常驻进程的三条时间线。只有 travel 是动态滚动：
-#   checkin   每天 0 点恢复每小时轮询，签到成功 -> 禁用到当天 23:59
-#   exchange  每天 0 点恢复每小时轮询，兑换成功或确认无可兑换 -> 禁用到当天 23:59
-#   travel    重启先领礼物/派遣，之后按页面真实倒计时设置下次检查
-# 进程启动时三条线都立即执行一次，然后各自从该时刻向后滚动。
+# 五个任务：签到 / 补签 / 兑换 / 抽奖 / 派遣。每个任务独立滚动：
+#   - 失败按 retry_backoff_sec 退避重试，直到成功或确认「今天做不了」
+#   - 只有五个任务全部 done/impossible（当日 100% 完成且无法继续）才静默到 silent_at
+#   - 次日 0 点账本翻页，全部重置
+#   - 进程重启不受静默控制：五个任务立刻用真实状态复核一遍（不信任账本）
 day_boundary = "00:00"
-hourly_interval_sec = 3600
+silent_at = "23:59"
+retry_backoff_sec = [60, 120, 300, 600]
+hourly_interval_sec = 3600    # 兼容旧配置，新调度用 retry_backoff_sec
 
 [gifts]
 enabled = true
@@ -57,7 +59,9 @@ open_labels = ["成长计划", "做任务赢积分", "任务中心"]
 open_wait_sec = 6
 scene = ""              # 可填 咖啡馆 / 商场店铺 / 健身房 / 古镇客栈；留空用默认
 claim_offset_sec = 3
-auto_exchange = true    # 补登卡等有限资源不会自动消耗
+auto_exchange = true    # 自动兑换连登里程碑奖励
+auto_lottery = true     # 自动抽奖：把「抽奖(N)」抽到 0
+auto_makeup = true      # 漏签自动补签（会消耗补登卡，卡为 0 则当天不再尝试）
 # 任务结束后关闭成长中心弹窗；只关本次工具自己打开的，用户开着的不动
 close_page_after_action = true
 

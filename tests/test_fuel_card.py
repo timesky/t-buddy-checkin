@@ -97,6 +97,47 @@ class FuelProbeTests(unittest.TestCase):
         self.assertEqual(st["card"]["title"], "Buddy加油站")
 
 
+class FuelStatusTests(unittest.TestCase):
+    """权威判据是服务端 checkinData，不是「卡片在不在」。"""
+
+    def setUp(self):
+        self.fc = FuelCard(_cfg())
+
+    def test_status_reads_server_fields(self):
+        payload = {"ok": True, "today_checked_in": True, "today_credit": 100,
+                   "streak_days": 36, "checkin_dates": ["2026-11-14", "2026-11-12"]}
+        self.fc._eval = lambda js, timeout=25: (True, payload)
+        st = self.fc.status(refresh=True)
+        self.assertTrue(st["ok"])
+        self.assertTrue(st["today_checked_in"])
+        self.assertEqual(st["today_credit"], 100)
+
+    def test_status_refresh_flag_toggles_the_js(self):
+        seen = {}
+
+        def fake_eval(js, timeout=25):
+            seen["js"] = js
+            return True, {"ok": True, "today_checked_in": False}
+
+        self.fc._eval = fake_eval
+        self.fc.status(refresh=True)
+        self.assertIn("if (true && props", seen["js"])
+        self.fc.status(refresh=False)
+        self.assertIn("if (false && props", seen["js"])
+
+    def test_status_failure_is_explicit(self):
+        self.fc._eval = lambda js, timeout=25: (False, "cdp eval timeout")
+        st = self.fc.status()
+        self.assertFalse(st["ok"])
+        self.assertIsNone(st["today_checked_in"])
+
+    def test_status_js_reads_both_key_styles(self):
+        js = FuelCard.STATUS_JS
+        self.assertIn("today_checked_in", js)
+        self.assertIn("todayCheckedIn", js)
+        self.assertIn("onRefreshCheckin", js)
+
+
 class FuelClaimTests(unittest.TestCase):
     def setUp(self):
         self.fc = FuelCard(_cfg())
@@ -104,43 +145,65 @@ class FuelClaimTests(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-    def test_already_claimed_does_not_click(self):
-        self.fc.probe = lambda switch_to_checkin=False: {
-            "ok": True, "present": False, "claimed": True, "card": {}, "cards": []}
-        self.fc._eval = lambda *a, **k: self.fail("已领过不该再点按钮")
+    def test_already_checked_in_does_not_click(self):
+        self.fc.status = lambda refresh=True: {
+            "ok": True, "today_checked_in": True, "today_credit": 100,
+            "streak_days": 36}
+        self.fc._eval = lambda *a, **k: self.fail("服务端已签就不该再点按钮")
         r = self.fc.claim()
         self.assertTrue(r.ok)
         self.assertTrue(r.data.get("already"))
+        self.assertTrue(r.data.get("confirmed"))
 
-    def test_unknown_bubble_does_not_claim(self):
-        self.fc.probe = lambda switch_to_checkin=False: {
-            "ok": True, "present": False, "claimed": None,
-            "detail": "fuel card not rendered", "card": {}, "cards": []}
-        self.fc._eval = lambda *a, **k: self.fail("浮层不在时不该盲点")
+    def test_unreadable_status_does_not_blind_click(self):
+        self.fc.status = lambda refresh=True: {
+            "ok": False, "reason": "checkinData not found", "today_checked_in": None}
+        self.fc._eval = lambda *a, **k: self.fail("读不到状态时不该盲点")
         r = self.fc.claim()
         self.assertFalse(r.ok)
         self.assertFalse(r.data.get("confirmed"))
 
-    def test_success_toast_confirms(self):
+    def test_claim_confirmed_by_server_status(self):
         seq = [
-            {"ok": True, "present": True, "claimed": False, "card": _card(), "cards": []},
-            {"ok": True, "present": False, "claimed": True,
-             "card": _card(toast="领取成功", btn="已领取"), "cards": []},
+            {"ok": True, "today_checked_in": False, "today_credit": 0},
+            {"ok": True, "today_checked_in": True, "today_credit": 100,
+             "streak_days": 36},
         ]
-        self.fc.probe = lambda switch_to_checkin=False: seq.pop(0) if seq else {
-            "ok": True, "present": False, "claimed": True,
-            "card": _card(toast="领取成功"), "cards": []}
+
+        def fake_status(refresh=True):
+            if seq:
+                return seq.pop(0)
+            return {"ok": True, "today_checked_in": True, "today_credit": 100}
+
+        self.fc.status = fake_status
+        self.fc.ensure_visible = lambda: (True, "visible")
         self.fc._eval = lambda js, timeout=20: (True, {"ok": True, "btn": "立即领取"})
         r = self.fc.claim()
         self.assertTrue(r.ok)
         self.assertTrue(r.data.get("confirmed"))
+        self.assertEqual(r.data.get("today_credit"), 100)
 
-    def test_click_without_confirmation_is_failure(self):
-        self.fc.probe = lambda switch_to_checkin=False: {
-            "ok": True, "present": True, "claimed": False, "card": _card(), "cards": []}
+    def test_click_without_server_confirmation_is_failure(self):
+        self.fc.status = lambda refresh=True: {
+            "ok": True, "today_checked_in": False, "today_credit": 0}
+        self.fc.ensure_visible = lambda: (True, "visible")
         self.fc._eval = lambda js, timeout=20: (True, {"ok": True, "btn": "立即领取"})
         r = self.fc.claim(wait_sec=0.1)
-        self.assertFalse(r.ok, "点了但没确认，不能报成功")
+        self.assertFalse(r.ok, "点了但服务端仍说未签，不能报成功")
+
+    def test_hidden_bubble_is_reopened_before_click(self):
+        reopened = {"n": 0}
+
+        def fake_visible():
+            reopened["n"] += 1
+            return True, "reopened"
+
+        self.fc.status = lambda refresh=True: {
+            "ok": True, "today_checked_in": False, "today_credit": 0}
+        self.fc.ensure_visible = fake_visible
+        self.fc._eval = lambda js, timeout=20: (True, {"ok": True})
+        self.fc.claim(wait_sec=0.1)
+        self.assertEqual(reopened["n"], 1, "浮层被关掉时必须先重新打开")
 
     def test_click_js_only_targets_checkin_button(self):
         """只许点 #go 且 props.type==='checkin'；关闭按钮 #x 永远不碰。"""

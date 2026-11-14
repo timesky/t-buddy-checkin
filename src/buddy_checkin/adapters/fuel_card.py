@@ -16,11 +16,18 @@
         button#go          当前卡片的按钮
                            data-track-props={"index":0,"type":"checkin"}
 
-点击 #go 会经 bridge 事件 checkin_clicked 触发宿主 claimDailyCheckin()
-（POST /v2/billing/meter/daily-checkin），成功后该卡片从轮播里消失、轮播自动
-切到下一张，因此「加油站卡片是否还在」就是最可靠的签到状态。
+**权威判据**（2026-11-14 二次更正）：不看卡片在不在、也不看 toast，而是读
+React fiber 上 `AvatarTopComboSlot` 的 `checkinData` —— 那是宿主从
+`/v2/billing/meter/checkin-activity-status` 拿到的服务端状态；配合
+`onRefreshCheckin()` 可以现场重新拉一次。字段（服务端原始名）：
 
-补签不在浮层：漏签只能去成长中心日历点漏签格，消耗补登卡（本模块不管）。
+    today_checked_in : 今天是否已签
+    today_credit     : 今天已领积分
+    streak_days      : 连续签到天数
+    checkin_dates    : 已签日期列表（含今天即已签）
+
+用「卡片消失」当判据是不够的：卡片消失既可能是签到了，也可能是运营位换了
+配置或被用户手动关掉；反过来卡片还在也不代表没签（隔天乐观展示）。
 """
 from __future__ import annotations
 
@@ -36,7 +43,7 @@ ROOT = Path(__file__).resolve().parents[3]
 
 # 浮层里签到卡片的标题（轮播点的 aria-label 也是它）
 CHECKIN_LABEL = "Buddy加油站"
-# 领取成功后的确定性文案（toast / 按钮）
+# 领取成功后的确定性文案（toast / 按钮），仅用于诊断展示
 CLAIMED_MARKERS = ("领取成功", "已领取", "今日已领", "明天再来")
 
 
@@ -131,9 +138,73 @@ class FuelCard:
                 return True, val
         return True, val
 
-    # ---- 读取 ---------------------------------------------------------------
-    # 只在 shadow DOM 里读：浮层由远端 slot html 渲染，light DOM 永远是空的，
-    # 之前查 textContent 为空就以为「浮层没出现」。
+    # ---- 权威状态（React fiber → 服务端 checkinData） -----------------------
+    STATUS_JS = r"""
+(async () => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+  const pick = (o, ...keys) => {
+    for (const k of keys) if (o && o[k] !== undefined && o[k] !== null) return o[k];
+    return undefined;
+  };
+  let host = null;
+  for (const h of document.querySelectorAll('*')) {
+    if (h.shadowRoot && h.shadowRoot.getElementById('go')) { host = h; break; }
+  }
+  let props = null;
+  if (host) {
+    const key = Object.keys(host).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactProps$'));
+    let f = key ? host[key] : null, depth = 0;
+    while (f && depth < 30) {
+      const p = f.memoizedProps || f.pendingProps || {};
+      if (p && p.checkinData && (p.onRefreshCheckin || p.onCheckinClaim)) { props = p; break; }
+      f = f.return; depth++;
+    }
+  }
+  let data = props ? props.checkinData : null;
+  let refresh_error = null;
+  if (DATA_REFRESH && props && typeof props.onRefreshCheckin === 'function') {
+    try {
+      const fresh = await props.onRefreshCheckin();
+      if (fresh) data = fresh;
+    } catch (e) { refresh_error = String(e); }
+  }
+  if (!data) {
+    return JSON.stringify({ok: false, reason: 'checkinData not found (slot not mounted)',
+      host: !!host, refresh_error});
+  }
+  const dates = pick(data, 'checkin_dates', 'checkinDates') || [];
+  return JSON.stringify({
+    ok: true,
+    active: !!pick(data, 'active'),
+    today_checked_in: !!pick(data, 'today_checked_in', 'todayCheckedIn'),
+    today_credit: pick(data, 'today_credit', 'todayCredit') ?? 0,
+    daily_credit: pick(data, 'daily_credit', 'dailyCredit') ?? 0,
+    streak_days: pick(data, 'streak_days', 'streakDays') ?? 0,
+    total_credits: pick(data, 'total_credits', 'totalCredits') ?? 0,
+    checkin_dates: dates.slice(0, 60),
+    theme_name: pick(data, 'theme_name', 'themeName') || '',
+    claim_button_text: pick(data, 'claim_button_text', 'claimButtonText') || '',
+    refresh_error,
+    refreshed: DATA_REFRESH,
+    has_props: !!props
+  });
+})()
+"""
+
+    def status(self, refresh: bool = True) -> dict:
+        """读签到状态；refresh=True 时现场向服务端重新拉一次。
+
+        返回 {ok, today_checked_in, today_credit, streak_days, checkin_dates, ...}
+        ok=False 表示浮层未挂载/读不到，**不能**据此判断「已签」。
+        """
+        js = self.STATUS_JS.replace(
+            "DATA_REFRESH", "true" if refresh else "false")
+        ok, val = self._eval(js, timeout=25)
+        if not ok:
+            return {"ok": False, "reason": str(val), "today_checked_in": None}
+        return val if isinstance(val, dict) else {"ok": False, "reason": "bad payload"}
+
+    # ---- 读取（诊断用：卡片/轮播/toast） ------------------------------------
     PROBE_JS = r"""
 (() => {
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
@@ -167,29 +238,22 @@ class FuelCard:
 """
 
     def probe(self, switch_to_checkin: bool = False) -> dict:
-        """读浮层状态。
-
-        返回 {ok, present, claimed, card:{...}, cards:[...], detail}
-        present = 轮播里还有「Buddy加油站」这张卡（=今天还能领）
-        """
+        """读浮层外观状态（轮播/当前卡/按钮），仅诊断用，不作签到判据。"""
         ok, val = self._eval(self.PROBE_JS)
         if not ok:
             return {"ok": False, "present": False, "claimed": None,
                     "detail": str(val), "cards": []}
         cards = (val or {}).get("cards") or []
         if not cards:
-            # 浮层不在（被关掉 / 未登录 / 运营位未下发）：状态未知，绝不判「已签」
             return {"ok": True, "present": False, "claimed": None,
                     "detail": "fuel card not rendered (closed, logged out or no slot config)",
                     "cards": []}
 
         for card in cards:
             labels = [d.get("label") for d in (card.get("dots") or [])]
-            has_checkin_item = CHECKIN_LABEL in labels
-            active_is_checkin = (card.get("props") or {}).get("type") == "checkin"
-            card["has_checkin_item"] = has_checkin_item
-            card["active_is_checkin"] = active_is_checkin
-            if has_checkin_item and not active_is_checkin:
+            card["has_checkin_item"] = CHECKIN_LABEL in labels
+            card["active_is_checkin"] = (card.get("props") or {}).get("type") == "checkin"
+            if card["has_checkin_item"] and not card["active_is_checkin"]:
                 card["checkin_index"] = labels.index(CHECKIN_LABEL)
         card = next((c for c in cards if c.get("has_checkin_item")
                      or c.get("active_is_checkin")), cards[0])
@@ -197,7 +261,7 @@ class FuelCard:
             idx = card.get("checkin_index", 0)
             ok2, _ = self._eval(self._switch_js(idx))
             if ok2:
-                time.sleep(0.8)
+                time.sleep(0.6)
                 again = self.probe(switch_to_checkin=False)
                 if again.get("cards"):
                     card = again["card"]
@@ -207,7 +271,6 @@ class FuelCard:
                           for m in CLAIMED_MARKERS)
             present = not claimed and not card.get("btn_disabled")
         else:
-            # 当前卡片不是签到卡：签到项还在轮播里 -> 未领；不在了 -> 今天已领/已下线
             present = bool(card.get("has_checkin_item"))
             claimed = None if present else True
         return {"ok": True, "present": present, "claimed": claimed,
@@ -226,53 +289,109 @@ class FuelCard:
             "})()"
         )
 
+    # ---- 浮层是否可点 -------------------------------------------------------
+    def ensure_visible(self) -> tuple[bool, str]:
+        """确保签到浮层在 DOM 里（被关掉时从用户菜单重新唤起）。"""
+        ok, val = self._eval(
+            "(() => { for (const h of document.querySelectorAll('*')) {"
+            "  if (h.shadowRoot && h.shadowRoot.getElementById('go')) "
+            "    return JSON.stringify({ok:true}); } "
+            "  return JSON.stringify({ok:false}); })()")
+        if ok and isinstance(val, dict) and val.get("ok"):
+            return True, "visible"
+
+        # 浮层被关掉：从侧栏用户菜单的「Buddy加油站」重新打开
+        reopen = (
+            "(() => {"
+            "  const norm = s => (s || '').replace(/\\s+/g, ' ').trim();"
+            "  const item = [...document.querySelectorAll('[data-track-id]')]"
+            "    .find(e => /fuel_station|menu_signin|fuel/.test(e.getAttribute('data-track-id') || ''));"
+            "  if (item) { item.click(); return JSON.stringify({ok:true, how:'menu_item'}); }"
+            "  const trigger = document.querySelector('[data-track-id=\"user_avatar_menu\"]')"
+            "    || document.querySelector('.user-menu-trigger');"
+            "  if (!trigger) return JSON.stringify({ok:false, reason:'no menu trigger'});"
+            "  trigger.click();"
+            "  return JSON.stringify({ok:true, how:'open_menu'});"
+            "})()")
+        ok2, val2 = self._eval(reopen)
+        if not ok2 or not (isinstance(val2, dict) and val2.get("ok")):
+            return False, f"cannot reopen fuel card: {val2}"
+        if (val2 or {}).get("how") == "open_menu":
+            time.sleep(0.9)
+            ok3, val3 = self._eval(
+                "(() => {"
+                "  const item = document.querySelector('[data-track-id=\"avatar_menu_fuel_station\"]');"
+                "  if (!item) return JSON.stringify({ok:false, reason:'fuel menu item missing'});"
+                "  item.click(); return JSON.stringify({ok:true});"
+                "})()")
+            if not ok3 or not (isinstance(val3, dict) and val3.get("ok")):
+                return False, f"cannot reopen fuel card: {val3}"
+
+        for _ in range(10):
+            time.sleep(0.4)
+            ok4, val4 = self._eval(
+                "(() => { for (const h of document.querySelectorAll('*')) {"
+                "  if (h.shadowRoot && h.shadowRoot.getElementById('go')) "
+                "    return JSON.stringify({ok:true}); } "
+                "  return JSON.stringify({ok:false}); })()")
+            if isinstance(val4, dict) and val4.get("ok"):
+                return True, "reopened"
+        return False, "fuel card did not reappear after reopen"
+
     # ---- 动作 ---------------------------------------------------------------
-    def claim(self, wait_sec: float = 6.0) -> ActionResult:
-        """点浮层「立即领取」完成今日签到，并确认真的领到了。"""
-        st = self.probe(switch_to_checkin=True)
+    def claim(self, wait_sec: float = 25.0) -> ActionResult:
+        """点浮层「立即领取」完成今日签到，用服务端状态确认。"""
+        st = self.status(refresh=True)
         if not st.get("ok"):
-            return ActionResult(False, "checkin", st.get("detail") or "probe failed",
-                                {"confirmed": False, "source": "fuel-card"})
-        card = st.get("card") or {}
-        if st.get("present") is False and st.get("claimed") is True:
-            return ActionResult(True, "checkin", "already claimed today (fuel card gone)",
-                                {"confirmed": True, "already": True, "source": "fuel-card"})
-        if not st.get("present"):
             return ActionResult(
                 False, "checkin",
-                f"fuel card not claimable: {st.get('detail')} "
-                f"(toggle={[(d.get('label'), d.get('on')) for d in card.get('dots') or []]})",
+                f"cannot read checkin status: {st.get('reason') or st.get('refresh_error')}",
                 {"confirmed": False, "source": "fuel-card"})
+        if st.get("today_checked_in"):
+            return ActionResult(
+                True, "checkin",
+                f"already checked in today (credit={st.get('today_credit')}, "
+                f"streak={st.get('streak_days')}d)",
+                {"confirmed": True, "already": True, "source": "fuel-card",
+                 "today_credit": st.get("today_credit"), "streak_days": st.get("streak_days")})
+
+        visible, why = self.ensure_visible()
+        if not visible:
+            return ActionResult(False, "checkin", why,
+                                {"confirmed": False, "source": "fuel-card"})
 
         ok, val = self._eval(self._click_js())
-        if not ok:
-            return ActionResult(False, "checkin", f"click failed: {val}",
-                                {"confirmed": False, "source": "fuel-card"})
         info = val if isinstance(val, dict) else {}
-        if not info.get("ok"):
-            return ActionResult(False, "checkin",
-                                f"claim button unavailable: {info.get('reason')}",
-                                {"confirmed": False, "source": "fuel-card"})
+        if not ok or not info.get("ok"):
+            # 卡片不在轮播里（例如已下线/被关闭）时退化为直接触发宿主事件
+            ok2, val2 = self._eval(
+                "(() => { const B = window.__HOST_BRIDGE__; if (!B || !B.emit) "
+                "return JSON.stringify({ok:false}); B.emit('checkin_clicked'); "
+                "return JSON.stringify({ok:true, how:'emit'}); })()")
+            if not ok2 or not (isinstance(val2, dict) and val2.get("ok")):
+                return ActionResult(
+                    False, "checkin",
+                    f"claim button unavailable: {info.get('reason') or val}",
+                    {"confirmed": False, "source": "fuel-card"})
 
         deadline = time.time() + wait_sec
-        last = {}
+        last: dict = {}
         while time.time() < deadline:
-            time.sleep(0.6)
-            after = self.probe()
-            last = after
-            toast = ((after.get("card") or {}).get("toast") or "")
-            if any(m in toast for m in CLAIMED_MARKERS):
-                return ActionResult(True, "checkin", f"claimed: {toast}",
-                                    {"confirmed": True, "toast": toast,
-                                     "source": "fuel-card"})
-            if after.get("present") is False:
-                return ActionResult(True, "checkin", "claimed: checkin card removed",
-                                    {"confirmed": True, "source": "fuel-card"})
+            time.sleep(1.5)
+            last = self.status(refresh=True)
+            if last.get("ok") and last.get("today_checked_in"):
+                return ActionResult(
+                    True, "checkin",
+                    f"claimed: credit={last.get('today_credit')}, "
+                    f"streak={last.get('streak_days')}d",
+                    {"confirmed": True, "source": "fuel-card",
+                     "today_credit": last.get("today_credit"),
+                     "streak_days": last.get("streak_days")})
         return ActionResult(
             False, "checkin",
-            f"clicked but no confirmation in {wait_sec}s "
-            f"(toast={(last.get('card') or {}).get('toast')!r}, "
-            f"btn={(last.get('card') or {}).get('btn')!r})",
+            f"clicked but server still says not checked in after {wait_sec:.0f}s "
+            f"(today_credit={last.get('today_credit')}, "
+            f"refresh_error={last.get('refresh_error')})",
             {"confirmed": False, "source": "fuel-card"})
 
     @staticmethod

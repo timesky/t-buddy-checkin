@@ -89,32 +89,49 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.workbuddy-cdp-
 
 ```bash
 ./run.sh deps check        # 依赖检查（不消耗模型额度）
-./run.sh inspect           # 只读诊断：CDP / targets / 签到状态 / 页面按钮
-./run.sh status            # 三条时间线的下次执行时间 + 最近运行
-./run.sh checkin-now       # 只跑签到状态校验
-./run.sh travel-now        # 只跑旅行线（领礼物→派遣→读真实倒计时）
-./run.sh exchange-now      # 只跑兑换检查
-./run.sh once              # 全量一轮
-./run.sh daemon            # 常驻：三条时间线
+./run.sh inspect           # 只读诊断：CDP / 签到服务端状态 / 漏签 / 抽奖券 / 页面按钮
+./run.sh status            # 当日任务账本 + 各任务下次检查 + 最近运行
+./run.sh checkin-now       # 只跑每日签到
+./run.sh makeup-now        # 只跑漏签补签（成长中心日历 + 补登卡）
+./run.sh exchange-now      # 只跑兑换
+./run.sh lottery-now       # 只跑抽奖
+./run.sh travel-now        # 只跑派遣（领礼物→派遣→读真实倒计时）
+./run.sh once              # 按账本跑完五个任务一遍（= 一次重启自检）
+./run.sh verify            # 同 once：用真实状态纠正账本并补做未完成任务
+./run.sh daemon            # 常驻：五个任务滚动，全终态静默到 23:59
 ./run.sh install-launchd   # 写 LaunchAgent plist（不自动加载）
 ```
 
 除 `deps` / `inspect` / `install-launchd` / `model-check` 外都要带 `BUDDY_FREE_MODEL=1`（免费模型闸门，plist 内已内置）。
 
-## 三条时间线
+## 五个任务与当日账本
 
-| 线 | 周期 | 成功后的处理 |
+| 任务 | 完成判据（可复核的证据） | 今天做不了（impossible） |
 |---|---|---|
-| checkin | 每天 0 点恢复，每小时轮询 | 确认已打卡 → 禁用到当天 23:59 |
-| exchange | 每天 0 点恢复，每小时轮询 | 兑换成功 / 明确「本月已兑」→ 禁用到 23:59 |
-| travel | 动态滚动 | 每次读页面真实倒计时设置下次检查 |
+| checkin | 服务端 `today_checked_in=true`（含 `checkin_dates` 有今天） | 活动未开启 |
+| makeup | 日历里没有可补漏签格 | 还有漏签但补登卡为 0 |
+| exchange | 兑换成功（奖励项变「已兑换」）或明确「本月已兑」 | — |
+| lottery | 「抽奖(N)」的券抽到 0（子页显示剩余 0） | 本来就没有券 |
+| travel | 派遣次数用尽且没有可领奖励 | — |
 
-派遣实际时长每次不同（页面只提示 1~4 小时），所以绝不套固定间隔；派遣次数用尽时禁用到 23:00。
+账本 `~/.local/share/buddy-web-checkin/progress.json` 记录每个任务的状态：
+
+- `pending` 没成功，按 60s → 120s → 300s → 600s 退避重试
+- `done` / `impossible` 今天结束，不再尝试
+- **五个任务全部终态** = 当日 100% 完成且无法继续 → 静默到 23:59
+- 次日北京时间 0 点账本翻页，全部重置
+- **重启不受静默控制**：进程启动时五个任务立刻用真实状态复核一遍，账本写错的
+  `done` 会被改回 `pending` 并立即补做（已实测：把账本全改成 done 后重启，
+  travel 被纠正回 pending）
+
+派遣是唯一按真实倒计时滚动的任务：每次都从页面读「旅行倒计时 HH:MM:SS」，
+到点先领奖励再派下一次，绝不写死间隔；页面提示次数用尽才记为今天结束。
 
 ## 幂等与安全边界
 
 - 所有领取经 `state.claim_once` 幂等，重启不重复领
-- **不自动消耗补签卡**、不点「去完成」类任务、不自动登录、不填账号密码、不绕验证码
+- 漏签补签**会消耗补登卡**（按需求开启）；卡为 0 时当天不再尝试，绝不凭空补
+- 不点「去完成」类任务、不自动登录、不填账号密码、不绕验证码
 - 不改客户端登录态，不读取/解密任何 token；日志与 `discovered.json` 走敏感键脱敏
 - CDP 不可达时明确报错并给出修复命令，不静默降级到其它通道
 - 任务结束后关闭自己打开的成长中心弹窗；用户手动打开的页面不动（`[growth].close_page_after_action`，默认 true）
@@ -126,11 +143,18 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.workbuddy-cdp-
 | `deps check` 报 WorkBuddy CDP MISSING | 没设环境变量或没重启客户端 → 跑 `scripts/launch-workbuddy-debug.sh` |
 | `cdp eval timeout` | 客户端卡住或端口被占 → 重启客户端后 `./run.sh inspect` |
 | `growth-center iframe not found` | 页面被关掉了 → 跑任意 `*-now` 命令会自动从侧栏入口重新打开 |
-| 签到一直 `ok=False` | 今天还没对话 → 正常发一次消息即可；或看 `inspect` 的 `今日已打卡` |
+| 签到一直 `ok=False` | 看 `inspect` 的「服务端已签」；为 false 说明点击没生效，检查浮层是否被关掉（技能会自动从用户菜单重新唤起） |
+| 补签没做 | `inspect` 的「可补漏签 / 补登卡」；卡为 0 就是当天补不了，等下次活动发卡 |
+| 抽奖没抽 | 券来自兑换连登奖励；`inspect` 看「抽奖券」，为 0 即今天没有 |
 | 派遣 `dispatch not confirmed (state=scene_dialog)` | 场景弹窗没走完 → 查 `inspect` 的页面状态，必要时手动点一次 |
 | 另一台机器入口文案不同 | 改 `[growth].open_labels`（如 `["成长计划"]`） |
 
 ## 变更记录
+
+- **2026-11-14（第二轮）**：改成「五任务 + 当日账本」模型。签到判据换成服务端
+  `checkinData`（`onRefreshCheckin` 现场刷新），不再用「卡片在不在」推测；新增漏签
+  自动补签（补签格只认 CDP 真实鼠标事件，JS `click()` 无效）、自动抽奖（抽奖是子页
+  不是弹层）、兑换后必须复核奖励项变化；全部任务终态才静默，重启强制用真实状态复核账本。
 
 - **2026-11-14**：更正签到通道 —— 签到一直在主窗口左下角「Buddy加油站」浮层（shadow DOM 内的远端 slot html），新增 `adapters/fuel_card.py`；`GrowthBrowser.checkin()` 降级为「活跃地图只读参考」。修正 11-12 的错误结论（当时因 `app.asar` 搜不到该文案就判定"按钮已取消"，导致签到线连着两天一次都没真正执行却报成功）。
 - **2026-11-12**：改用 CDP 通道（agent-browser + 客户端调试端口）。签到从「点按钮」改为「读活跃地图状态」。删除 `adapters/desktop.py`（CuaDriverSigner）与 `adapters/growth.py`（GrowthCenter），CuaDriver 不再是依赖。

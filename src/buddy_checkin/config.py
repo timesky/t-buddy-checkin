@@ -40,6 +40,10 @@ DEFAULTS: dict[str, Any] = {
     # 三条线在进程启动时都立即执行一次，再各自从该时刻向后滚动。
     "schedule": {
         "day_boundary": "00:00",
+        # 失败重试退避（秒）；用尽后停在最后一档，直到成功或确认今天做不了
+        "retry_backoff_sec": [60, 120, 300, 600],
+        # 全部任务终态后静默到这个时刻（北京时间），次日 0 点自动翻页
+        "silent_at": "23:59",
         "hourly_interval_sec": 3600,
     },
     "gifts": {
@@ -86,7 +90,11 @@ DEFAULTS: dict[str, Any] = {
         "open_wait_sec": 6,
         "scene": "",              # 留空用页面默认场景
         "claim_offset_sec": 3,    # 倒计时归零后再等 3 秒，避免服务端未结算
-        "auto_exchange": True,    # 自动兑换连登奖励/抽奖/满能量盲盒；补登卡永不自动消耗
+        "auto_exchange": True,    # 自动兑换连登奖励/抽奖券/满能量盲盒
+        # 自动抽奖：把「抽奖(N)」的券抽到 0；没有券即今天做不了
+        "auto_lottery": True,
+        # 补签：漏签格用补登卡补，卡为 0 即今天补不了（不凭空消耗）
+        "auto_makeup": True,
         # 任务结束（领取/派遣/兑换/签到校验）后关闭成长中心弹窗。
         # 只关「本次由工具打开」的弹窗；用户自己开着的页面保持不动，不抢界面。
         "close_page_after_action": True,

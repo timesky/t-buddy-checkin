@@ -1,28 +1,42 @@
-"""业务编排：签到 -> 礼物兑换 -> 派遣 -> 精确到期领礼物 -> 再次派遣。
+"""业务编排：签到 → 漏签补签 → 兑换 → 抽奖 → 派遣/领奖。
 
-所有领取都经 State.claim_once 幂等。**全部走 CDP（agent-browser + 客户端调试端口）**：
+每个任务都返回 ActionResult，并且 **data["state"]** 明确表达当天的可终止性：
 
-  - 每日签到      : 点主窗口左下角「Buddy加油站」浮层的「立即领取」（FuelCard）。
-                    2026-11-14 更正：签到从来没在成长中心，之前改成「读活跃地图」
-                    是误判 —— 活跃地图只记录有没有用客户端，和签到领积分无关，
-                    结果整条签到线一次都没执行却报 confirmed=True。
-  - 礼物/派遣/兑换  : GrowthBrowser 直连成长中心 iframe，DOM 级 click
+    done          已用可复核证据确认今天做完了
+    impossible    今天确实做不了（补登卡 0 / 没有抽奖券 / 派遣次数用尽）
+    pending       还没成功或没有确定性结论，稍后重试
 
-旧的 CuaDriver / AX 通道（desktop.CuaDriverSigner、growth.GrowthCenter）
-已不再被 build() 装配，配置文件里的 ax 相关键仅作历史兼容。
-不自动登录、不消耗补签卡、不做「去完成」类任务。
+账本（progress.py）按这个 state 记录；只有全部 done/impossible 才静默到 23:59。
+判断依据都落在「服务端状态」或「DOM 事实变化」上，绝不用「按钮不在=做完了」
+这类推测（2026-11-13 就是这样把漏签记成已签的）。
+
+通道分工（2026-11-14 实测，5.11.3）：
+  - 每日签到    : 主窗口左下角「Buddy加油站」浮层（FuelCard），判据取 React
+                  fiber 上的 checkinData（服务端 /checkin-activity-status）
+  - 漏签补签    : 成长中心日历漏签格 + 补登卡（GrowthBrowser.makeup），
+                  补签格只认真实鼠标事件（CDP Input.dispatchMouseEvent）
+  - 礼物/派遣/兑换: GrowthBrowser 直连成长中心 iframe
+  - 抽奖        : 成长中心「抽奖(N)」按钮，持续抽到券为 0
+
+旧 CuaDriver / AX 通道已不再装配；不自动登录、不碰「去完成」类任务。
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import time
 from typing import Any
 
 from .adapters.base import ActionResult
+from .progress import DONE, IMPOSSIBLE, PENDING
 from .timeutil import day_key
 
 logger = logging.getLogger(__name__)
+
+
+def _state(result: ActionResult) -> str:
+    return str((result.data or {}).get("state") or (DONE if result.ok else PENDING))
 
 
 class Actions:
@@ -31,44 +45,51 @@ class Actions:
         self.cfg = cfg
         self.state = state
         self.desktop = desktop
-        # growth 为 GrowthBrowser（CDP）：礼物/派遣/兑换
+        # growth 为 GrowthBrowser（CDP）：礼物/派遣/兑换/补签/抽奖
         self.growth = growth
         # fuel 为 FuelCard（CDP）：左下角「Buddy加油站」浮层，签到的唯一真实入口
         self.fuel = fuel
 
-    # ---- 1. 每日签到（点左下角浮层的「立即领取」） --------------------------
+    # ---- 1. 每日签到（点左下角浮层的「立即领取」，服务端状态确认） ----------
     def daily_checkin(self) -> ActionResult:
-        """签到时间线的一轮：点左下角 Buddy加油站 的「立即领取」。
-
-        2026-11-14 更正（5.11.3 实测）：
-          - 签到入口只在主窗口左下角浮层（div.daily-checkin 的 shadow DOM 内），
-            点 #go 经 bridge 事件走 claimDailyCheckin 接口；
-          - 成长中心「11月活跃地图」只是活跃记录，**不能**当签到判据 —— 之前
-            按它判 confirmed=True，导致签到整条线从没真正执行过；
-          - 漏签只能在成长中心日历用补登卡补，不自动消耗（本方法不碰）。
-
-          - 领取成功   -> ok=True, confirmed=True，落库 last_checkin_day
-          - 今日已领   -> ok=True, confirmed=True（already），不重复点
-          - 浮层不在   -> ok=False，不落库，下一轮再试
-        """
         if not self.cfg["daily_checkin"]["enabled"]:
-            return ActionResult(True, "checkin", "disabled", {"confirmed": True})
-        if self.state.kv_get("last_checkin_day") == day_key():
-            return ActionResult(True, "checkin", "already checked in today",
-                                {"confirmed": True})
+            return ActionResult(True, "checkin", "disabled",
+                                {"confirmed": True, "state": DONE})
         if self.fuel is None:
             return ActionResult(False, "checkin",
                                 "fuel card channel not configured (set [growth].enabled=true)",
-                                {"confirmed": False})
+                                {"confirmed": False, "state": PENDING})
         result = self.fuel.claim()
         if result.ok and result.data.get("confirmed"):
             self.state.claim_once("checkin", "daily")
             self.state.kv_set("last_checkin_day", day_key())
             self.state.kv_set("last_checkin_at", time.time())
+            result.data["state"] = DONE
+            if result.data.get("already"):
+                result.detail = result.detail  # 服务端确认已签，同样算完成
+        elif not result.ok:
+            result.data.setdefault("state", PENDING)
         self.state.log("checkin", result.ok, result.detail)
         return result
 
-    # ---- 2. 签到礼物自动兑换 ------------------------------------------------
+    # ---- 2. 漏签补签（成长中心日历 + 补登卡） -------------------------------
+    def missed_makeup(self) -> ActionResult:
+        growth = self.cfg.get("growth", {}) or {}
+        if not growth.get("enabled", True):
+            return ActionResult(True, "makeup", "growth disabled",
+                                {"state": IMPOSSIBLE})
+        if not growth.get("auto_makeup", True):
+            return ActionResult(True, "makeup", "auto_makeup disabled",
+                                {"state": IMPOSSIBLE})
+        if self.growth is None:
+            return ActionResult(False, "makeup", "growth channel not configured",
+                                {"state": PENDING})
+        result = self.growth.makeup()
+        result.data.setdefault("state", DONE if result.ok else PENDING)
+        self.state.log("makeup", result.ok, result.detail[:400])
+        return result
+
+    # ---- 3. 兑换奖励 ---------------------------------------------------------
     def claim_gifts(self) -> list[ActionResult]:
         if not self.cfg["gifts"]["enabled"]:
             return []
@@ -90,17 +111,13 @@ class Actions:
         return results
 
     def check_exchanges(self) -> ActionResult:
-        """兑换检查时间线的一轮：只检查/兑换，不碰签到与派遣。
-
-        ok=True 表示得到确定结论（兑换成功，或确认无可兑换），调度器据此
-        禁用到当天 23:59；检查失败/窗口不可用则 ok=False，隔一小时重试。
-        """
         if not self.cfg.get("growth", {}).get("auto_exchange", True):
             return ActionResult(True, "exchange", "auto_exchange disabled",
-                                {"skipped": True, "count": 0})
+                                {"skipped": True, "count": 0, "state": DONE})
         if self.growth is None:
             return ActionResult(False, "exchange",
-                                "growth channel not configured (set [growth].enabled=true)")
+                                "growth channel not configured (set [growth].enabled=true)",
+                                {"state": PENDING})
         results = self.growth.claim_exchanges(
             lambda key: self.state.already_claimed("exchange", key)
         )
@@ -110,38 +127,86 @@ class Actions:
             self.state.log(ex.action, ex.ok, ex.detail[:400])
         ok = all(r.ok for r in results) if results else True
         detail = "; ".join(r.detail[:100] for r in results) or "nothing exchangeable"
-        return ActionResult(ok, "exchange", detail, {"count": len(results)})
+        return ActionResult(ok, "exchange", detail,
+                            {"count": len(results), "state": DONE if ok else PENDING})
 
-    # ---- 3. 派遣 / 到期领奖 / 再派遣 ----------------------------------------
+    # ---- 4. 抽奖 -------------------------------------------------------------
+    def draw_lottery(self) -> ActionResult:
+        growth = self.cfg.get("growth", {}) or {}
+        if not growth.get("auto_lottery", True):
+            return ActionResult(True, "lottery", "auto_lottery disabled",
+                                {"state": IMPOSSIBLE})
+        if self.growth is None:
+            return ActionResult(False, "lottery", "growth channel not configured",
+                                {"state": PENDING})
+        result = self.growth.lottery()
+        result.data.setdefault("state", DONE if result.ok else PENDING)
+        self.state.log("lottery", result.ok, result.detail[:400])
+        return result
+
+    # ---- 5. 派遣 / 到期领奖 / 再派遣（滚动） --------------------------------
     def travel_tick(self, force: bool = False) -> ActionResult:
         cfg = self.cfg["travel"]
         if not cfg["enabled"]:
-            return ActionResult(True, "travel", "disabled")
+            return ActionResult(True, "travel", "disabled", {"state": IMPOSSIBLE})
         if self.growth is None:
             return ActionResult(
                 False, "travel",
-                "growth channel not configured (set [growth].enabled=true)")
+                "growth channel not configured (set [growth].enabled=true)",
+                {"state": PENDING})
         # 每次都从页面读真实倒计时；派遣后时长不固定，绝不套用固定间隔
         result = self.growth.tick(force=force)
         due = result.data.get("due_at")
         if due is not None:
             self.state.kv_set("travel_due_at", float(due))
+        # 注意：适配器 data 里的 "state" 是**页面状态**（idle/traveling/...），
+        # 与账本的任务状态同名字不同义，这里必须显式覆盖成任务状态。
+        result.data["page_state"] = result.data.pop("state", None)
+        if result.data.get("dispatch_blocked") == "exhausted":
+            # 今天次数用尽且没有可领奖励：派遣任务今天结束了
+            result.data["state"] = DONE
+        else:
+            result.data["state"] = PENDING
         self.state.log("travel", result.ok, result.detail[:600])
         return result
 
-    # ---- 全流程 -------------------------------------------------------------
+    # ---- 批量会话：多个任务共用一次打开的成长中心页面 ----------------------
+    def growth_session(self):
+        """补签/兑换/抽奖/派遣都在成长中心里，合并成一次打开，少开关窗口。"""
+        sess = getattr(self.growth, "session", None)
+        if callable(sess):
+            return sess()
+        return contextlib.nullcontext()
+
+    # ---- 全流程（重启自检 / 手动 reconcile） --------------------------------
     def reconcile_all(self, reason: str = "manual") -> dict[str, Any]:
-        checkin = self.daily_checkin()
-        gifts = self.claim_gifts()
-        travel = self.travel_tick()
-        summary = {
-            "reason": reason,
-            "checkin": checkin.as_dict(),
-            "gifts": [r.as_dict() for r in gifts],
-            "travel": travel.as_dict(),
-            "ok": checkin.ok and travel.ok,
-            "day": day_key(),
-        }
-        self.state.log("reconcile", summary["ok"], json.dumps(summary, ensure_ascii=False)[:800])
-        logger.info("reconcile(%s) ok=%s", reason, summary["ok"])
-        return summary
+        """按顺序跑完五个任务，返回汇总。
+
+        顺序有依赖：签到 → 补签（会解锁连登里程碑）→ 兑换（可能发抽奖券）
+        → 抽奖 → 派遣（独立滚动）。
+        """
+        out: dict[str, Any] = {"reason": reason, "day": day_key()}
+        tasks = (
+            ("checkin", self.daily_checkin),
+            ("makeup", self.missed_makeup),
+            ("exchange", self.check_exchanges),
+            ("lottery", self.draw_lottery),
+            ("travel", self.travel_tick),
+        )
+        with self.growth_session():
+            for name, fn in tasks:
+                try:
+                    result = fn()
+                    out[name] = result.as_dict()
+                    out[name]["state"] = _state(result)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("task %s crashed: %s", name, exc)
+                    out[name] = {"ok": False, "detail": f"crashed: {exc}",
+                                 "state": PENDING}
+        out["ok"] = all(v.get("state") in (DONE, IMPOSSIBLE) for v in out.values()
+                        if isinstance(v, dict) and "state" in v)
+        self.state.log("reconcile", out["ok"],
+                       json.dumps({k: v.get("state") for k, v in out.items()
+                                   if isinstance(v, dict) and "state" in v},
+                                  ensure_ascii=False))
+        return out
