@@ -10,12 +10,14 @@
     只能靠 agent-browser 的跨 webContents 聚合 snapshot/click 触发。
   - 页面打开后，所有读取与点击都在 iframe 内用 JS 完成，比 AX 快且稳。
 
-签到语义变更（2026-11-12 实测 5.11.2）：客户端已无「Buddy加油站 / 立即签到」
-按钮，签到 = 每天在活跃地图留下一条记录（完成一次对话即可）。因此签到不再是
-「点按钮」，而是读日历状态：
-    .gs-cal-cell.is-today  今日格子
-    绿色 rgb(111, 229, 198) 或 is-checked = 今天已打卡
-    .gs-cal-cell.is-broken 漏签（可补，补签卡有限，永不自动消耗）
+签到/补签的分工（2026-11-14 更正，5.11.3 实测）：
+    当日签到只在主窗口左下角「Buddy加油站」浮层（见 adapters/fuel_card.py），
+    **不在成长中心**。本适配器里的 checkin_status() 只是「11月活跃地图」读取，
+    代表今天有没有用过客户端，与签到领积分无关，绝不能当签到判据
+    （2026-11-13~14 就是按它判 confirmed=True，导致签到一次都没真正执行）。
+    漏签只能在本页日历用补登卡补，不自动消耗。
+    日历事实：.gs-cal-cell.is-today 今日格子，实心绿 rgb(111,229,198)=今天有记录；
+    .gs-cal-cell.is-broken 漏签（可补登）。
 """
 from __future__ import annotations
 
@@ -907,7 +909,11 @@ class GrowthBrowser:
     # ---- 签到（状态校验） ---------------------------------------------------
     @_auto_close
     def checkin(self) -> ActionResult:
-        """签到 = 活跃地图今日是否已有记录；不再点击任何按钮。"""
+        """读「11月活跃地图」：今天有没有留下活跃记录。
+
+        **这不是签到判据**（2026-11-14 更正）：签到在左下角浮层（FuelCard），
+        活跃地图只代表今天用过客户端。保留本方法仅供诊断与漏签排查。
+        """
         opened = self.ensure_page()
         if not opened.ok:
             return ActionResult(False, "checkin", opened.detail, {"confirmed": False})

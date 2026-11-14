@@ -2,8 +2,10 @@
 
 所有领取都经 State.claim_once 幂等。**全部走 CDP（agent-browser + 客户端调试端口）**：
 
-  - 每日签到      : 读成长中心「11月活跃地图」，今天有记录即已签到（5.11.2 起
-                    官方取消签到按钮，签到 = 每日一次活跃/对话记录）
+  - 每日签到      : 点主窗口左下角「Buddy加油站」浮层的「立即领取」（FuelCard）。
+                    2026-11-14 更正：签到从来没在成长中心，之前改成「读活跃地图」
+                    是误判 —— 活跃地图只记录有没有用客户端，和签到领积分无关，
+                    结果整条签到线一次都没执行却报 confirmed=True。
   - 礼物/派遣/兑换  : GrowthBrowser 直连成长中心 iframe，DOM 级 click
 
 旧的 CuaDriver / AX 通道（desktop.CuaDriverSigner、growth.GrowthCenter）
@@ -24,37 +26,41 @@ logger = logging.getLogger(__name__)
 
 
 class Actions:
-    def __init__(self, cfg: dict, state: Any, desktop: Any, growth: Any = None) -> None:
+    def __init__(self, cfg: dict, state: Any, desktop: Any, growth: Any = None,
+                 fuel: Any = None) -> None:
         self.cfg = cfg
         self.state = state
         self.desktop = desktop
-        # growth 为 GrowthBrowser（CDP）：签到状态校验 + 礼物/派遣/兑换
+        # growth 为 GrowthBrowser（CDP）：礼物/派遣/兑换
         self.growth = growth
+        # fuel 为 FuelCard（CDP）：左下角「Buddy加油站」浮层，签到的唯一真实入口
+        self.fuel = fuel
 
-    # ---- 1. 每日签到（读活跃地图状态，不再点按钮） --------------------------
+    # ---- 1. 每日签到（点左下角浮层的「立即领取」） --------------------------
     def daily_checkin(self) -> ActionResult:
-        """签到时间线的一轮：读成长中心活跃地图，今天有记录即已签到。
+        """签到时间线的一轮：点左下角 Buddy加油站 的「立即领取」。
 
-        5.11.2 起客户端已无「Buddy加油站 / 立即签到」按钮，签到语义改为
-        「每天在活跃地图留下一条记录（完成一次对话）」。因此本方法只做状态
-        校验，不再点击任何按钮：
+        2026-11-14 更正（5.11.3 实测）：
+          - 签到入口只在主窗口左下角浮层（div.daily-checkin 的 shadow DOM 内），
+            点 #go 经 bridge 事件走 claimDailyCheckin 接口；
+          - 成长中心「11月活跃地图」只是活跃记录，**不能**当签到判据 —— 之前
+            按它判 confirmed=True，导致签到整条线从没真正执行过；
+          - 漏签只能在成长中心日历用补登卡补，不自动消耗（本方法不碰）。
 
-          - 今天已打卡   -> ok=True, confirmed=True，落库 last_checkin_day
-          - 今天未打卡   -> ok=False，detail 明确提示需要一次对话，不落库
-          - CDP 不可达   -> ok=False，detail 给出发送端修复指引
-
-        只有 confirmed 才允许当天禁用轮询，避免把「读不到」当成「已签到」。
+          - 领取成功   -> ok=True, confirmed=True，落库 last_checkin_day
+          - 今日已领   -> ok=True, confirmed=True（already），不重复点
+          - 浮层不在   -> ok=False，不落库，下一轮再试
         """
         if not self.cfg["daily_checkin"]["enabled"]:
             return ActionResult(True, "checkin", "disabled", {"confirmed": True})
         if self.state.kv_get("last_checkin_day") == day_key():
             return ActionResult(True, "checkin", "already checked in today",
                                 {"confirmed": True})
-        if self.growth is None:
+        if self.fuel is None:
             return ActionResult(False, "checkin",
-                                "growth channel not configured (set [growth].enabled=true)",
+                                "fuel card channel not configured (set [growth].enabled=true)",
                                 {"confirmed": False})
-        result = self.growth.checkin()
+        result = self.fuel.claim()
         if result.ok and result.data.get("confirmed"):
             self.state.claim_once("checkin", "daily")
             self.state.kv_set("last_checkin_day", day_key())

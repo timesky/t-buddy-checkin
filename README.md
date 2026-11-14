@@ -60,21 +60,30 @@ launchctl setenv WORKBUDDY_REMOTE_DEBUGGING_PORT 9222
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.workbuddy-cdp-env.plist
 ```
 
-## 签到语义（2026-11-12 变更，重要）
+## 签到语义（2026-11-14 更正，重要）
 
-客户端 5.11.2 起**已无「Buddy加油站 / 立即签到」按钮**（`app.asar` 全文 0 处命中）。签到变成：
+**签到只在主窗口左下角的「Buddy加油站」浮层**，点「立即领取」。之前一版说
+「客户端已无签到按钮、签到 = 读活跃地图」是**错的**，原因：那个卡片是远端运营位
+下发的 HTML，在 `app.asar` 里搜不到字符串，就被误判成"按钮没了"；而「活跃地图」
+只记录今天有没有用过客户端，跟签到领积分是两套东西 —— 结果签到整条线一次都
+没真正执行，却天天报 `confirmed=True`。
 
-> 每天在成长中心「活跃地图」留下一条记录 —— **完成一次对话即自动记录**。
+实测结构（5.11.3）：主 renderer 的 `div.daily-checkin` → 内部 `.wb-slot--avatar-top-combo`
+的 **shadow DOM** 里才有卡片（light DOM 永远是空的，读 textContent 会以为浮层不存在）：
 
-因此本技能的签到**不做任何点击**，只读状态：
-
-| 页面证据 | 含义 |
+| 元素 | 含义 |
 |---|---|
-| `.gs-cal-cell.is-today` 且底色 `rgb(111, 229, 198)` | 今天已打卡 → `confirmed=True` |
-| `.gs-cal-cell.is-broken.is-makeup-clickable` | 漏签可补（补签卡有限，**永不自动消耗**） |
-| `当前连续登录 N 天` | 连登天数 |
+| `#h` / `#d` | 卡片标题「Buddy加油站」/ 副标题「每日可领 100 积分」 |
+| `#go` + `data-track-props={"type":"checkin"}` | 签到按钮，点击后经 bridge 走 `claimDailyCheckin` |
+| `#tt` | 轻提示，成功后出现「领取成功」 |
+| `.dot[aria-label]` | 轮播点；领完后签到卡从轮播里消失 = 今日已领 |
 
-今天未记录时返回 `ok=False`，detail 明确提示「完成一次对话即可签到」，不写 `last_checkin_day`（避免整天假阳性跳过）。
+判定口径：**看到签到卡才算可领；看到「领取成功」或签到卡消失才算已签**。
+浮层不在（被关闭/未登录/未下发）一律视为「未知」，不写 `last_checkin_day`。
+
+漏签补不了签到：只能去成长中心日历点漏签格、消耗补登卡（`.gs-cal-cell.is-broken`，
+**永不自动消耗**）。活跃地图（`.gs-cal-cell.is-today` 实心绿 `rgb(111,229,198)`）
+仅作参考，不再作为签到判据。
 
 ## 命令
 
@@ -123,6 +132,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.workbuddy-cdp-
 
 ## 变更记录
 
+- **2026-11-14**：更正签到通道 —— 签到一直在主窗口左下角「Buddy加油站」浮层（shadow DOM 内的远端 slot html），新增 `adapters/fuel_card.py`；`GrowthBrowser.checkin()` 降级为「活跃地图只读参考」。修正 11-12 的错误结论（当时因 `app.asar` 搜不到该文案就判定"按钮已取消"，导致签到线连着两天一次都没真正执行却报成功）。
 - **2026-11-12**：改用 CDP 通道（agent-browser + 客户端调试端口）。签到从「点按钮」改为「读活跃地图状态」。删除 `adapters/desktop.py`（CuaDriverSigner）与 `adapters/growth.py`（GrowthCenter），CuaDriver 不再是依赖。
 - **2026-11-10**：引入 agent-desktop 第二引擎（严格 headless，不抢焦点）。
 - **2026-11-09**：首版，CuaDriver AX 通道。

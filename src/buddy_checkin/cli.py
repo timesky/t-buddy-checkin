@@ -11,6 +11,7 @@ from pathlib import Path
 
 from . import config
 from .actions import Actions
+from .adapters.fuel_card import FuelCard
 from .adapters.growth_browser import GrowthBrowser
 from .deps import cmd_deps
 from .scheduler import Scheduler
@@ -60,7 +61,7 @@ def cmd_model_check(cfg: dict, args: argparse.Namespace) -> int:
 def build(cfg: dict):
     """构造后端组合：全部走 CDP（agent-browser + 客户端调试端口）。
 
-    - 签到        : 读活跃地图状态（growth.checkin）
+    - 签到        : 点左下角「Buddy加油站」浮层（FuelCard）
     - 礼物/派遣/兑换 : GrowthBrowser 直连成长中心 iframe 做 DOM 级操作
 
     旧 CuaDriver/AX 通道（desktop.CuaDriverSigner、growth.GrowthCenter）
@@ -68,9 +69,18 @@ def build(cfg: dict):
     """
     state = State(config.state_db_path(cfg))
     growth = _build_growth(cfg, state)
-    # 签到不再依赖桌面端点击，desktop 传 None（Actions 仅在 growth 缺失时提示）
-    actions = Actions(cfg, state, None, growth=growth)
+    fuel = _build_fuel(cfg)
+    # 签到不再依赖桌面端点击，desktop 传 None
+    actions = Actions(cfg, state, None, growth=growth, fuel=fuel)
     return state, None, actions
+
+
+def _build_fuel(cfg: dict):
+    """签到通道：主窗口左下角浮层。CDP 不可达时由 FuelCard 明确报错。"""
+    g = cfg.get("growth", {}) or {}
+    if not g.get("enabled"):
+        return None
+    return FuelCard(cfg)
 
 
 def _build_growth(cfg: dict, state):
@@ -208,6 +218,24 @@ def cmd_inspect(cfg: dict, args: argparse.Namespace) -> int:
               f"{port} && 重启 WorkBuddy 客户端")
         return 1
 
+    fc = FuelCard(cfg)
+    fst = fc.probe()
+    print("\n== 签到状态（左下角 Buddy加油站 浮层）==")
+    if not fst.get("ok"):
+        print(f"  读取失败: {fst.get('detail')}")
+    else:
+        card = fst.get("card") or {}
+        print(f"  浮层卡片    : {card.get('title') or (fst.get('detail') or '')[:40]}")
+        print(f"  副标题      : {card.get('sub') or '-'}")
+        print(f"  按钮        : {card.get('btn') or '-'}"
+              f"（type={(card.get('props') or {}).get('type')}）")
+        print(f"  轮播        : " + ", ".join(
+            f"{d.get('label')}{'*' if d.get('on') else ''}" for d in card.get("dots") or []))
+        verdict = ("今日可领（未签）" if fst.get("present")
+                   else "今日已领或浮层无签到项" if fst.get("claimed")
+                   else "状态未知")
+        print(f"  判定        : {verdict}")
+
     ws = gb._iframe_ws()
     print(f"  成长中心 iframe : {'已打开' if ws else '未打开'}")
     if not ws:
@@ -215,7 +243,7 @@ def cmd_inspect(cfg: dict, args: argparse.Namespace) -> int:
         return 0
 
     st = gb.checkin_status()
-    print("\n== 签到状态（活跃地图）==")
+    print("\n== 成长中心活跃地图（仅参考，不是签到判据）==")
     if st.get("ok"):
         print(f"  今日已打卡  : {st.get('checked')}")
         print(f"  连续登录    : {st.get('streak')} 天")

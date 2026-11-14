@@ -19,7 +19,7 @@ from typing import Any
 DEFAULTS: dict[str, Any] = {
     "base_url": "https://www.workbuddy.cn/app",
     "state_db": "~/.local/share/buddy-web-checkin/state.sqlite3",
-    # 桌面端：签到已改为「读活跃地图状态」，不再点击客户端按钮。
+    # 桌面端：签到走左下角「Buddy加油站」浮层（FuelCard），不经桌面端。
     # 本段只保留 agent-desktop 作为 CDP 不可达时的人工排查兜底（不参与日常流程）。
     "desktop": {
         "app": "WorkBuddy",
@@ -31,7 +31,7 @@ DEFAULTS: dict[str, Any] = {
         "screenshot_dir": "~/.local/share/buddy-web-checkin/screenshots",
     },
     # 签到时间线由 [schedule] 控制（0 点恢复 / 每小时轮询），此处只留总开关。
-    # 签到 = 当天活跃地图是否有记录，只校验状态，无 24h 冷却。
+    # 签到 = 点浮层「立即领取」；确认领到才落库，无 24h 冷却。
     "daily_checkin": {"enabled": True},
     # 统一进程内的三条调度线（仅 travel 为动态滚动）：
     #   1 checkin  每天 0 点恢复每小时轮询，签到成功即禁用到当天 23:59

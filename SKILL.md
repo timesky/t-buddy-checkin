@@ -37,9 +37,9 @@ CDP 端口是全新安装最容易漏的一步：客户端**不认** `--remote-d
 | 命令 | 作用 | 是否需要人工 |
 |---|---|---|
 | `deps check` | 逐项检查依赖（安装后必跑） | 否 |
-| `inspect` | 只读诊断：CDP 连通 / targets / 签到状态 / 页面按钮（跨机器排查首选） | 否 |
+| `inspect` | 只读诊断：CDP 连通 / targets / 浮层签到状态 / 页面按钮（跨机器排查首选） | 否 |
 | `status` | 三条时间线下次执行时间 / 最近运行 | 否 |
-| `checkin-now` | 签到线一轮（读活跃地图状态） | 否 |
+| `checkin-now` | 签到线一轮（点左下角浮层「立即领取」） | 否 |
 | `exchange-now` | 兑换检查线一轮 | 否 |
 | `travel-now` | 旅行线一轮（领礼物→派遣→读真实倒计时） | 否 |
 | `once` | 全量一轮 | 否 |
@@ -47,13 +47,21 @@ CDP 端口是全新安装最容易漏的一步：客户端**不认** `--remote-d
 | `install-launchd` | 写 LaunchAgent plist（RunAtLoad+KeepAlive） | 加载命令由你确认 |
 | `model-check` | 查看免费模型策略与确认状态 | 否 |
 
-## 签到语义（5.11.2 起，重要）
+## 签到语义（2026-11-14 更正，重要）
 
-客户端已无「Buddy加油站 / 立即签到」按钮（`app.asar` 全文 0 处命中）。**签到 = 当天在活跃地图留下一条记录，完成一次对话即自动记录**。因此本技能签到只读状态、不点击：
+**当日签到 = 点主窗口左下角「Buddy加油站」浮层的「立即领取」**。之前「已无签到
+按钮、签到 = 读活跃地图」的结论是错的：卡片是远端运营位下发的 HTML（`app.asar`
+里搜不到），且活跃地图只代表今天用过客户端，与签到领积分无关 —— 那版实现从来没
+真正签到过，却天天报 `confirmed=True`。
 
-- `.gs-cal-cell.is-today` 且底色 `rgb(111, 229, 198)` → 今天已打卡，`confirmed=True`
-- `.gs-cal-cell.is-broken.is-makeup-clickable` → 漏签可补（补签卡有限，**永不自动消耗**）
-- 未记录时返回 `ok=False` 并提示「完成一次对话即可签到」，**不写 `last_checkin_day`**（避免整天假阳性）
+- 卡片在 `div.daily-checkin` 内 `.wb-slot--avatar-top-combo` 的 **shadow DOM**，
+  light DOM 永远为空（读 textContent 会误判浮层不存在）
+- 签到按钮 `#go` + `data-track-props={"type":"checkin"}`；成功后 `#tt` 出现
+  「领取成功」，签到卡从轮播里消失
+- 只有「看到领取成功 / 签到卡消失」才写 `last_checkin_day`；浮层不在 = 未知，
+  下一轮重试（避免整天假阳性）
+- 漏签只能去成长中心日历消耗**补登卡**补，本技能不自动消耗
+- `.gs-cal-cell.is-today` 实心绿只代表「今天有活跃记录」，仅作参考
 
 ## 三条时间线
 

@@ -53,8 +53,24 @@ class FakeDesktop(DesktopAdapter):
         return ActionResult(True, "checkin", "ok", {"confirmed": self.confirmed})
 
 
+class FakeFuel:
+    """假「Buddy加油站」浮层：签到的唯一真实通道（2026-11-14 更正）。"""
+
+    def __init__(self, confirmed: bool = True):
+        self.confirmed = confirmed
+        self.claim_calls = 0
+
+    def claim(self):
+        self.claim_calls += 1
+        if self.confirmed:
+            return ActionResult(True, "checkin", "claimed: 领取成功",
+                                {"confirmed": True, "source": "fuel-card"})
+        return ActionResult(False, "checkin", "fuel card not rendered",
+                            {"confirmed": False, "source": "fuel-card"})
+
+
 class FakeGrowth:
-    """假成长中心：checkin 为状态校验（不再点按钮），其余同旧接口。"""
+    """假成长中心：礼物/派遣/兑换；checkin 仅保留为活跃地图读取（不参与签到）。"""
 
     def __init__(self, due: float, checkin_ok: bool = True):
         self.due = due
@@ -219,32 +235,46 @@ class ActionsTests(unittest.TestCase):
 
     def test_full_loop_is_idempotent(self):
         growth = FakeGrowth(due=time.time() + 1200)
-        actions = Actions(self.cfg, self.state, None, growth=growth)
+        fuel = FakeFuel()
+        actions = Actions(self.cfg, self.state, None, growth=growth, fuel=fuel)
         summary = actions.reconcile_all()
         self.assertTrue(summary["ok"])
-        self.assertEqual(growth.checkin_calls, 1)
+        self.assertEqual(fuel.claim_calls, 1)
         self.assertEqual(self.state.kv_get("last_checkin_day"), day_key())
         due = self.state.kv_get_float("travel_due_at")
         self.assertIsNotNone(due)
         self.assertGreater(due, time.time())
 
         actions.reconcile_all()
-        self.assertEqual(growth.checkin_calls, 1)  # 当天不重复读签到
+        self.assertEqual(fuel.claim_calls, 1)  # 当天不重复领签到
         # travel_due_at 仍由 growth 的真实倒计时刷新
         self.assertAlmostEqual(self.state.kv_get_float("travel_due_at"),
                                self.state.kv_get_float("travel_due_at"))
 
     def test_unconfirmed_checkin_does_not_write_state(self):
-        """回归（2026-11-10）：读不到/未记录只是推测，绝不能写 last_checkin_day，
-        否则当天所有后续轮询都被跳过，整天漏签。"""
-        growth = FakeGrowth(due=time.time() + 1200, checkin_ok=False)
-        actions = Actions(self.cfg, self.state, None, growth=growth)
+        """回归（2026-11-10 / 2026-11-14）：浮层没领到只是「没证据」，绝不能写
+        last_checkin_day，否则当天所有后续轮询都被跳过，整天漏签。"""
+        fuel = FakeFuel(confirmed=False)
+        actions = Actions(self.cfg, self.state, None,
+                          growth=FakeGrowth(time.time() + 1200), fuel=fuel)
         result = actions.daily_checkin()
+        self.assertFalse(result.ok)
         self.assertFalse(result.data.get("confirmed"))
         self.assertIsNone(self.state.kv_get("last_checkin_day"))
-        # 下一轮仍会真正检查，而不是被幂等跳过
+        # 下一轮仍会真正重试，而不是被幂等跳过
         actions.daily_checkin()
-        self.assertEqual(2, growth.checkin_calls)
+        self.assertEqual(2, fuel.claim_calls)
+
+    def test_checkin_never_uses_heatmap_as_proof(self):
+        """回归（2026-11-14）：活跃地图绿了不代表签到领到了 —— 之前就是这样
+        报 confirmed=True，导致签到从没真正执行。heatmap 只能是参考。"""
+        growth = FakeGrowth(time.time() + 1200)   # heatmap 会返回 confirmed=True
+        fuel = FakeFuel(confirmed=False)
+        actions = Actions(self.cfg, self.state, None, growth=growth, fuel=fuel)
+        result = actions.daily_checkin()
+        self.assertFalse(result.ok)
+        self.assertEqual(0, growth.checkin_calls, "签到不该再去读活跃地图")
+        self.assertIsNone(self.state.kv_get("last_checkin_day"))
 
     def test_force_claim_then_redispatch_records_due(self):
         due = time.time() + 3

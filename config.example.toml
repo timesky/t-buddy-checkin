@@ -7,7 +7,7 @@ state_db = "~/.local/share/buddy-web-checkin/state.sqlite3"
 log_level = "INFO"
 
 [desktop]
-# 签到已改为「读活跃地图状态」，不再点击桌面端任何按钮。
+# 签到走主窗口左下角「Buddy加油站」浮层（adapters/fuel_card.py），不经桌面端。
 # 本段仅保留 agent-desktop（可选 AX 兜底），不参与日常流程。
 # 注意 TCC 授权绑「实际启动它的 App」（如 iTerm/Terminal），需先把该 App 加入
 # 系统设置→隐私与安全性→辅助功能（macOS 27+ 设备控制和数据访问）。
@@ -21,8 +21,8 @@ app = "WorkBuddy"
 
 [daily_checkin]
 enabled = true          # 签到时间线的总开关；周期见下方 [schedule]
-# 签到语义（5.11.2 起）：当天在活跃地图留下记录（完成一次对话）即为已签到。
-# 只做状态校验，不再有点击动作，因此没有 24h 冷却。
+# 签到语义（2026-11-14 更正）：点左下角「Buddy加油站」浮层的「立即领取」。
+# 只有看到「领取成功」/签到卡消失才落库；没有 24h 冷却。
 
 [schedule]
 # 统一常驻进程的三条时间线。只有 travel 是动态滚动：
