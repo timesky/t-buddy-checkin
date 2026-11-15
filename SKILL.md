@@ -71,12 +71,20 @@ CDP 端口是全新安装最容易漏的一步：客户端**不认** `--remote-d
   里有 date / cardBalance），点开 `.gs-cell-toast--makeup` 再点「使用」消耗一张
   补登卡；**这些格子只认 CDP 真实鼠标事件**（`Input.dispatchMouseEvent`），
   JS 的 `element.click()` 点了没有任何反应
-- `.gs-cal-cell.is-today` 实心绿只代表「今天有活跃记录」，仅作参考
+- 日历图例（2026-11-15 实测）：**已打卡**是同一色系 4 阶（`--wb-heat-cell-1..4`，
+  alpha 0.18/0.36/0.58/0.82，深浅只代表活跃度）；**未打卡（可补登）**是纯白
+  `rgb(250,250,250)`，与未来日期 `is-todo` 同色。所以「未打卡」必须叠加 class 判断，
+  只看颜色会把未来日期也算成漏签。今日已签 = 该格实心 `rgb(111,229,198)` alpha=1
+- 补签判定不查签到元数据，只消费服务端下发的可补入口，另加两道校验：
+  **渲染完整性**（格子数≥28、恰有一个 `is-today`、有 `is-todo`、本月每格都在，
+  否则记 pending）与**缺口交叉校验**（已过天数 − 已打卡格数 = 缺口；
+  已打卡格数不可能少于「当前连续登录 N 天」）
 
 ## 五个任务与当日账本
 
-任务：`checkin` 签到 / `makeup` 补签 / `exchange` 兑换 / `lottery` 抽奖 / `travel` 派遣。
-每个任务给出三态之一，写进账本 `~/.local/share/buddy-web-checkin/progress.json`：
+任务：`checkin` 签到 / `exchange` 兑换 / `makeup` 补签 / `lottery` 抽奖 / `travel` 派遣。
+顺序固定为 **checkin → exchange → makeup → lottery → travel**：补登卡来自兑换奖励，
+先拿卡再补签。每个任务给出三态之一，写进账本 `~/.local/share/buddy-web-checkin/progress.json`：
 
 - `done`：用可复核证据确认完成（服务端状态 / 奖励项变已兑换 / 券为 0 / 次数用尽）
 - `impossible`：今天确实做不了（补登卡 0 / 没有抽奖券）

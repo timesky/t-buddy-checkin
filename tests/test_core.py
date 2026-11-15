@@ -362,7 +362,7 @@ class SchedulerTests(unittest.TestCase):
             self.actions.states[name] = "done"
         self.scheduler.run_forever(max_iterations=5)
         self.assertEqual(self.actions.calls,
-                         ["checkin", "makeup", "exchange", "lottery", "travel"])
+                         ["checkin", "exchange", "makeup", "lottery", "travel"])
 
     def test_restart_ignores_silence_and_rechecks_everything(self):
         """重启不受静默控制：账本写着今天全做完并静默，也要立刻复核。"""
@@ -437,11 +437,12 @@ class SchedulerTests(unittest.TestCase):
         self.assertIsNone(self.progress.silent_until)
 
     def test_verify_pass_runs_tasks_in_dependency_order(self):
+        """顺序是 checkin → exchange → makeup：兑换先发补登卡，补签才能当轮用上。"""
         for name in ("checkin", "makeup", "exchange", "lottery", "travel"):
             self.actions.states[name] = "done"
         self.scheduler.verify_pass()
         self.assertEqual(self.actions.calls,
-                         ["checkin", "makeup", "exchange", "lottery", "travel"])
+                         ["checkin", "exchange", "makeup", "lottery", "travel"])
 
     def test_run_forever_keeps_pending_task_scheduled(self):
         for name in ("checkin", "makeup", "exchange", "lottery"):

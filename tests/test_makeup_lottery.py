@@ -106,6 +106,123 @@ class MakeupTests(unittest.TestCase):
         self.assertEqual(calls, [(100, 300), (200, 320)])
 
 
+class MakeupCalendarGuardTests(unittest.TestCase):
+    """2026-11-15：「扫不到可补格」不能等于「没有漏签」。
+
+    日历图例实测：已打卡是同一色系的 4 阶（alpha 0.18~0.82），未打卡是纯白，
+    与未来日期 is-todo 同色。所以判定必须叠加 class，且要有渲染完整性校验，
+    否则弹窗刚开、格子没渲染完时会被误判成 done 并静默一整天。
+    """
+
+    def setUp(self):
+        p = patch("buddy_checkin.adapters.growth_browser.time.sleep", lambda s: None)
+        p.start()
+        self.addCleanup(p.stop)
+        self.gb = _gb()
+
+    @staticmethod
+    def _scan(**kw) -> dict:
+        base = {
+            "ok": True, "items": [], "card_balance": 1,
+            "render_ok": True, "today_checked": True,
+            "streak_days": 15, "day_of_month": 15,
+            "checked_days": [f"2026-11-{d:02d}" for d in range(1, 16)],
+        }
+        base.update(kw)
+        return base
+
+    def test_unrendered_calendar_is_pending_not_done(self):
+        self.gb.makeup_scan = lambda: self._scan(
+            render_ok=False, render_reason="too_few_cells")
+        r = self.gb.makeup()
+        self.assertFalse(r.ok)
+        self.assertEqual(r.data["state"], "pending")
+
+    def test_today_unchecked_defers_to_checkin(self):
+        self.gb.makeup_scan = lambda: self._scan(today_checked=False)
+        r = self.gb.makeup()
+        self.assertFalse(r.ok)
+        self.assertEqual(r.data["state"], "pending")
+
+    def test_gap_without_clickable_is_impossible(self):
+        """连登 14 天说明本月缺 1 天，但服务端不给可补入口 → 不可补，不是 done。"""
+        days = [f"2026-11-{d:02d}" for d in range(2, 16)]
+        self.gb.makeup_scan = lambda: self._scan(checked_days=days, streak_days=14)
+        r = self.gb.makeup()
+        self.assertTrue(r.ok)
+        self.assertEqual(r.data["state"], "impossible")
+        self.assertEqual(r.data["gap"], 1)
+
+    def test_checked_days_fewer_than_streak_is_pending(self):
+        """已打卡格数少于当前连续登录天数 → 日历数据自相矛盾，不能下结论。"""
+        self.gb.makeup_scan = lambda: self._scan(
+            checked_days=[f"2026-11-{d:02d}" for d in range(1, 6)])
+        r = self.gb.makeup()
+        self.assertFalse(r.ok)
+        self.assertEqual(r.data["state"], "pending")
+
+    def test_full_month_without_gap_is_done(self):
+        self.gb.makeup_scan = lambda: self._scan()
+        r = self.gb.makeup()
+        self.assertTrue(r.ok)
+        self.assertEqual(r.data["state"], "done")
+
+
+class CalendarScanTests(unittest.TestCase):
+    """逐格扫描：缺格必须让 render_ok 为假，否则「无漏签」不可信。"""
+
+    def setUp(self):
+        self.gb = _gb()
+
+    @staticmethod
+    def _cells(days) -> list[dict]:
+        return [{"idx": i, "text": str(d), "cls": "is-checked", "day": d,
+                 "date": f"2026-11-{d:02d}", "alpha": 0.36, "rgb": [111, 229, 198],
+                 "checked": True, "clickable": False, "future": False,
+                 "today": False, "balance": None} for i, d in enumerate(days)]
+
+    def _payload(self, days) -> dict:
+        return {
+            "ok": True, "month": "2026-11", "today": "2026-11-15",
+            "day_of_month": 15, "cells": self._cells(days),
+            "today_cell": {"checked": True, "date": "2026-11-15", "today": True},
+            "card_balance": 1, "card_text": "补登卡 ×1", "streak_days": 15,
+            "todo_count": 8, "render_ok": True, "render_reason": "",
+        }
+
+    def test_missing_day_breaks_render_ok(self):
+        days = [d for d in range(1, 16) if d != 7]
+        gb = self.gb
+        gb._eval = lambda js, timeout=20: (True, self._payload(days))
+        scan = gb.calendar_scan()
+        self.assertFalse(scan["render_ok"])
+        self.assertIn("missing_days", scan["render_reason"])
+
+    def test_complete_calendar_reports_no_gap(self):
+        gb = self.gb
+        gb._eval = lambda js, timeout=20: (True, self._payload(range(1, 16)))
+        scan = gb.calendar_scan()
+        self.assertTrue(scan["render_ok"])
+        self.assertEqual(len(scan["checked_days"]), 15)
+        self.assertEqual(scan["past_unchecked"], [])
+        self.assertTrue(scan["today_checked"])
+
+    def test_unchecked_past_day_becomes_makeup_candidate(self):
+        days = [d for d in range(1, 16) if d != 3]
+        payload = self._payload(days)
+        payload["cells"].append({
+            "idx": 99, "text": "3", "cls": "is-broken is-makeup-clickable",
+            "day": 3, "date": "2026-11-03", "alpha": 1.0, "rgb": [250, 250, 250],
+            "checked": False, "clickable": True, "future": False,
+            "today": False, "balance": 1})
+        gb = self.gb
+        gb._eval = lambda js, timeout=20: (True, payload)
+        scan = gb.calendar_scan()
+        self.assertTrue(scan["render_ok"])
+        self.assertEqual([c["date"] for c in scan["clickable"]], ["2026-11-03"])
+        self.assertEqual([i["date"] for i in scan["items"]], ["2026-11-03"])
+
+
 class LotteryTests(unittest.TestCase):
     def setUp(self):
         p = patch("buddy_checkin.adapters.growth_browser.time.sleep", lambda s: None)

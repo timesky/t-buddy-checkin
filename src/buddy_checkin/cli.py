@@ -312,14 +312,24 @@ def cmd_inspect(cfg: dict, args: argparse.Namespace) -> int:
               f"（type={(card.get('props') or {}).get('type')}）")
         print(f"  轮播        : " + ", ".join(
             f"{d.get('label')}{'*' if d.get('on') else ''}" for d in card.get("dots") or []))
-    # 权威判据：服务端 checkinData（不是卡片在不在）
+    # 权威判据：服务端 checkinData（不是卡片在不在，也不是日历格子文案）
     auth = fc.status(refresh=True)
     if auth.get("ok"):
-        print(f"  服务端已签  : {auth.get('today_checked_in')}"
+        today = FuelCard.today_iso()
+        done, why = FuelCard.judge_checked_today(auth)
+        print(f"  服务端摘要  : today_checked_in={auth.get('today_checked_in')}"
               f"（今日积分 {auth.get('today_credit')}，连签 {auth.get('streak_days')} 天）")
         dates = auth.get("checkin_dates") or []
         print(f"  最近签到日  : {', '.join(dates[:4]) or '-'}")
-        print(f"  判定        : {'今日已签到' if auth.get('today_checked_in') else '今日未签到（需补点）'}")
+        print(f"  今日({today}) : {'在 checkin_dates 里 ✓' if done else '不在 checkin_dates 里 ✗'}"
+              f"   [判据 {why}]")
+        if done:
+            print("  判定        : 今日已签到（服务端元数据确认）")
+        elif auth.get("today_checked_in"):
+            print("  判定        : 今日未签到 —— 布尔为真但日期里没有今天，"
+                  "是跨零点未翻日的残留，不能当已签")
+        else:
+            print("  判定        : 今日未签到（需补点）")
     else:
         print(f"  服务端状态读取失败: {auth.get('reason')}")
 
@@ -344,6 +354,10 @@ def cmd_inspect(cfg: dict, args: argparse.Namespace) -> int:
         items = mk.get("items") or []
         print(f"  可补漏签    : {', '.join(str(i.get('date')) for i in items) or '无'}")
         print(f"  补登卡      : {mk.get('card_text') or mk.get('card_balance')}")
+        if mk.get("streak_days") is not None or mk.get("render_ok") is not None:
+            print(f"  连登天数    : {mk.get('streak_days')} 天")
+            print(f"  今日格已签  : {mk.get('today_checked')}（样式推断，仅作交叉证据）")
+            print(f"  日历渲染    : {'完整' if mk.get('render_ok') else '未就绪'}")
     else:
         print(f"  读取失败: {mk.get('detail')}")
     tickets, label = gb.lottery_tickets()

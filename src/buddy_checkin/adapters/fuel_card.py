@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import subprocess
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -206,6 +207,38 @@ class FuelCard:
             return {"ok": False, "reason": str(val), "today_checked_in": None}
         return val if isinstance(val, dict) else {"ok": False, "reason": "bad payload"}
 
+    # ---- 判定：只认服务端元数据，不认界面文案 ------------------------------
+    #
+    # 2026-11-15 实测教训：成长中心日历的格子文案会随悬停/加载状态在
+    # 「尚未登场」「轻轻路过」「今日」之间变化，且 `is-checked` 的格子并不都
+    # 在服务端 checkin_dates 里（11-01、11-13 显示已打卡但服务端无记录）。
+    # 界面只能当"提示"，判定一律回到 checkinData。
+    #
+    # 另一个坑：`today_checked_in` 是布尔摘要，服务端跨零点还没翻日时会残留
+    # 昨天的 true；daemon 恰好在 00:00:00 触发，只看这个布尔就会把今天判成
+    # 「已签到」，然后记 done 静默一整天。所以硬判据用 **checkin_dates 是否
+    # 包含今天**（服务端按日期记账），布尔只作降级兜底。
+    @staticmethod
+    def today_iso() -> str:
+        return date.today().isoformat()
+
+    @classmethod
+    def judge_checked_today(cls, st: dict) -> tuple[bool, str]:
+        """返回 (今日是否已签, 判据来源)。
+
+        来源取值：date_in_dates / today_missing / bool_fallback / no_data
+        """
+        if not st or not st.get("ok"):
+            return False, "no_data"
+        today = cls.today_iso()
+        dates = [str(d)[:10] for d in (st.get("checkin_dates") or [])]
+        if today in dates:
+            return True, "date_in_dates"
+        if dates:
+            # 服务端给得出日期列表却没有今天：布尔为真也只是昨天的残留
+            return False, "today_missing"
+        return bool(st.get("today_checked_in")), "bool_fallback"
+
     # ---- 读取（诊断用：卡片/轮播/toast） ------------------------------------
     PROBE_JS = r"""
 (() => {
@@ -341,25 +374,66 @@ class FuelCard:
         return False, "fuel card did not reappear after reopen"
 
     # ---- 动作 ---------------------------------------------------------------
+    def _already(self, st: dict, why: str) -> ActionResult:
+        return ActionResult(
+            True, "checkin",
+            f"already checked in today (credit={st.get('today_credit')}, "
+            f"streak={st.get('streak_days')}d, date={self.today_iso()})",
+            {"confirmed": True, "already": True, "source": "fuel-card",
+             "judge": why, "checked_date": self.today_iso(),
+             "today_credit": st.get("today_credit"),
+             "streak_days": st.get("streak_days")})
+
+    def _wait_rollover(self, limit_sec: float = 180.0,
+                       step: float = 30.0) -> tuple[bool, dict, str]:
+        """服务端跨零点尚未翻日时的等待：直到今天的日期出现在 checkin_dates。
+
+        `today_checked_in` 为真、但 checkin_dates 里没有今天，说明服务端还停
+        在昨天。此时点按钮没有意义（浮层会按"今日已领"处理），只能等服务端
+        翻页，翻页后再走正常签到流程。
+        """
+        step = step if step > 0 else 1.0
+        tries = max(1, int(limit_sec // step))
+        st: dict = {}
+        for _ in range(tries):
+            time.sleep(step)
+            st = self.status(refresh=True)
+            done, why = self.judge_checked_today(st)
+            if done and why == "date_in_dates":
+                return True, st, why
+            if why != "today_missing":
+                # 已经翻日（布尔为假，需要点按钮）或读不到数据，交回上层
+                return False, st, why
+        return False, st, "rollover_timeout"
+
     def claim(self, wait_sec: float = 25.0) -> ActionResult:
-        """点浮层「立即领取」完成今日签到，用服务端状态确认。"""
+        """点浮层「立即领取」完成今日签到，用服务端元数据确认。"""
         st = self.status(refresh=True)
         if not st.get("ok"):
             return ActionResult(
                 False, "checkin",
                 f"cannot read checkin status: {st.get('reason') or st.get('refresh_error')}",
                 {"confirmed": False, "source": "fuel-card"})
-        if st.get("today_checked_in"):
-            return ActionResult(
-                True, "checkin",
-                f"already checked in today (credit={st.get('today_credit')}, "
-                f"streak={st.get('streak_days')}d)",
-                {"confirmed": True, "already": True, "source": "fuel-card",
-                 "today_credit": st.get("today_credit"), "streak_days": st.get("streak_days")})
+        done, why = self.judge_checked_today(st)
+        if done:
+            return self._already(st, why)
+        if why == "today_missing" and st.get("today_checked_in"):
+            # 服务端还没翻日：昨天的 true 残留，不能据此记 done
+            done, st, why = self._wait_rollover()
+            if done:
+                return self._already(st, why)
+            if why == "rollover_timeout":
+                # 明确不记终态，交给调度器退避重试（否则今天会整天漏签）
+                return ActionResult(
+                    False, "checkin",
+                    "server still reports yesterday (today not in checkin_dates) "
+                    "after waiting for day rollover",
+                    {"confirmed": False, "source": "fuel-card",
+                     "judge": why, "state": "pending"})
 
-        visible, why = self.ensure_visible()
+        visible, why_vis = self.ensure_visible()
         if not visible:
-            return ActionResult(False, "checkin", why,
+            return ActionResult(False, "checkin", why_vis,
                                 {"confirmed": False, "source": "fuel-card"})
 
         ok, val = self._eval(self._click_js())
@@ -381,20 +455,24 @@ class FuelCard:
         while time.time() < deadline:
             time.sleep(1.5)
             last = self.status(refresh=True)
-            if last.get("ok") and last.get("today_checked_in"):
+            done, why = self.judge_checked_today(last)
+            if done:
                 return ActionResult(
                     True, "checkin",
                     f"claimed: credit={last.get('today_credit')}, "
-                    f"streak={last.get('streak_days')}d",
+                    f"streak={last.get('streak_days')}d, date={self.today_iso()}",
                     {"confirmed": True, "source": "fuel-card",
+                     "judge": why, "checked_date": self.today_iso(),
                      "today_credit": last.get("today_credit"),
                      "streak_days": last.get("streak_days")})
         return ActionResult(
             False, "checkin",
-            f"clicked but server still says not checked in after {wait_sec:.0f}s "
-            f"(today_credit={last.get('today_credit')}, "
+            f"clicked but {self.today_iso()} not in checkin_dates after "
+            f"{wait_sec:.0f}s (today_checked_in={last.get('today_checked_in')}, "
+            f"today_credit={last.get('today_credit')}, "
             f"refresh_error={last.get('refresh_error')})",
-            {"confirmed": False, "source": "fuel-card"})
+            {"confirmed": False, "source": "fuel-card",
+             "judge": why if last else "no_data"})
 
     @staticmethod
     def _click_js() -> str:

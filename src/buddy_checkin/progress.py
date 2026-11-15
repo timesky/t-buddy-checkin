@@ -33,7 +33,7 @@ DONE = "done"
 IMPOSSIBLE = "impossible"
 
 # 与调度器的任务顺序一致：先签到、补签，再兑换，最后抽奖/派遣
-TASK_ORDER = ("checkin", "makeup", "exchange", "lottery", "travel")
+TASK_ORDER = ("checkin", "exchange", "makeup", "lottery", "travel")
 
 TASK_LABELS = {
     "checkin": "每日签到",

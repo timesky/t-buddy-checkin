@@ -101,6 +101,7 @@ class Scheduler:
         state = str(data.get("state") or (DONE if result.ok else PENDING))
         rec = self.progress.mark(name, state, result.detail, data.get("evidence") or {
             k: v for k, v in data.items() if k in ("today_credit", "streak_days",
+                                                   "checked_date", "judge",
                                                    "made_up", "broken_left",
                                                    "tickets_left", "due_at", "state")})
 

@@ -678,46 +678,176 @@ class GrowthBrowser:
         return bool(payload.get("ok")), str(payload.get("error") or "ok")
 
     # ---- 补签（成长中心日历，消耗补登卡） -----------------------------------
-    MAKEUP_SCAN_JS = r"""
+    #
+    # 2026-11-15 实测图例语义（不要凭颜色猜）：
+    #   「已打卡」= 4 阶同色系 --wb-heat-cell-1..4，alpha 分别 0.18/0.36/0.58/0.82
+    #                （深浅只代表当天活跃度，四种都算已打卡）
+    #   「未打卡（可补登）」= 纯白 rgb(250,250,250)，与未来日期 is-todo 同色
+    #   今日已签 = 实心 rgb(111,229,198) alpha=1.0，不属于上述任一阶
+    #
+    # 因此「未打卡」不能只看颜色，必须叠加 class：
+    #   is-checked          已打卡（历史）
+    #   is-today + 实心      今日已签
+    #   is-broken + is-makeup-clickable  过去漏签且可补
+    #   is-todo / is-other   未来日期 / 次月补位，不可补
+    #
+    # 顶部「当前连续登录 N 天」是服务端维护的连续计数，用作交叉校验：
+    # 若 N < 本月已过天数，说明本月必有缺口，此时扫不到可补格就不能当"无漏签"。
+    CALENDAR_SCAN_JS = r"""
 (() => {
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-  const cells = [...document.querySelectorAll('.gs-cal-cell.is-makeup-clickable')];
-  const items = cells.map(c => {
-    let remark = {};
-    try { remark = JSON.parse(c.getAttribute('dt-remark') || '{}'); } catch (e) {}
+  const parse = c => {
+    const m = String(c).match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+    if (!m) return {r: 0, g: 0, b: 0, a: 0};
+    return {r: +m[1], g: +m[2], b: +m[3], a: m[4] === undefined ? 1 : parseFloat(m[4])};
+  };
+  const isTeal = p => p.g > 150 && p.g > p.r + 50 && p.b > 120;
+
+  const now = new Date();
+  const y = now.getFullYear(), mo = now.getMonth();
+  const pad = n => String(n).padStart(2, '0');
+  const month = y + '-' + pad(mo + 1);
+  const todayStr = month + '-' + pad(now.getDate());
+  const dim = now.getDate();
+
+  const cells = [...document.querySelectorAll('.gs-cal-cell')].map((c, i) => {
+    let rem = {};
+    try { rem = JSON.parse(c.getAttribute('dt-remark') || '{}'); } catch (e) {}
+    const p = parse(getComputedStyle(c).backgroundColor);
+    const cls = String(c.className).replace('gs-cal-cell', '').trim();
+    const text = norm(c.textContent);
+    const isToday = cls.indexOf('is-today') >= 0;
+    const isFuture = cls.indexOf('is-todo') >= 0 || cls.indexOf('is-other') >= 0;
+    const clickable = cls.indexOf('is-makeup-clickable') >= 0;
+    const day = isToday ? dim : (/^\d{1,2}$/.test(text) ? parseInt(text, 10) : null);
+    let date = rem.date || '';
+    if (!date && day !== null && !isFuture) date = month + '-' + pad(day);
+    const solid = isTeal(p) && p.a >= 0.99;
+    const checked = !clickable && (
+      cls.indexOf('is-checked') >= 0 || (isToday && solid));
     return {
-      date: remark.date || '',
-      balance: (remark.cardBalance === undefined ? null : remark.cardBalance),
-      label: norm(c.textContent)
+      idx: i, text, cls, day, date,
+      alpha: p.a, rgb: [p.r, p.g, p.b],
+      checked, clickable, future: isFuture, today: isToday,
+      balance: rem.cardBalance === undefined ? null : rem.cardBalance
     };
   });
-  const text = norm(document.body.innerText);
-  const m = text.match(/补[登签]卡\s*[×xX*]\s*(\d+)/);
+
+  const body = norm(document.body.innerText);
+  const dm = body.match(/补[登签]卡\s*[×xX*]\s*(\d+)/);
+  const sm = body.match(/当前连续登录\s*(\d+)\s*天/);
+  const cardFromCell = cells.find(c => c.balance !== null);
+
+  const todayCell = cells.find(c => c.today) || null;
+  const todoCount = cells.filter(c => c.cls.indexOf('is-todo') >= 0).length;
   return JSON.stringify({
-    items,
-    card_text: m ? m[0] : '',
-    card_balance: m ? parseInt(m[1], 10) : (items[0] && items[0].balance !== null ? items[0].balance : null)
+    ok: true,
+    month, today: todayStr, day_of_month: dim,
+    cells,
+    card_text: dm ? dm[0] : '',
+    card_balance: dm ? parseInt(dm[1], 10) : (cardFromCell ? cardFromCell.balance : null),
+    streak_days: sm ? parseInt(sm[1], 10) : null,
+    today_cell: todayCell,
+    todo_count: todoCount,
+    render_ok: cells.length >= 28 && !!todayCell && todoCount >= 1,
+    render_reason: (cells.length < 28 ? 'too_few_cells'
+      : (!todayCell ? 'no_today_cell'
+      : (todoCount < 1 ? 'no_future_cells' : '')))
   });
 })()
 """
 
-    def makeup_scan(self) -> dict:
-        """读漏签格（可补登）与补登卡余量。
+    def calendar_scan(self) -> dict:
+        """逐格读本月日历：已打卡/未打卡/可补/今日，并自带渲染完整性校验。
 
-        实测（2026-11-14）：漏签格是
-        <button class="gs-cal-cell is-broken is-makeup-clickable"
-                dt-remark='{"date":"2026-11-01","cardBalance":2}'>1</button>
-        卡片余量同时出现在按钮的 dt-remark.cardBalance 和页面「补登卡 ×2」文案里。
+        返回：
+          cells           全部格子（含 class、alpha、日期、是否可补）
+          past_unchecked  1 号→昨天 中未打卡的格子（漏签候选）
+          clickable       其中服务端允许补登的
+          today_checked   今日格是否已签（样式推断，单样本，仅作交叉证据）
+          streak_days     顶部「当前连续登录 N 天」
+          render_ok       日历是否渲染完整（缺格/缺今日/无未来日期都算未就绪）
         """
-        ok, val = self._eval(self.MAKEUP_SCAN_JS)
+        ok, val = self._eval(self.CALENDAR_SCAN_JS)
         if not ok:
-            return {"ok": False, "detail": str(val), "items": [], "card_balance": None}
+            return {"ok": False, "detail": str(val), "cells": [], "items": [],
+                    "past_unchecked": [], "clickable": [], "card_balance": None,
+                    "card_text": "", "streak_days": None, "today_checked": None,
+                    "render_ok": False, "render_reason": "eval_failed"}
         info = val if isinstance(val, dict) else {}
+        if not info.get("ok"):
+            return {"ok": False, "detail": "bad payload", "cells": [], "items": [],
+                    "past_unchecked": [], "clickable": [], "card_balance": None,
+                    "card_text": "", "streak_days": None, "today_checked": None,
+                    "render_ok": False, "render_reason": "bad_payload"}
+
+        cells = info.get("cells") or []
+        month = info.get("month") or ""
+        dim = int(info.get("day_of_month") or 0)
+        today = info.get("today") or ""
+
+        # 本月 1 号→今天 必须都有对应格子，缺一个就说明日历还没渲染全
+        seen = {c.get("day") for c in cells
+                if c.get("day") and str(c.get("date") or "").startswith(month)}
+        missing = [d for d in range(1, dim + 1) if d not in seen]
+
+        past_unchecked = [c for c in cells
+                          if c.get("date") and not c.get("checked")
+                          and not c.get("future") and str(c["date"]) < today]
+        clickable = [c for c in past_unchecked if c.get("clickable")]
+        today_cell = info.get("today_cell") or next(
+            (c for c in cells if c.get("today")), None)
+
+        render_ok = bool(info.get("render_ok")) and not missing
+        reason = info.get("render_reason") or ""
+        if missing and not reason:
+            reason = f"missing_days={missing[:5]}"
+        if not dim or not today:
+            # 拿不到「今天几号」就算不出缺口，不能声称已渲染完整
+            render_ok = False
+            reason = reason or "no_date_context"
+
+        items = [{"date": c.get("date"), "balance": c.get("balance"),
+                  "label": c.get("text")} for c in clickable]
         return {
             "ok": True,
-            "items": info.get("items") or [],
+            "cells": cells,
+            "items": items,                       # 向后兼容旧调用方
+            "past_unchecked": past_unchecked,
+            "clickable": clickable,
+            "today_checked": bool(today_cell.get("checked")) if today_cell else None,
+            "today_cell": today_cell,
+            "checked_days": [c.get("date") for c in cells
+                             if c.get("checked") and c.get("date")],
             "card_balance": info.get("card_balance"),
             "card_text": info.get("card_text") or "",
+            "streak_days": info.get("streak_days"),
+            "month": month, "today": today, "day_of_month": dim,
+            "render_ok": render_ok, "render_reason": reason,
+        }
+
+    def makeup_scan(self) -> dict:
+        """旧接口：只返回可补格与补登卡余量（cli 诊断与既有调用方使用）。
+
+        注意必须把 day_of_month / checked_days 一起透传，否则 makeup() 里的
+        「本月缺口」交叉校验会永远得到 gap=0，等于没校验（2026-11-15 踩过）。
+        """
+        scan = self.calendar_scan()
+        if not scan.get("ok"):
+            return {"ok": False, "detail": scan.get("detail"), "items": [],
+                    "card_balance": None}
+        return {
+            "ok": True,
+            "items": scan["items"],
+            "card_balance": scan["card_balance"],
+            "card_text": scan["card_text"],
+            "streak_days": scan["streak_days"],
+            "today_checked": scan["today_checked"],
+            "render_ok": scan["render_ok"],
+            "render_reason": scan.get("render_reason"),
+            "day_of_month": scan.get("day_of_month"),
+            "checked_days": scan.get("checked_days") or [],
+            "past_unchecked": scan.get("past_unchecked") or [],
         }
 
     def _makeup_cell_rect(self, date: str) -> tuple[bool, dict | str]:
@@ -807,17 +937,57 @@ class GrowthBrowser:
         if not scan.get("ok"):
             return ActionResult(False, "makeup", f"scan failed: {scan.get('detail')}",
                                 {"state": "pending"})
+
         items = scan.get("items") or []
         balance = scan.get("card_balance")
+        today_checked = scan.get("today_checked")
+        streak = scan.get("streak_days")
+        past_days = int(scan.get("day_of_month") or 0)
+        checked_n = len(scan.get("checked_days") or [])
+        gap = max(0, past_days - checked_n) if past_days else 0
+        cross = {"past_days": past_days, "checked": checked_n, "gap": gap,
+                 "streak": streak, "today_checked": today_checked,
+                 "render_ok": scan.get("render_ok")}
+
+        # 1) 日历渲染不全时，「扫不到可补格」不代表「没有漏签」——不能记终态
+        if scan.get("render_ok") is False:
+            return ActionResult(
+                False, "makeup",
+                f"calendar not fully rendered ({scan.get('render_reason')}); retry",
+                {"state": "pending", "cross_check": cross})
+
+        # 2) 今日未签：这是 checkin 任务的事，别在这里判"无漏签"
+        if today_checked is False:
+            return ActionResult(
+                False, "makeup",
+                "today not checked in yet (calendar cell not solid); wait for checkin",
+                {"state": "pending", "cross_check": cross})
+
+        # 3) 交叉校验：已打卡格数不可能少于「当前连续登录天数」
+        if streak and past_days and checked_n < min(int(streak), past_days):
+            return ActionResult(
+                False, "makeup",
+                f"inconsistent calendar: {checked_n}/{past_days} checked but streak={streak}d",
+                {"state": "pending", "cross_check": cross})
+
         if not items:
-            return ActionResult(True, "makeup", "no missed day",
-                                {"state": "done", "broken": [], "card_balance": balance})
+            if gap <= 0:
+                return ActionResult(True, "makeup", "no missed day",
+                                    {"state": "done", "broken": [], "gap": 0,
+                                     "card_balance": balance, "cross_check": cross})
+            # 有缺口但服务端没有下发可补入口（超出补登窗口/不可补）
+            return ActionResult(
+                True, "makeup",
+                f"{gap} day(s) missing this month but none is make-up-able",
+                {"state": "impossible", "broken": [], "gap": gap,
+                 "card_balance": balance, "cross_check": cross})
+
         if balance == 0:
             return ActionResult(
                 True, "makeup",
                 f"no makeup card left (missed={','.join(str(i.get('date')) for i in items)})",
                 {"state": "impossible", "broken": [i.get("date") for i in items],
-                 "card_balance": balance})
+                 "card_balance": balance, "gap": gap, "cross_check": cross})
 
         limit = len(items) if max_cards is None else min(len(items), int(max_cards))
         if balance is not None:
@@ -837,17 +1007,27 @@ class GrowthBrowser:
         after = self.makeup_scan()
         left = after.get("items") or []
         balance_after = after.get("card_balance")
+        checked_after = len(after.get("checked_days") or [])
+        gap_after = max(0, past_days - checked_after) if past_days else 0
         data = {
             "made_up": done_days,
             "errors": errors,
             "broken_left": [i.get("date") for i in left],
             "card_balance": balance_after,
+            "gap": gap_after,
+            "cross_check": {**cross, "checked_after": checked_after},
         }
         if not left:
-            data["state"] = "done"
-            return ActionResult(True, "makeup",
-                                f"made up {len(done_days)} day(s): {','.join(done_days) or '-'}",
-                                data)
+            if gap_after <= 0:
+                data["state"] = "done"
+                return ActionResult(True, "makeup",
+                                    f"made up {len(done_days)} day(s): "
+                                    f"{','.join(done_days) or '-'}", data)
+            data["state"] = "impossible"
+            return ActionResult(
+                True, "makeup",
+                f"made up {len(done_days)}; {gap_after} day(s) still missing "
+                f"but not make-up-able", data)
         if balance_after == 0:
             data["state"] = "impossible"
             return ActionResult(True, "makeup",
