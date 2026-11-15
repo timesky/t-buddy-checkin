@@ -36,7 +36,7 @@ description: 独立运行 WorkBuddy 每日活跃（签到）校验、签到礼�
    - Intel：`https://download.codebuddy.cn/workbuddy/saas/darwin-x64/WorkBuddy-darwin-x64-5.11.3.43806934-ecace0f7.dmg`
 
 > 注意：官方「历史版本下载」页最新只到 **5.9.3**，那就是网页版活动中心那一版，
-> 照着官网下载会直接踩坑。完整兼容矩阵与升级步骤见 `README.md`。
+> 照着官网下载会直接踩坑。完整兼容矩阵与升级步骤见 `docs/compatibility.md`。
 
 ## 安装第三方依赖（安装 / 重新拉取技能时必跑）
 
@@ -138,9 +138,12 @@ CDP 端口是全新安装最容易漏的一步：客户端**不认** `--remote-d
 
 ## 跨机器排查
 
-另一台机器失败时按顺序跑：`./run.sh deps check` → `./run.sh inspect` → 对照 README 故障排查表。入口文案不同改 `[growth].open_labels`（如 `["成长计划"]`）。
+另一台机器失败时按顺序跑：`./run.sh deps check` → `./run.sh ports status` → `./run.sh inspect`
+→ 对照 `docs/troubleshooting.md` 的现象表。入口文案不同改 `[growth].open_labels`（如 `["成长计划"]`）。
 
-详细架构与故障排查见 `README.md`。
+文档导航：`docs/README.md`（安装 `docs/install.md` / 端口 `docs/ports.md` / 判据
+`docs/checkin-semantics.md` / 用法 `docs/usage.md` / 架构 `docs/architecture.md` / 排查
+`docs/troubleshooting.md`）。
 
 ## 免费模型约束（历史约定，独立服务下不耗额度）
 

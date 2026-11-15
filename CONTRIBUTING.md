@@ -1,0 +1,57 @@
+<style>
+  :root { --wb-max-width: 980px; }
+  body { max-width: var(--wb-max-width); margin: 0 auto; padding: 0 24px 48px; }
+  pre, table { max-width: 100%; overflow-x: auto; }
+  img { max-width: 100%; height: auto; }
+</style>
+
+# 参与开发
+
+[主 README](README.md) · [文档索引](docs/README.md) · [架构](docs/architecture.md)
+
+## 环境
+
+```bash
+python3 --version    # 需要 ≥ 3.11
+node --version       # 需要 ≥ 22
+cd tools && npm install && cd ..
+cp config.example.toml config.toml
+./run.sh deps check  # 六项全 OK
+```
+
+零第三方 Python 依赖，不要为了图方便引入 `requests` / `pydantic` 之类 —— 只用标准库是
+本项目的硬约束（独立服务要能在裸 macOS 上跑起来）。
+
+## 测试
+
+```bash
+python3 -m unittest discover -s tests -q
+```
+
+- 单测**必须全程 mock 掉 CDP**，不许依赖本机客户端状态、不许真的点按钮。
+- 新增判据就要新增用例：签到翻日、补签三态、缺口交叉校验、版本红线、端口归属都有对应用例，
+  照着写比读文档快。
+- 提交前至少跑一遍；改到真机行为时再补一次 `./run.sh inspect` / `once`，并在 PR 里贴输出。
+
+## 代码约定
+
+| 约定 | 说明 |
+|---|---|
+| 端口只有一个注入点 | `cli.inject_port()`，不要在别处写 9222 或直接读环境变量 |
+| 版本红线只有一处 | `compat.py`，不要在业务代码里散落 `5.11` |
+| 状态只认结构 | 用 class / `disabled` / 倒计时文本判定，不要按界面文案猜 |
+| 时间统一北京时间 | 走 `timeutil`，naive 时间按北京时间解释 |
+| 领取必须幂等 | 经 `state.claim_once`，重复运行不能重复领 |
+| 失败不换通道 | CDP 不可达就报错并给修复命令，不静默降级 |
+
+## 提交
+
+- 一个 commit 一件事，message 用 `feat(scope):` / `fix(scope):` / `docs:` / `test:` 前缀。
+- 改到行为（判据、顺序、退避、退出码）时同步更新 `docs/changelog.md` 与相关文档。
+- 不提交 `config.toml`、`progress.txt`、`*.sqlite3`、`*.png`、`tools/node_modules/`、`.tmp/`。
+
+## 不要做的事
+
+- 不加自动登录、不碰验证码、不读取或导出 token。
+- 不点「去完成」类任务按钮，不自动消耗补登卡之外的付费资源。
+- 不为了「看起来成功」放宽判据（历史上就这么踩过两次坑：签到线连着两天没真正执行却报成功）。
