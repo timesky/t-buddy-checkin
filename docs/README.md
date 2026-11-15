@@ -7,7 +7,7 @@
 
 # 文档索引
 
-[主 README](../README.md) · [English README](../README_EN.md) · [SKILL.md](../SKILL.md)
+[主 README](../README.md) · [English README](../README_EN.md) · [SKILL.md](../SKILL.md) · [MIT LICENSE](../LICENSE)
 
 第一次用，按 **① 兼容性 → ② 安装 → ③ 用法** 的顺序看，其余按需查。
 
