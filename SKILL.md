@@ -9,21 +9,47 @@ description: 独立运行 WorkBuddy 每日活跃（签到）校验、签到礼�
 
 **所有自动化操作都走 CDP**：`agent-browser` 打开客户端侧栏里的成长中心，`tools/cdp_client.mjs` 直连成长中心 iframe 做 DOM 级读取与点击。旧的 CuaDriver / AX 通道已整体移除（`adapters/desktop.py`、`adapters/growth.py` 已删除），`agent-desktop` 仅作可选兜底、不参与日常流程。
 
-操作对象依赖 WorkBuddy：成长中心是客户端内嵌页面，客户端需带调试端口启动（`scripts/launch-workbuddy-debug.sh` 一键完成）。
+操作对象依赖 WorkBuddy **5.11+**：成长中心是客户端内嵌页面，客户端需带调试端口启动（`scripts/launch-workbuddy-debug.sh` 一键完成）。
 
 > `BUDDY_FREE_MODEL=1` 是按 WorkBuddy 技能设计时的运维确认闸门，**独立服务下不消耗额度，但按约定保留**：除 `model-check` / `deps` / `install-launchd` / `inspect` 纯本地运维外，所有命令都要该环境变量。LaunchAgent plist 已内置。
+
+## 运行前置（硬依赖，缺一不可，先全过一遍再动手）
+
+| 前置 | 要求 | 说明 |
+|---|---|---|
+| **WorkBuddy 版本** | **≥ 5.11.0**（实测 5.11.3） | **≤ 5.9.x 不支持**：成长中心还是网页版活动中心，客户端里没有内嵌成长中心和「Buddy加油站」浮层。官方日志里没有公开的 5.10，也未实测，按不支持处理 |
+| 平台 | **仅 macOS 12+** | 依赖 `launchd` / `launchctl` / `lsof` / `defaults` / `pgrep` / `osascript`；Windows/Linux 不可用 |
+| 客户端状态 | 已登录 + 主窗口存在（可最小化、不能关窗） | 成长中心挂在登录态里；关窗后没有可连的 webContents |
+| 界面语言 | **简体中文** | 50+ 处按中文文案定位（`成长计划`/`立即领取`/`兑换`/`使用`/`抽奖(N)`…），仅成长中心入口可通过 `[growth].open_labels` 改 |
+| 安装位置 | 默认 `/Applications/WorkBuddy.app` | 装在别处用 `WORKBUDDY_APP=/path/WorkBuddy.app` 指定（否则版本读不到） |
+| Python | ≥ 3.11 | `tomllib` / `sqlite3` / `zoneinfo` |
+| Node.js | **≥ 22** | `tools/cdp_client.mjs` 用全局 `WebSocket`；`agent-browser` 也要求 `engines.node >= 22` |
+| 网络 | 能访问 `workbuddy.cn` + npm registry | 成长中心数据来自服务端；`npm install` 要拉包 |
+
+**版本红线是自动的**：`deps check` 首项校验客户端版本；`checkin-now` / `once` /
+`daemon` / `verify` 在版本过低时会**先退出（退出码 3）**并打印升级方式，
+不会空跑一天。升级入口有两个：
+
+1. 客户端左下角头像 → **检查更新**（5.11 目前灰度，可能提示已是最新）
+2. 官方安装包覆盖安装（2026-11-15 验证可下载；务必拖进「应用程序」）：
+   - Apple 芯片：`https://download.codebuddy.cn/workbuddy/saas/darwin-arm64/WorkBuddy-darwin-arm64-5.11.3.43806934-ecace0f7.dmg`
+   - Intel：`https://download.codebuddy.cn/workbuddy/saas/darwin-x64/WorkBuddy-darwin-x64-5.11.3.43806934-ecace0f7.dmg`
+
+> 注意：官方「历史版本下载」页最新只到 **5.9.3**，那就是网页版活动中心那一版，
+> 照着官网下载会直接踩坑。完整兼容矩阵与升级步骤见 `README.md`。
 
 ## 安装第三方依赖（安装 / 重新拉取技能时必跑）
 
 ```bash
 cd tools && npm install && cd ..    # agent-browser（必需）+ agent-desktop（可选）
-./run.sh deps check                 # 五项依赖：Python / node / agent-browser / WorkBuddy CDP / agent-desktop
+./run.sh deps check                 # 六项：客户端版本 / Python / node / agent-browser / WorkBuddy CDP / agent-desktop
 ```
 
 | 依赖 | 必需 | 说明 |
 |---|---|---|
+| WorkBuddy ≥ 5.11.0 | ✅ | 提供内嵌成长中心 + 左下角浮层；≤5.9.x 不支持 |
 | Python ≥ 3.11 | ✅ | 标准库 tomllib / sqlite3 / zoneinfo |
-| node ≥ 20 | ✅ | 跑 `tools/cdp_client.mjs`（CDP 桥） |
+| node ≥ 22 | ✅ | 跑 `tools/cdp_client.mjs`（CDP 桥，用全局 `WebSocket`） |
 | agent-browser | ✅ | 跨 webContents 聚合快照/点击，打开成长中心 |
 | WorkBuddy CDP 端口 | ✅ | 端口自适应（跟随客户端自报的 `DevToolsActivePort`）；缺失时 `ports negotiate --apply` + 重启客户端 |
 | agent-desktop | 可选 | AX 兜底，需给启动它的 App 授权辅助功能 |

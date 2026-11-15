@@ -11,6 +11,76 @@ WorkBuddy 每日活跃（签到）/ 领礼物 / 派遣 / 兑换自动化。全�
 
 零第三方 Python 包（仅标准库 `tomllib` / `sqlite3` / `zoneinfo`）。运行时依赖：`node` + `agent-browser` + 客户端调试端口。旧 CuaDriver / AX 通道已整体移除。
 
+## 兼容性：版本不对，后面全白做
+
+### 支持的 WorkBuddy 版本
+
+| 客户端版本 | 结论 | 说明 |
+|---|---|---|
+| **≥ 5.11.0** | ✅ 支持 | 客户端内置成长中心 + 左下角「Buddy加油站」浮层，五个任务齐全。**实测基线 5.11.3**；比基线更新的版本仍放行，只提示先跑 `inspect` 复核 |
+| 5.10.x | ❌ 不支持 | 官方更新日志里没有公开的 5.10，也未实测，按不支持处理 |
+| **≤ 5.9.x** | ❌ 不支持 | 成长中心还是**网页版活动中心**：客户端里没有内嵌成长中心（CDP 里看不到 `type=iframe` 的 growth-center），也没有「Buddy加油站」浮层。本技能两条通道都不存在，**不做降级兼容** |
+
+版本号怎么查（三选一，都不会改东西）：
+
+```bash
+# ① 最快：技能自己报（同时校验 5.11 红线）
+./run.sh deps check
+# ② 命令行读安装包
+defaults read /Applications/WorkBuddy.app/Contents/Info.plist CFBundleShortVersionString
+# ③ 界面：客户端左下角头像（菜单里带当前版本号）
+```
+
+### 升级到 5.11+（5.11 目前是灰度版本，这一步是新装唯一的卡点）
+
+官方更新日志里 **5.11.0 发布于 2026-11-03，标注「灰度中」**
+（<https://www.workbuddy.cn/docs/workbuddy/Changelog>），所以**官网下载页和
+「历史版本下载」页最新只到 5.9.3** —— 照着官网下载就是那个跑不起来的版本。
+两条可用的路：
+
+**方式一：客户端内升级**（灰度按账号放开，可能提示「已是最新」）
+
+```
+客户端左下角头像 → 检查更新
+```
+
+**方式二：官方安装包覆盖安装**（拿不到灰度包时用这条；链接为官方 CDN，
+2026-11-15 实测 HTTP 200、`application/x-apple-diskimage`，可直接装）
+
+| 芯片 | 下载地址 | 体积 |
+|---|---|---|
+| Apple 芯片（M 系列） | <https://download.codebuddy.cn/workbuddy/saas/darwin-arm64/WorkBuddy-darwin-arm64-5.11.3.43806934-ecace0f7.dmg> | 约 358 MB |
+| Intel | <https://download.codebuddy.cn/workbuddy/saas/darwin-x64/WorkBuddy-darwin-x64-5.11.3.43806934-ecace0f7.dmg> | 约 390 MB |
+
+装的时候有三个坑（前两条是官方安装指南原话）：
+
+1. **必须拖进「应用程序」**——双击 .dmg 后直接把 WorkBuddy 从磁盘映像里运行，
+   后续无法自动更新。
+2. 从磁盘映像里运行时若提示无法自动更新，按提示点「移动到应用程序」。
+3. **退出旧版再启动**：`⌘Q`，并确认菜单栏图标也退干净，否则新版本不会接管；
+   装完回客户端左下角头像核对版本号 ≥ 5.11.0，再跑 `./run.sh deps check`。
+
+> 查芯片：屏幕左上角 苹果菜单 → 「关于本机」 → 「芯片」写 Apple M* 就是 ARM64，写 Intel 就是 x64。
+> 官方安装指南：<https://www.workbuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Installation-Mac-Guide>
+
+### 其余硬依赖（缺一条就跑不通，装之前先对一遍）
+
+| 前置 | 要求 | 不满足会怎样 |
+|---|---|---|
+| 操作系统 | **macOS 12 (Monterey) 及以上**（WorkBuddy 官方要求） | 客户端本身起不来 |
+| 平台 | **仅 macOS**。用了 `launchd` / `launchctl` / `lsof` / `defaults` / `pgrep` / `osascript` | Windows / Linux 无法使用，别装 |
+| WorkBuddy 安装位置 | 默认 `/Applications/WorkBuddy.app`；装在别处需 `WORKBUDDY_APP=/path/WorkBuddy.app` | 版本读不到、日志里客户端显示「未运行」 |
+| 客户端登录态 | 已登录，且**主窗口存在**（可最小化，不能关窗） | 成长中心在登录态里；没有窗口就没有可连的 webContents |
+| 界面语言 | **简体中文** | 50+ 处按中文文案定位（「成长计划」「立即领取」「兑换」「使用」「抽奖(N)」…），只有成长中心入口可配 `[growth].open_labels`，其余换英文就点不到 |
+| Python | **≥ 3.11**（`tomllib` / `sqlite3` / `zoneinfo`） | `run.sh` 直接退出 |
+| Node.js | **≥ 22** | `tools/cdp_client.mjs` 用全局 `WebSocket`，`agent-browser` 自身也声明 `engines.node >= 22`；20/21 上连不上 iframe |
+| agent-browser | `0.42.x`（`cd tools && npm install`） | 打不开成长中心页面 |
+| CDP 调试端口 | 客户端带 `WORKBUDDY_REMOTE_DEBUGGING_PORT` 启动 | `deps check` 报 `WorkBuddy CDP MISSING` |
+| 网络 | 能访问 `workbuddy.cn`（成长中心是服务端数据）；`npm install` 需 registry | 签到状态读不到 / 装不上依赖 |
+| 可写目录 | `~/.local/share/buddy-web-checkin/`、`~/Library/LaunchAgents/` | 账本与登录项写不进去 |
+| 权限 | **不需要 sudo**，也不需要辅助功能/录屏授权（可选件 `agent-desktop` 才需要） | — |
+
+
 ## 工作原理
 
 ```
@@ -32,7 +102,13 @@ CDP 127.0.0.1:9222
 
 ## 安装（新机器 / 另一台机器）
 
+顺序照抄即可，每一步都有可验证的输出。
+
 ```bash
+# 0. 先确认客户端版本 ≥ 5.11（5.9.x 是网页版活动中心，装了也跑不起来）
+defaults read /Applications/WorkBuddy.app/Contents/Info.plist CFBundleShortVersionString
+# 不是 5.11+ → 回到上一节「升级到 5.11+」，升完再往下
+
 # 1. 代码
 git clone git@github.com:timesky/t-buddy-checkin.git
 cd buddy-web-checkin
@@ -49,10 +125,28 @@ cp config.example.toml config.toml
 # 端口没开时（status 显示无监听）：
 ./scripts/launch-workbuddy-debug.sh   # 写端口 → 优雅重启客户端 → 等 CDP 就绪
 
-# 5. 验证
-./run.sh deps check      # 五条依赖应全绿
-./run.sh inspect         # 应看到 [iframe] growth-center + 签到状态
+# 5. 验证（六项全绿才算装好）
+./run.sh deps check      # 客户端版本 / Python / node / agent-browser / CDP / 可选件
+./run.sh inspect         # 应看到 targets 里有 WorkBuddy + 签到状态
 ```
+
+`deps check` 的第一项就是客户端版本，装好后输出应该长这样（6 项全 `OK`，
+`agent-desktop` 显示「可选-未装」也不影响）：
+
+```
+  [OK       ] WorkBuddy 客户端 v5.11.3
+       客户端 5.11.3 在支持范围内（≥5.11.0，实测基线 5.11.3）
+  [OK       ] Python v3.11.15
+  [OK       ] node v22.22.2
+  [OK       ] agent-browser v0.42.0
+  [OK       ] WorkBuddy CDP
+       已连通（端口来源 active_file）
+  [OK       ] agent-desktop v1.2.0
+✅ 所有必需依赖就绪，可以运行 ./run.sh once / daemon。
+```
+
+版本不够时它会直接把升级方式打出来，并让 `checkin-now` / `once` / `daemon`
+这类命令**在动手前就退出**（退出码 `3`），不会白跑一天。
 
 ### 端口是自适应的（不用再手填 9222）
 
@@ -185,6 +279,11 @@ alpha 0.18/0.36/0.58/0.82，深浅只代表活跃度），未打卡是纯白 `rg
 
 | 现象 | 原因 / 处理 |
 |---|---|
+| `deps check` 第一项 WorkBuddy 客户端报 MISSING | 版本 < 5.11（5.9.x 是网页版活动中心）→ 按输出里的两种升级方式升到 5.11+ |
+| 命令直接退出、退出码 3 | 同上：版本红线拦住了，stderr 里有完整升级指引 |
+| `deps check` 报 node 缺失（但明明装了） | 版本 < 22（`cdp_client.mjs` 用全局 `WebSocket`）→ `brew install node@22` |
+| 版本显示「未知」/ 客户端显示「未运行」 | 客户端不在 `/Applications` → `export WORKBUDDY_APP=~/Applications/WorkBuddy.app` 后重试 |
+| `no growth entry found in client` | ①客户端不是简体中文界面 ②入口文案变了 → 改 `[growth].open_labels` |
 | `deps check` 报 WorkBuddy CDP MISSING | 没设环境变量或没重启客户端 → 跑 `scripts/launch-workbuddy-debug.sh` |
 | `cdp eval timeout` | 客户端卡住或端口被占 → 重启客户端后 `./run.sh inspect` |
 | `growth-center iframe not found` | 页面被关掉了 → 跑任意 `*-now` 命令会自动从侧栏入口重新打开 |
@@ -195,6 +294,14 @@ alpha 0.18/0.36/0.58/0.82，深浅只代表活跃度），未打卡是纯白 `rg
 | 另一台机器入口文案不同 | 改 `[growth].open_labels`（如 `["成长计划"]`） |
 
 ## 变更记录
+
+- **2026-11-15（兼容性前置）**：把「版本」变成一等公民。新增 `src/buddy_checkin/compat.py`
+  集中放版本红线（≥5.11.0，实测 5.11.3）、官方下载直链与升级指引；`deps check`
+  首项校验客户端版本、node 门槛从「装了就行」收紧到 **≥22**（`cdp_client.mjs`
+  用全局 `WebSocket`）；`checkin-now`/`once`/`daemon` 在版本过低时**动手前退出**
+  （退出码 3）；`ports status`/`inspect` 打印客户端版本与判定；客户端路径不再写死
+  `/Applications`（`WORKBUDDY_APP` 可覆盖）。文档补齐「5.9.x 是网页版活动中心、
+  不支持」的原因与 5.11 灰度期的下载方式。
 
 - **2026-11-14（第二轮）**：改成「五任务 + 当日账本」模型。签到判据换成服务端
   `checkinData`（`onRefreshCheckin` 现场刷新），不再用「卡片在不在」推测；新增漏签

@@ -23,6 +23,15 @@ def _offline_targets(self) -> bool:
 
 
 class DepsTests(unittest.TestCase):
+    def setUp(self):
+        self._patches = [
+            patch("buddy_checkin.ports.client_version", return_value="5.11.3"),
+            patch("buddy_checkin.ports.client_app", return_value=Path("/Applications/WorkBuddy.app")),
+        ]
+        for p in self._patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self._patches])
+
     def test_python_dep_present(self):
         d = deps.python_dep()
         self.assertTrue(d["present"])
@@ -43,9 +52,36 @@ class DepsTests(unittest.TestCase):
         with patch.object(growth_browser.GrowthBrowser, "available", _offline_targets):
             report = deps.evaluate(BASE_CFG)
         names = [d["name"] for d in report["dependencies"]]
-        self.assertEqual(names, ["Python", "node", "agent-browser", "WorkBuddy CDP", "agent-desktop"])
+        self.assertEqual(
+            names,
+            ["WorkBuddy 客户端", "Python", "node", "agent-browser", "WorkBuddy CDP", "agent-desktop"],
+        )
         self.assertNotIn("CuaDriver", names)
         self.assertNotIn("浏览器（任意已装）", names)
+
+    def test_old_client_blocks(self):
+        """5.9.x 是网页版活动中心：必须判红，并给出升级方式（含官方直链）。"""
+        with patch("buddy_checkin.ports.client_version", return_value="5.9.3.42398134-d4692421"), \
+             patch.object(growth_browser.GrowthBrowser, "available", _offline_targets):
+            report = deps.evaluate(BASE_CFG)
+        client = next(d for d in report["dependencies"] if d["name"] == "WorkBuddy 客户端")
+        self.assertFalse(client["present"])
+        self.assertIn("5.11.0", client["install"])
+        self.assertIn("download.codebuddy.cn", client["install"])
+        self.assertIn("WorkBuddy 客户端", report["required_missing"])
+        self.assertFalse(report["ok"])
+
+    def test_old_node_blocks(self):
+        """node ≥22 是硬要求（全局 WebSocket），20 上要判缺失。"""
+        with patch.object(deps, "_try_version", return_value="20.11.1"):
+            d = deps.node_dep()
+        self.assertFalse(d["present"])
+        self.assertIn("22", d["install"])
+
+    def test_new_node_passes(self):
+        with patch.object(deps, "_try_version", return_value="22.22.2"):
+            d = deps.node_dep()
+        self.assertTrue(d["present"])
 
     def test_agent_browser_and_cdp_are_required(self):
         with patch.object(growth_browser.GrowthBrowser, "available", _offline_targets), \

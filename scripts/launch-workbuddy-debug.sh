@@ -20,6 +20,36 @@ PORT_FILE="$HOME/.workbuddy/app/session/DevToolsActivePort"
 
 cdp_ok() { curl -s -m 2 "http://127.0.0.1:$1/json/version" 2>/dev/null | grep -q '"Browser"'; }
 
+# 0) 版本红线：5.9.x 及更早的成长中心是网页版活动中心，客户端里没有内嵌成长中心
+#    和「Buddy加油站」浮层 —— 端口打开了也跑不起来，先升级再说。
+APP_BUNDLE="${WORKBUDDY_APP:-/Applications/WorkBuddy.app}"
+[ -d "$APP_BUNDLE" ] || APP_BUNDLE="$HOME/Applications/WorkBuddy.app"
+CW_VERSION=""
+if [ -d "$APP_BUNDLE" ]; then
+  CW_VERSION="$(defaults read "$APP_BUNDLE/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null)"
+fi
+if [ -n "$CW_VERSION" ]; then
+  CW_MAJOR="${CW_VERSION%%.*}"
+  CW_REST="${CW_VERSION#*.}"
+  CW_MINOR="${CW_REST%%.*}"
+  case "$CW_MAJOR$CW_MINOR" in
+    (*[!0-9]*|"") CW_MAJOR=0; CW_MINOR=0 ;;
+  esac
+  if [ "$CW_MAJOR" -lt 5 ] || { [ "$CW_MAJOR" -eq 5 ] && [ "$CW_MINOR" -lt 11 ]; }; then
+    echo "✗ WorkBuddy $CW_VERSION 太旧：5.9.x 及更早的成长中心是网页版活动中心，"
+    echo "  客户端里没有内嵌成长中心和「Buddy加油站」浮层，本技能无法工作。需要 5.11.0+。"
+    echo ""
+    echo "升级方式一（官方）：左下角头像 → 检查更新（5.11 目前灰度，可能提示已是最新）"
+    echo "升级方式二：官方安装包覆盖安装"
+    echo "  Apple 芯片：https://download.codebuddy.cn/workbuddy/saas/darwin-arm64/WorkBuddy-darwin-arm64-5.11.3.43806934-ecace0f7.dmg"
+    echo "  Intel 芯片：https://download.codebuddy.cn/workbuddy/saas/darwin-x64/WorkBuddy-darwin-x64-5.11.3.43806934-ecace0f7.dmg"
+    echo "  下载后拖进「应用程序」，退出旧版再启动，然后重跑本脚本。"
+    echo "  注意：官网「历史版本下载」页最新只到 5.9.3，那个版本装了也跑不起来。"
+    exit 4
+  fi
+  echo "WorkBuddy $CW_VERSION（要求 ≥5.11.0）"
+fi
+
 if [ -z "$PORT" ] && [ -f "$PORT_FILE" ]; then
   PORT="$(head -1 "$PORT_FILE" | tr -d '[:space:]')"
 fi

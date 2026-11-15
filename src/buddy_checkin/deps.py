@@ -7,7 +7,8 @@
     webContents 聚合 snapshot/click
   - 客户端需带 WORKBUDDY_REMOTE_DEBUGGING_PORT 环境变量启动，才会暴露调试端口
 
-必需依赖：Python ≥3.11、node（CDP 桥）、agent-browser、客户端调试端口。
+必需依赖：WorkBuddy 客户端 ≥5.11（5.9.x 是网页版活动中心，不支持）、
+Python ≥3.11、node ≥22、agent-browser、客户端调试端口。
 可选依赖：agent-desktop（AX 兜底，不参与日常流程）。
 
 旧的 CuaDriver / AX 通道已整体移除，不再列为依赖。
@@ -94,16 +95,51 @@ def node_dep() -> dict:
     from .adapters.growth_browser import GrowthBrowser
 
     resolved = GrowthBrowser._resolve_node()
+    version = _try_version(resolved, "--version") if resolved else None
+    major = None
+    if version:
+        m = re.match(r"(\d+)\.", version)
+        major = int(m.group(1)) if m else None
+    # node ≥22 是硬要求：tools/cdp_client.mjs 用全局 WebSocket（Node 22 才稳定
+    # 可用，20/21 上没有），agent-browser 自己也声明 engines.node >=22。
+    present = bool(resolved) and (major is None or major >= 22)
     return {
         "name": "node",
         "kind": "runtime",
         "required": True,
         "critical": True,
-        "present": bool(resolved),
-        "version": _try_version(resolved, "--version") if resolved else None,
+        "present": present,
+        "version": version,
         "path": resolved or "未找到（PATH 或 ~/.workbuddy/binaries/node）",
-        "install": "安装 Node.js ≥ 20，或使用 WorkBuddy 自带 node（~/.workbuddy/binaries/node）",
-        "note": "tools/cdp_client.mjs 的运行时，用于直连成长中心 iframe 执行 DOM 操作",
+        "install": (
+            "升级到 Node.js ≥ 22（brew install node@22 / nvm install 22），"
+            "或直接用 WorkBuddy 自带的 ~/.workbuddy/binaries/node"
+        ),
+        "note": (
+            "tools/cdp_client.mjs 用全局 WebSocket，需 Node ≥ 22"
+            + (f"；当前 {version} 不满足" if present is False and resolved else "")
+        ),
+    }
+
+
+def client_version_dep(cfg: dict) -> dict:
+    """WorkBuddy 客户端版本：5.11 以下一定跑不起来（不是「可能有问题」）。"""
+    from . import compat, ports
+
+    ver = ports.client_version()
+    res = compat.check(ver)
+    # 只有「能证明过期」才判红；读不到版本（装在自定义路径）不算失败，
+    # 否则会把能正常用的机器误报成缺依赖。
+    return {
+        "name": "WorkBuddy 客户端",
+        "kind": "app-version",
+        "required": True,
+        "critical": True,
+        "present": bool(res["ok"]),
+        "version": ver,
+        "path": str(ports.client_app() or "未找到 WorkBuddy.app（/Applications 或 ~/Applications）"),
+        "install": compat.upgrade_text(ver),
+        "note": res["message"],
     }
 
 
@@ -187,7 +223,9 @@ def agent_desktop_dep(cfg: dict) -> dict:
 
 
 def collect(cfg: dict) -> list[dict]:
+    # 顺序 = 排查顺序：先看业务前提（客户端版本），再看运行时，最后看端口与可选件
     return [
+        client_version_dep(cfg),
         python_dep(),
         node_dep(),
         agent_browser_dep(cfg),
@@ -200,19 +238,28 @@ def evaluate(cfg: dict) -> dict:
     deps = collect(cfg)
     required_missing = [d for d in deps if d["required"] and not d["present"]]
     optional_missing = [d for d in deps if not d["required"] and not d["present"]]
+    from . import compat
+
     return {
         "ok": not required_missing,
         "dependencies": deps,
         "required_missing": [d["name"] for d in required_missing],
         "optional_missing": [d["name"] for d in optional_missing],
+        "client_compat": compat.check(
+            next((d["version"] for d in deps if d["name"] == "WorkBuddy 客户端"), None)
+        ),
     }
 
 
 def install(cfg: dict) -> int:
-    print("[deps] 运行时依赖：agent-browser + node + WorkBuddy 客户端 CDP 端口。\n")
+    print("[deps] 运行前提：WorkBuddy 客户端 ≥ 5.11 + node ≥ 22 + agent-browser + CDP 端口。\n")
     for d in collect(cfg):
         status = "已就绪" if d["present"] else "缺失"
-        print(f"  - {d['name']} [{status}]: {d['install']}")
+        print(f"  - {d['name']} [{status}]")
+        print(f"      {d['note']}")
+        if not d["present"]:
+            for line in str(d["install"]).splitlines():
+                print(f"      {line}")
     return 0
 
 
@@ -226,14 +273,16 @@ def cmd_deps(cfg: dict, args: Any) -> int:
             print(f"{d['name']:16} {('OK' if d['present'] else 'MISSING'):8} "
                   f"{('[required]' if d['required'] else '[optional]'):12} {d['path']}")
         return 0
-    print("== buddy-web-checkin 第三方依赖检查 ==")
+    print("== buddy-web-checkin 依赖检查 ==")
     for d in report["dependencies"]:
-        flag = "OK" if d["present"] else ("MISSING" if d["required"] else "missing(可选)")
+        flag = "OK" if d["present"] else ("MISSING" if d["required"] else "可选-未装")
         ver = f" v{d['version']}" if d.get("version") else ""
-        print(f"  [{flag:18}] {d['name']}{ver}")
+        print(f"  [{flag:9}] {d['name']}{ver}")
         print(f"       {d['note']}")
         if not d["present"]:
-            print(f"       安装: {d['install']}")
+            print("       ↓ 处理方式")
+            for line in str(d["install"]).splitlines():
+                print(f"       {line}")
     print("")
     if report["ok"]:
         print("✅ 所有必需依赖就绪，可以运行 ./run.sh once / daemon。")

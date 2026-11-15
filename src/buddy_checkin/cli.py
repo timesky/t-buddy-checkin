@@ -9,7 +9,7 @@ import sys
 import threading
 from pathlib import Path
 
-from . import config, launchd, ports
+from . import compat, config, launchd, ports
 from .actions import Actions
 from .adapters.fuel_card import FuelCard
 from .adapters.growth_browser import GrowthBrowser
@@ -63,6 +63,23 @@ def preflight_model_check(cfg: dict) -> int:
         file=sys.stderr,
     )
     return 2
+
+
+def preflight_client_check(cfg: dict) -> int:
+    """客户端版本红线：能证明低于 5.11 就直接停。
+
+    5.9.x 及更早的成长中心是网页版活动中心，客户端里既没有内嵌成长中心
+    iframe、也没有「Buddy加油站」浮层 —— 继续跑只会每条命令报错或整日空转，
+    不如一次性把升级方式说清楚。返回 0=放行，3=版本不支持。
+    """
+    ver = ports.client_version()
+    res = compat.check(ver)
+    if res["ok"]:
+        if res["level"] in ("newer_than_tested", "unknown"):
+            logger.warning("客户端版本：%s", res["message"])
+        return 0
+    print(compat.upgrade_text(ver), file=sys.stderr)
+    return 3
 
 
 def cmd_model_check(cfg: dict, args: argparse.Namespace) -> int:
@@ -276,7 +293,16 @@ def cmd_inspect(cfg: dict, args: argparse.Namespace) -> int:
     g = cfg.get("growth", {}) or {}
     port = g.get("cdp_port", ports.DEFAULT_PORT)
     gb = GrowthBrowser(cfg)
-    print("== CDP 诊断 ==")
+    print("== 运行前提 ==")
+    ver = ports.client_version()
+    comp = compat.check(ver)
+    print(f"  客户端版本      : {compat.one_line(ver)}")
+    print(f"  版本判定        : {comp['message']}")
+    if not comp["ok"]:
+        print(compat.upgrade_text(ver))
+        print("\n（版本不支持，后续检查没有意义；升级后重跑本命令）")
+        return 3
+    print("\n== CDP 诊断 ==")
     print(f"  port            : {port}（来源 {g.get('cdp_port_source', '?')}）")
     print(f"  agent-browser   : {gb.ab_bin or '未找到（tools/node_modules/.bin/agent-browser）'}")
     print(f"  node            : {gb.node_bin or '未找到'}")
@@ -511,6 +537,12 @@ def main(argv: list[str] | None = None) -> int:
             return rc
     # 端口：任何需要 CDP 的命令都先探真实端口再下发（唯一注入点）
     if args.command not in ("model-check", "ports"):
+        # 版本红线先于端口：端口通了但客户端是 5.9.x（网页版活动中心）同样跑不了。
+        # deps/inspect/status/install-launchd 属运维或诊断，放行以便把版本号打出来。
+        if args.command not in ("deps", "inspect", "status", "install-launchd"):
+            rc = preflight_client_check(cfg)
+            if rc:
+                return rc
         inject_port(cfg)
     handlers = {
         "checkin-now": cmd_checkin_now,

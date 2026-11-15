@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import compat
+
 ENV_KEY = "WORKBUDDY_REMOTE_DEBUGGING_PORT"
 DEFAULT_PORT = 9222
 DEFAULT_RANGE = tuple(range(9222, 9243))  # 9222..9242
@@ -101,11 +103,39 @@ def env_port() -> int | None:
     return int(m.group(1)) if m else None
 
 
+def app_paths() -> list[Path]:
+    """可能装 WorkBuddy 的位置（官方要求装进「应用程序」，但允许覆盖）。
+
+    `WORKBUDDY_APP` 可指向任意 `.app`（装在 `~/Applications`、外置盘、
+    或改名后的副本时用）。以前这里写死 `/Applications`，装在别处就会被判
+    「客户端未运行 / 版本未知」——属于误报，不能当结论。
+    """
+    out: list[Path] = []
+    override = (os.environ.get("WORKBUDDY_APP") or "").strip()
+    if override:
+        out.append(Path(override).expanduser())
+    out += [
+        Path("/Applications/WorkBuddy.app"),
+        Path.home() / "Applications" / "WorkBuddy.app",
+    ]
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for p in out:
+        if str(p) not in seen:
+            seen.add(str(p))
+            uniq.append(p)
+    return uniq
+
+
 def client_pids() -> list[int]:
-    """客户端主进程（Electron 主进程，窗口就挂在它上面）。"""
+    """客户端主进程（Electron 主进程，窗口就挂在它上面）。
+
+    只匹配可执行路径片段，不写死 `/Applications`：装在 `~/Applications`
+    或改过路径的客户端同样能认出来。
+    """
     try:
         proc = subprocess.run(
-            ["pgrep", "-f", "/Applications/WorkBuddy.app/Contents/MacOS/Electron"],
+            ["pgrep", "-f", f"{APP_MARK}Electron"],
             capture_output=True, text=True, timeout=4,
         )
     except (OSError, subprocess.SubprocessError):
@@ -113,10 +143,22 @@ def client_pids() -> list[int]:
     return [int(x) for x in (proc.stdout or "").split() if x.isdigit()]
 
 
+def client_app() -> Path | None:
+    """实际装着的那份 .app（存在且带 Info.plist）。"""
+    for p in app_paths():
+        if (p / "Contents" / "Info.plist").exists():
+            return p
+    return None
+
+
 def client_version() -> str | None:
+    """读客户端 CFBundleShortVersionString（决定 5.11+ 红线的那个值）。"""
+    app = client_app()
+    if app is None:
+        return None
     try:
         proc = subprocess.run(
-            ["defaults", "read", "/Applications/WorkBuddy.app/Contents/Info.plist",
+            ["defaults", "read", str(app / "Contents" / "Info.plist"),
              "CFBundleShortVersionString"],
             capture_output=True, text=True, timeout=4,
         )
@@ -387,9 +429,12 @@ def report(cfg: dict | None = None) -> dict:
             "exe_owned": bool(info and info["owned"]),
         })
     res = resolve(cfg)
+    ver = client_version()
     return {
         "machine": os.uname().nodename,
-        "client_version": client_version(),
+        "client_version": ver,
+        "client_app": str(client_app() or ""),
+        "client_compat": compat.check(ver),
         "client_pids": pids,
         "env": {"key": ENV_KEY, "port": env},
         "active_file": active,
@@ -404,6 +449,18 @@ def format_report(rep: dict) -> str:
     """把 report() 渲染成给人看的段落。"""
     lines = ["== CDP 端口 =="]
     lines.append(f"  机器            : {rep['machine']}  WorkBuddy {rep['client_version'] or '?'}")
+    comp = rep.get("client_compat") or {}
+    if comp:
+        lines.append(f"  客户端版本      : {compat.one_line(rep['client_version'])}"
+                     f"  [{comp.get('level', '?')}]")
+        if rep.get("client_app"):
+            lines.append(f"  客户端路径      : {rep['client_app']}")
+        if not comp.get("ok", True):
+            lines.append("                    ✗ 版本过低，本技能无法工作（端口再对也没用）")
+            lines.append("                    → ./run.sh deps check 查看升级方式")
+        elif comp.get("level") == "unknown":
+            lines.append("                    ? 没读到版本：装在非默认路径时用 "
+                         "WORKBUDDY_APP=/path/WorkBuddy.app 指定")
     res = rep["resolved"]
     # pgrep -f 会同时命中 --prewarm 之类的 CLI 辅助进程，直接列首项会指错人；
     # 优先报「真正监听解析端口」的那个 PID。
