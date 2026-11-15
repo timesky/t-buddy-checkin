@@ -14,6 +14,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-3776ab)](docs/compatibility.md)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2022-339933)](docs/compatibility.md)
 [![tests](https://img.shields.io/badge/tests-159%20passing-brightgreen)](docs/architecture.md#测试)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 [English](README_EN.md) · [文档索引](docs/README.md) · [SKILL.md](SKILL.md)
 
@@ -132,5 +133,10 @@ BUDDY_FREE_MODEL=1 ./run.sh inspect          # 真机只读诊断
 
 ## License
 
-仓库暂未附 License 文件。在补上之前，默认保留所有权利；如需在别的项目里复用，
-请先开 Issue 说明用途。
+[MIT](LICENSE) © 2026 TimeSky —— **完全开源、可商用**：可自由使用、复制、修改、合并、
+发布、分发、再授权乃至销售，唯一条件是保留版权与许可声明；软件按「现状」提供，不含任何担保。
+
+第三方依赖同样是宽松开源许可：`agent-browser` / `agent-desktop` 均为 Apache-2.0
+（见 [tools/package.json](tools/package.json)），依赖树里没有 BUSL / FSL / PolyForm-NC
+一类「源可得非开源」许可。本项目不分发 `node_modules`，因此不触发 Apache-2.0 的 NOTICE
+分发义务；新增依赖的许可规则见 [CONTRIBUTING.md](CONTRIBUTING.md#依赖许可硬规则)。

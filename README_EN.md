@@ -15,6 +15,7 @@ in one idempotent daily ledger, running quietly in the background.
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-3776ab)](docs/compatibility.md)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2022-339933)](docs/compatibility.md)
 [![tests](https://img.shields.io/badge/tests-159%20passing-brightgreen)](docs/architecture.md#测试)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 [中文](README.md) · [Docs index (中文)](docs/README.md) · [SKILL.md](SKILL.md)
 
@@ -141,5 +142,14 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR.
 
 ## License
 
-No license file yet — all rights reserved until one is added. If you want to reuse this code,
-please open an issue describing your use case first.
+[MIT](LICENSE) © 2026 TimeSky — **fully open source and commercially usable**: use, copy,
+modify, merge, publish, distribute, sublicense and sell are all permitted, on the sole
+condition that the copyright and permission notices are kept. Provided "as is", without
+warranty of any kind.
+
+Third-party dependencies are permissive OSI licenses too: `agent-browser` and
+`agent-desktop` are both Apache-2.0 (see [tools/package.json](tools/package.json)); the
+dependency tree contains no "source-available but not open source" licenses such as BUSL,
+FSL or PolyForm-NC. `node_modules` is not redistributed by this project, so Apache-2.0
+NOTICE distribution obligations do not apply. Rules for new dependencies:
+[CONTRIBUTING.md](CONTRIBUTING.md).

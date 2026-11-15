@@ -53,6 +53,27 @@ python3 -m unittest discover -s tests -q
   [docs/README.md](docs/README.md#文档语言与命名约定)。
 - 不提交 `config.toml`、`progress.txt`、`*.sqlite3`、`*.png`、`tools/node_modules/`、`.tmp/`。
 
+## 依赖许可（硬规则）
+
+本项目采用 MIT，依赖树也必须是**完全开源、可商用**，不能出现「源可得但非开源」的许可。
+
+- 允许：OSI 认证的宽松许可 —— `MIT` / `Apache-2.0` / `BSD-2-Clause` / `BSD-3-Clause` / `ISC`。
+- **禁止入依赖树**：BUSL、FSL、PolyForm-NC、SSPL、Elastic License、CC-BY-NC 等一切带
+  非商业/额外限制的「源可得非开源」许可；GPL / AGPL 等强 copyleft 会与 MIT 冲突，
+  引入前必须先讨论。
+- 新增 Python 包同样适用。当前**零第三方 Python 依赖**，优先用标准库维持这条。
+- 合并前核一遍每个依赖的 `license` 字段（含传递依赖），不要只看 `npm install` 成功。
+
+当前依赖（2026-11-15 实测 `tools/node_modules/**/package.json`）：
+
+| 依赖 | 版本 | 许可 |
+|---|---|---|
+| `agent-browser` | 0.42.0 | Apache-2.0 |
+| `agent-desktop` | 1.2.0 | Apache-2.0 |
+
+`tools/node_modules/` 已进 `.gitignore`，本项目只分发自己的源码，因此 Apache-2.0 的
+NOTICE 分发义务不触发；若将来打包分发依赖产物，需另附 THIRD_PARTY_NOTICES。
+
 ## 不要做的事
 
 - 不加自动登录、不碰验证码、不读取或导出 token。
