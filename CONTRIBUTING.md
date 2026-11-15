@@ -48,8 +48,8 @@ python3 -m unittest discover -s tests -q
 
 - 一个 commit 一件事，message 用 `feat(scope):` / `fix(scope):` / `docs:` / `test:` 前缀。
 - 改到行为（判据、顺序、退避、退出码）时同步更新 `docs/changelog.md` 与相关文档。
-- 新增翻译文件按 `README.<小写语言码>.md`（`README.ja.md`），需要地区才写 `README.pt-BR.md`；
-  **不要**再用 `README_EN.md` / `README_CN.md` 这类大写或国家码写法，理由见
+- 新增翻译文件沿用 `README_<小写语言码>.md`（如 `README_ja.md`），需要地区才写
+  `README_pt-BR.md`；**不要混用分隔符**（别再加 `README.en.md` / `README-ja.md`），依据见
   [docs/README.md](docs/README.md#文档语言与命名约定)。
 - 不提交 `config.toml`、`progress.txt`、`*.sqlite3`、`*.png`、`tools/node_modules/`、`.tmp/`。
 

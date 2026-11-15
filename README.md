@@ -15,7 +15,7 @@
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2022-339933)](docs/compatibility.md)
 [![tests](https://img.shields.io/badge/tests-159%20passing-brightgreen)](docs/architecture.md#测试)
 
-[English](README.en.md) · [文档索引](docs/README.md) · [SKILL.md](SKILL.md)
+[English](README_EN.md) · [文档索引](docs/README.md) · [SKILL.md](SKILL.md)
 
 ---
 
@@ -104,8 +104,8 @@ BUDDY_FREE_MODEL=1 ./run.sh <command>
 | [docs/changelog.md](docs/changelog.md) | 行为变化与踩过的坑 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 开发环境、测试约定、提交规范 |
 
-文档语言：中文为主，英文见 [README.en.md](README.en.md)；文件命名用 BCP 47 小写语言码
-（`README.en.md`，不用 `README_EN.md`），约定与理由见
+文档语言：中文为主，英文见 [README_EN.md](README_EN.md)。分隔符（`_` / `.` / `-`）
+没有国际标准，本仓库按中文开源圈最常见的下划线写法统一，约定与实测依据见
 [docs/README.md](docs/README.md#文档语言与命名约定)。
 
 ## 安全边界

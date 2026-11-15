@@ -7,7 +7,7 @@
 
 # 文档索引
 
-[主 README](../README.md) · [English README](../README.en.md) · [SKILL.md](../SKILL.md)
+[主 README](../README.md) · [English README](../README_EN.md) · [SKILL.md](../SKILL.md)
 
 第一次用，按 **① 兼容性 → ② 安装 → ③ 用法** 的顺序看，其余按需查。
 
@@ -31,22 +31,51 @@
 
 ## 文档语言与命名约定
 
-主文档为简体中文（WorkBuddy 的主要受众），英文版只有一份总览 [README.en.md](../README.en.md)；
+主文档为简体中文（WorkBuddy 的主要受众），英文版只有一份总览 [README_EN.md](../README_EN.md)；
 细节文档暂不翻译，Issue 用中文或英文都可以。
 
-文件命名遵循 **BCP 47 语言标签 + 点号后缀**，这条是有意选的，不是随手写：
+### 先说结论：分隔符没有国际标准
 
-| 写法 | 判断 | 说明 |
+`_` / `.` / `-` 三种写法都有大量项目在用。**GitHub 只渲染 `README.md`，完全不识别语言后缀**，
+语言切换靠的是两份 README 顶部手写的互链 —— 所以分隔符是「选一种、全仓一致」的约定，
+不是合规问题。本仓库用 `README_EN.md`，是因为它属于根目录翻译文件里最常见的一派，
+**没有任何技术理由说 `.` 更正确**。
+
+2026-11-15 逐个查 GitHub 仓库根目录的真实命名：
+
+| 仓库 | 翻译文件 | 分隔符 |
 |---|---|---|
-| `README.en.md` ✅ | 采用 | 点号分隔、语言码小写、无地区。同款见 HelloGitHub（`README.md` + `README_en.md` 的中文项目） |
-| `README_EN.md` ⚠️ | 不用 | 大写不算错但属历史风格（doocs/leetcode 这类）；`EN` 是**语言码**不是国家码，全大写容易让人误以为是 ISO 3166 |
-| `README_zh_CN.md` / `README-zh_CN.md` ⚠️ | 需要地区时才用 | ant-design 用 `README-zh_CN.md`，996.ICU 用 `README_CN.md`（直接拿国家码当语言码）。真要标地区，规范写法是 `README.zh-CN.md`（语言-地区） |
-| `README.en-US.md` | 不必 | 只有内容真按地区分叉（价格、合规、支付方式）时才加地区码；本项目的英文版没有地区差异 |
+| 521xueweihan/HelloGitHub | `README_en.md` / `README_ja.md` | `_` |
+| doocs/leetcode | `README_EN.md` | `_` |
+| PaddlePaddle/Paddle | `README_cn.md` / `README_ja.md` | `_` |
+| 996.ICU | `README_CN.md` | `_` |
+| ant-design/ant-design | `README-zh_CN.md` | `-` |
+| jwasham/coding-interview-university | `translations/README-zh.md` 等 | `-` + 目录 |
+| kubernetes/website | `content/en/`、`content/zh-cn/`、`content/pt-br/` | 目录 |
 
-**加新翻译时**：`README.<ISO 639-1 小写语言码>.md`，例如 `README.ja.md`、`README.ko.md`；
-只有当同一语言需要按地区分版本时才写成 `README.pt-BR.md`、`README.zh-TW.md`。
-文档站的 i18n 目录同理用 `docs/<lang>/`（对齐 kubernetes/website 的 `content/zh-cn/`、`pt-br/` 全小写连字符风格）。
+可以看到：**根目录的翻译 README 里 `_` 明显占多数**（本仓库之前的 `README.en.md`
+属于点号那一派，多见于多语言文档工具链与 Apache 内容协商后缀风格，没有功能优势）。
+文档站层面则是 BCP 47 全小写连字符目录（`zh-cn`、`pt-br`）成主流。
 
-为什么不用 `_EN`：`EN` 是语言码，`US/CN/GB` 才是国家二字码（ISO 3166-1 alpha-2）。
-把两者混成一个全大写后缀在中文项目里很常见，但既不符合 BCP 47，也让「英文」和「美式英语」
-在文件名上无法区分 —— 我们只维护一份英文，用最小、最不容易误解的 `en` 就够。
+### 真正有标准的是「语言码」，不是「分隔符」
+
+| 概念 | 标准 | 写法 |
+|---|---|---|
+| 语言码 | ISO 639-1 | `en` / `zh` / `ja`（规范小写） |
+| 国家 / 地区码 | ISO 3166-1 alpha-2 | `US` / `CN` / `TW`（规范大写） |
+| 语言标签 | BCP 47（语言-地区） | `en-US` / `zh-CN` / `pt-BR` |
+
+- `README_EN.md` 里的 `EN` 是**语言码全大写**，属于中文开源圈的显示习惯，
+  不是国家码（国家码是 `US`），也不影响功能 —— 文件名不会被当语言标签解析。
+- `README_CN.md` 是**拿国家码代替语言码**，严格讲不准确，但同样很常见。
+- 只有内容真按地区分叉（价格、合规、支付方式）时才需要地区码；本项目英文版没有地区差异，
+  所以不需要 `-US`。
+
+### 加新翻译时
+
+1. 沿用现有风格：`README_<语言码>.md`（例如 `README_ja.md`、`README_ko.md`，建议小写）。
+2. 需要按地区分叉才写 `README_zh-TW.md`、`README_pt-BR.md`。
+3. **不要混用分隔符**（不要再出现 `README.en.md` / `README-ja.md`），并在两份 README
+   顶部保持互链。
+4. 文档分册将来若做多语言，走 `docs/<lang>/`（对齐 Kubernetes 的 `zh-cn` / `pt-br` 风格），
+   而不是再堆一个 `docs-zh/` 目录。
