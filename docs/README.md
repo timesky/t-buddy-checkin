@@ -29,7 +29,24 @@
 - **路径**：账本与日志在 `~/.local/share/buddy-web-checkin/`，登录项在 `~/Library/LaunchAgents/`。
 - 文档里的命令都在仓库根目录执行，`./run.sh` 是唯一入口。
 
-## 文档语言
+## 文档语言与命名约定
 
 主文档为简体中文（WorkBuddy 的主要受众），英文版只有一份总览 [README.en.md](../README.en.md)；
 细节文档暂不翻译，Issue 用中文或英文都可以。
+
+文件命名遵循 **BCP 47 语言标签 + 点号后缀**，这条是有意选的，不是随手写：
+
+| 写法 | 判断 | 说明 |
+|---|---|---|
+| `README.en.md` ✅ | 采用 | 点号分隔、语言码小写、无地区。同款见 HelloGitHub（`README.md` + `README_en.md` 的中文项目） |
+| `README_EN.md` ⚠️ | 不用 | 大写不算错但属历史风格（doocs/leetcode 这类）；`EN` 是**语言码**不是国家码，全大写容易让人误以为是 ISO 3166 |
+| `README_zh_CN.md` / `README-zh_CN.md` ⚠️ | 需要地区时才用 | ant-design 用 `README-zh_CN.md`，996.ICU 用 `README_CN.md`（直接拿国家码当语言码）。真要标地区，规范写法是 `README.zh-CN.md`（语言-地区） |
+| `README.en-US.md` | 不必 | 只有内容真按地区分叉（价格、合规、支付方式）时才加地区码；本项目的英文版没有地区差异 |
+
+**加新翻译时**：`README.<ISO 639-1 小写语言码>.md`，例如 `README.ja.md`、`README.ko.md`；
+只有当同一语言需要按地区分版本时才写成 `README.pt-BR.md`、`README.zh-TW.md`。
+文档站的 i18n 目录同理用 `docs/<lang>/`（对齐 kubernetes/website 的 `content/zh-cn/`、`pt-br/` 全小写连字符风格）。
+
+为什么不用 `_EN`：`EN` 是语言码，`US/CN/GB` 才是国家二字码（ISO 3166-1 alpha-2）。
+把两者混成一个全大写后缀在中文项目里很常见，但既不符合 BCP 47，也让「英文」和「美式英语」
+在文件名上无法区分 —— 我们只维护一份英文，用最小、最不容易误解的 `en` 就够。

@@ -104,6 +104,10 @@ BUDDY_FREE_MODEL=1 ./run.sh <command>
 | [docs/changelog.md](docs/changelog.md) | 行为变化与踩过的坑 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 开发环境、测试约定、提交规范 |
 
+文档语言：中文为主，英文见 [README.en.md](README.en.md)；文件命名用 BCP 47 小写语言码
+（`README.en.md`，不用 `README_EN.md`），约定与理由见
+[docs/README.md](docs/README.md#文档语言与命名约定)。
+
 ## 安全边界
 
 - **不碰登录态**：不自动登录、不填账号密码、不绕验证码、不读取或导出任何 token。
