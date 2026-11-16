@@ -85,6 +85,47 @@ class ReconnectRetryTests(_Base):
         self.assertIn("做任务赢积分", r.detail)
 
 
+class FuelCardEntryFallbackTests(_Base):
+    """2026-11-16 另一台机器：侧栏入口不在，浮层运营卡直接挂着「立即前往」。"""
+
+    def test_direct_growth_button_opens_page(self):
+        self.gb._ensure_connected = lambda attempts=2: True
+        self.gb._ab = self.fake_ab
+        self.gb._looks_like_client = lambda: True
+        clicks: list[str] = []
+        state = {"iframe": False}
+
+        def click(label, attempts=3):
+            clicks.append(label)
+            if label == "立即前往":
+                state["iframe"] = True
+                return True, label
+            return False, "snapshot has no button"
+
+        self.gb._click_label = click
+        self.gb._iframe_ws = lambda: "ws://x" if state["iframe"] else None
+        r = self.gb.ensure_page()
+        self.assertTrue(r.ok, r.detail)
+        self.assertIn("立即前往", clicks)
+        self.assertEqual(clicks.count("立即前往"), 1,
+                         "浮层按钮本身就是最后一步，不该再点第二次")
+        self.assertTrue(self.gb._opened_this_run)
+
+    def test_fallback_only_after_configured_labels(self):
+        """兜底必须排在常规入口之后，避免优先误点运营卡。"""
+        self.gb._ensure_connected = lambda attempts=2: True
+        self.gb._ab = self.fake_ab
+        self.gb._looks_like_client = lambda: True
+        clicks: list[str] = []
+        self.gb._click_label = lambda label, attempts=3: (
+            clicks.append(label) or (False, "snapshot has no button"))
+        r = self.gb.ensure_page()
+        self.assertFalse(r.ok)
+        self.assertEqual(clicks[:2], ["成长计划", "做任务赢积分"])
+        self.assertEqual(clicks[-1], "立即前往")
+        self.assertIn("no growth entry found", r.detail)
+
+
 class SelfHealTests(_Base):
     def test_no_heal_when_client_visible(self):
         self.gb._looks_like_client = lambda: True

@@ -29,7 +29,8 @@ tail -30 ~/.local/share/buddy-web-checkin/daemon.log   # ④ 常驻进程日志
 | 命令直接退出、退出码 `3` | 同上：版本红线拦住了，stderr 里有完整升级指引 |
 | `deps check` 报 node 缺失（但明明装了） | 版本 < 22（`cdp_client.mjs` 用全局 `WebSocket`）→ `brew install node@22` |
 | 版本显示「未知」/ 客户端显示「未运行」 | 客户端不在 `/Applications` → `export WORKBUDDY_APP=~/Applications/WorkBuddy.app` 后重试 |
-| `no growth entry found in client` | ①客户端不是简体中文界面 ②入口文案变了 → 改 `[growth].open_labels` |
+| `no growth entry found in client`（兑换/补签/抽奖/派遣四项一起 `pending`） | 该机器侧栏入口文案与 `[growth].open_labels` 不匹配。2026-11-16 起代码会把左下角浮层运营卡的「立即前往」作为最后兜底（仅在常规入口全失败后尝试，且必须验证 iframe 出现）。仍失败时跑 `./tools/node_modules/.bin/agent-browser snapshot -i` 看真实按钮文案，改 `[growth].open_labels`；详见 [变更记录](changelog.md) |
+| 礼物没领、也没派新的一次 | 先看 `travel` 是不是被上面的入口问题卡住（账本 `progress.json` 里 `travel.state`）；再看 daemon.log 里 `claim=` / `dispatch=` 与 `due_at`。入口四项都 `pending` 时，签到仍会是 `done`（走浮层，不依赖成长中心），容易误判成「服务正常」 |
 | `deps check` 报 `WorkBuddy CDP MISSING` | 没设环境变量或没重启客户端 → `./scripts/launch-workbuddy-debug.sh` |
 | `cdp eval timeout` | 客户端卡住或端口被占 → 重启客户端后 `./run.sh inspect` |
 | `growth-center iframe not found` | 页面被关掉了 → 跑任意 `*-now` 命令会自动从侧栏入口重新打开 |

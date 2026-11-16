@@ -430,11 +430,13 @@ class GrowthBrowser:
                 continue
             clicked_any = True
             time.sleep(1.0)
-            # 点入口后会出现「立即前往」
-            ok2, _ = self._click_label("立即前往", attempts=2)
-            if not ok2:
-                # 有些版本入口直接打开页面，无需二次点击
-                time.sleep(1.5)
+            # 点侧栏入口后会出现「立即前往」，需要再点一次；但浮层运营卡上的
+            # 「立即前往」本身就是最后一步，不能再点第二次（按钮点完会消失）。
+            if label != "立即前往":
+                ok2, _ = self._click_label("立即前往", attempts=2)
+                if not ok2:
+                    # 有些版本入口直接打开页面，无需二次点击
+                    time.sleep(1.5)
             for _ in range(int(self.wait_sec * 2)):
                 if self._iframe_ws():
                     ready = self._wait_page_ready()
@@ -487,6 +489,14 @@ class GrowthBrowser:
             return ActionResult(False, "growth_open", msg, {"blocked": code})
 
         labels = ["成长计划"] + list((self.cfg.get("growth", {}) or {}).get("open_labels") or [])
+        # 2026-11-16 另一台机器事故：客户端侧栏里三个入口文案都匹配不上，但
+        # 左下角浮层运营卡直接挂着 #go[type=growth]「立即前往」按钮。旧实现只有
+        # 「先点侧栏入口 → 再点立即前往」一条路径，入口找不到就永远走不到第二步，
+        # 兑换/补签/抽奖/派遣四项整天 pending，礼物领取与新派遣都没发生。
+        # 把浮层按钮作为最后兜底：放在所有常规入口之后，点击后仍要验证 iframe
+        # 真的出现，避免误点其它运营卡。
+        if "立即前往" not in labels:
+            labels.append("立即前往")
         self._last_open_errors = []
         self._last_open_clicked = False
         for attempt in range(2):
