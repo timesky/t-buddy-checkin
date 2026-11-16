@@ -214,6 +214,112 @@ class FuelClaimTests(unittest.TestCase):
         self.assertNotIn("'x'", js)
         self.assertNotIn("dot", js)
 
+    def test_unmounted_slot_is_reopened_before_giving_up(self):
+        """2026-11-16 漏签复现：读不到状态时必须先重新选页+唤起浮层再读一次。"""
+        seq = [
+            {"ok": False, "reason": "checkinData not found (slot not mounted)",
+             "host": False, "today_checked_in": None},
+            {"ok": True, "today_checked_in": False, "today_credit": 0,
+             "checkin_dates": ["2026-11-15"]},
+            {"ok": True, "today_checked_in": True, "today_credit": 100,
+             "streak_days": 38, "checkin_dates": ["2026-11-16"]},
+        ]
+
+        seq_last = {"ok": True, "today_checked_in": True, "today_credit": 100,
+                    "checkin_dates": ["2026-11-16"]}
+
+        def fake_status(refresh=True):
+            return seq.pop(0) if seq else seq_last
+
+        self.fc.status = fake_status
+        calls = {"visible": 0, "reset": 0}
+
+        def fake_visible():
+            calls["visible"] += 1
+            return True, "reopened"
+
+        self.fc.ensure_visible = fake_visible
+        self.fc.reset_page = lambda: calls.__setitem__("reset", calls["reset"] + 1)
+        self.fc._eval = lambda js, timeout=20: (True, {"ok": True, "btn": "立即领取"})
+        r = self.fc.claim(wait_sec=0.1)
+        self.assertTrue(r.ok, "恢复浮层后应能正常签到，不能整天 pending")
+        self.assertEqual(r.data.get("judge"), "date_in_dates")
+        self.assertGreaterEqual(calls["reset"], 1, "恢复前应重新选页")
+        self.assertGreaterEqual(calls["visible"], 1, "恢复前应唤起浮层")
+
+    def test_host_present_but_no_data_is_not_a_reopen_case(self):
+        """浮层在、只是 fiber 上没有 checkinData 时，不该去点用户菜单。"""
+        self.fc.status = lambda refresh=True: {
+            "ok": False, "reason": "checkinData not found (slot not mounted)",
+            "host": True, "today_checked_in": None}
+        self.fc.ensure_visible = lambda: self.fail("host 存在说明浮层在，不该重新唤起")
+        self.fc.reset_page = lambda: self.fail("host 存在说明没选错页")
+        r = self.fc.claim()
+        self.assertFalse(r.ok)
+        self.assertEqual(r.data.get("reopen"), "not_needed")
+
+
+class FuelPageSelectionTests(unittest.TestCase):
+    """多窗口客户端：不能默认连 /json/list 的第一个 app.asar 页面。"""
+
+    def setUp(self):
+        self.fc = FuelCard(_cfg())
+        self.pages = [
+            {"type": "page", "url": "file:///Applications/WorkBuddy.app/Contents/Resources/app.asar/renderer/sheet.html",
+             "webSocketDebuggerUrl": "ws://sheet"},
+            {"type": "page", "url": "file:///Applications/WorkBuddy.app/Contents/Resources/app.asar/renderer/index.html",
+             "webSocketDebuggerUrl": "ws://fuel"},
+            {"type": "page", "url": "file:///Applications/WorkBuddy.app/Contents/Resources/app.asar/renderer/other.html",
+             "webSocketDebuggerUrl": "ws://other"},
+        ]
+        self.fc._http = lambda path: self.pages
+
+    def test_selects_page_with_fuel_card(self):
+        self.fc._probe_page = lambda ws: ws == "ws://fuel"
+        self.assertEqual(self.fc.page_ws(), "ws://fuel")
+
+    def test_falls_back_to_first_candidate_when_no_page_has_card(self):
+        self.fc._probe_page = lambda ws: False
+        self.assertEqual(self.fc.page_ws(), "ws://sheet")
+
+    def test_fallback_prefers_main_window_over_sheet(self):
+        """浮层被卸载时回退到主窗口，表格窗口里点用户菜单唤不起浮层。"""
+        titles = {"ws://sheet": ".xlsx", "ws://fuel": "WorkBuddy",
+                  "ws://other": "F06_舱位明细.xlsx"}
+        titled = [dict(p, title=titles[p["webSocketDebuggerUrl"]]) for p in self.pages]
+        self.fc._http = lambda path: titled
+        self.fc._probe_page = lambda ws: False
+        self.assertEqual(self.fc.page_ws(), "ws://fuel")
+
+    def test_fallback_skips_windows_titled_as_spreadsheet(self):
+        titles = {"ws://sheet": "WorkBuddy", "ws://fuel": "F06_舱位明细.xlsx",
+                  "ws://other": "WorkBuddy"}
+        titled = [dict(p, title=titles[p["webSocketDebuggerUrl"]]) for p in self.pages]
+        self.fc._http = lambda path: titled
+        self.fc._probe_page = lambda ws: False
+        self.assertEqual(self.fc.page_ws(), "ws://sheet")
+
+    def test_reset_page_forces_rescan(self):
+        seen = {"n": 0}
+
+        def probe(ws):
+            seen["n"] += 1
+            return ws == "ws://fuel"
+
+        self.fc._probe_page = probe
+        self.fc.page_ws()
+        self.fc.page_ws()
+        self.assertEqual(seen["n"], 2, "命中浮层即停止探测；第二次应走缓存")
+        self.fc.reset_page()
+        self.fc.page_ws()
+        self.assertEqual(seen["n"], 4, "reset 后应重新扫描候选页")
+
+    def test_cached_ws_that_disappeared_is_rechosen(self):
+        self.fc._probe_page = lambda ws: ws == "ws://fuel"
+        self.assertEqual(self.fc.page_ws(), "ws://fuel")
+        self.fc._http = lambda path: [p for p in self.pages if p["webSocketDebuggerUrl"] != "ws://fuel"]
+        self.assertEqual(self.fc.page_ws(), "ws://sheet")
+
 
 if __name__ == "__main__":
     unittest.main()

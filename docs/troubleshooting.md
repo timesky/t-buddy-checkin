@@ -34,6 +34,8 @@ tail -30 ~/.local/share/buddy-web-checkin/daemon.log   # ④ 常驻进程日志
 | `cdp eval timeout` | 客户端卡住或端口被占 → 重启客户端后 `./run.sh inspect` |
 | `growth-center iframe not found` | 页面被关掉了 → 跑任意 `*-now` 命令会自动从侧栏入口重新打开 |
 | 签到一直 `ok=False` | 看 `inspect` 的「今日是否在 checkin_dates」；为 false 说明点击没生效，检查浮层是否被关掉（技能会自动从用户菜单重新唤起） |
+| 签到整夜 `pending`，日志全是 `checkinData not found (slot not mounted)` | 客户端开了多个 `app.asar` 窗口，旧版会连到没有浮层的那个；或浮层被客户端卸载。2026-11-16 已修（探测选页 + 读不到先唤起浮层），确认 daemon 已重启加载新代码，详见 [签到判据 §5](checkin-semantics.md#5-多窗口与浮层卸载2026-11-16-漏签复盘) |
+| daemon 好像没干活 | 先 `launchctl print gui/$(id -u)/com.local.buddy-web-checkin`（看 `state = running`），再 `tail ~/.local/share/buddy-web-checkin/daemon.log`；全终态时静默到 23:59 属正常 |
 | 签到「浮窗说已签、日历说尚未登场」 | 正常：浮层是乐观展示，判定只认 `checkin_dates`，见 [签到判据](checkin-semantics.md) |
 | 补签没做 | 看 `inspect` 的「可补漏签 / 补登卡」；卡为 0 就是当天补不了，等下次活动发卡 |
 | 抽奖没抽 | 券来自兑换连登奖励；`inspect` 看「抽奖券」，为 0 即今天没有 |

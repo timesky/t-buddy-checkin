@@ -11,6 +11,22 @@
 
 只记「行为/判据发生变化」和「踩过的坑」，不记纯重构。
 
+## 2026-11-16 · 修复多窗口下签到整天漏签
+
+- **事故**：11-16 00:00 账本正常翻页，但 `checkin` 从 00:00 到 10:58 每 10 分钟
+  重试一次、共 69 次全部 `checkinData not found (slot not mounted)`，整天没签到。
+  daemon 与 LaunchAgent 均正常，四项其它任务都 `done`。
+- **原因一**：客户端同时存在 4 个 `app.asar` page，只有挂浮层的那个 shadow DOM 里有
+  `#go`；`page_ws()` 取 `/json/list` 第一个 URL 匹配项，窗口顺序一变就选错页。
+- **原因二**：`claim()` 先读状态、读不到直接返回失败，`ensure_visible()` 排在后面，
+  浮层未挂载时形成「读不到 → 不唤起 → 继续读不到」的循环，重试不会自愈。
+- **修复**：`page_ws()` 逐个探测选含浮层的 renderer 并缓存；CDP 失败/未挂载时清缓存
+  重扫；回退页优先主窗口（跳过表格窗口）；`claim()` 读不到时先重新选页 +
+  `ensure_visible()` 唤起浮层再读一次，仍失败才记 `pending`；失败证据新增 `reopen`
+  字段区分 `reopened` / `reopen_failed` / `not_needed`。
+- 单测 167 项全绿（新增 8 项覆盖选页、缓存失效、回退优先级、恢复顺序）。
+- 当天 11:03 已用 `checkin-now` 补签：`credit=100`、`streak=38`、判据 `date_in_dates`。
+
 ## 2026-11-15 · 兼容性前置（版本成一等公民）
 
 - 新增 [`compat.py`](../src/buddy_checkin/compat.py)：集中放版本红线（≥ 5.11.0，实测基线

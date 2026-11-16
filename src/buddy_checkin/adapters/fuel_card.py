@@ -64,6 +64,8 @@ class FuelCard:
         self.node_bin = self._resolve_node()
         self.cdp_js = ROOT / "tools" / "cdp_client.mjs"
         self.block: tuple[str, str] | None = None
+        # 选中过的主 renderer ws；避免每次 _eval 都重扫全部候选页
+        self._ws: str | None = None
 
     # ---- 基础设施 -----------------------------------------------------------
     @staticmethod
@@ -96,20 +98,68 @@ class FuelCard:
         with urllib.request.urlopen(url, timeout=3) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
 
+    def reset_page(self) -> None:
+        """丢弃已选中的 renderer，下次 _eval 重新扫全部候选页。"""
+        self._ws = None
+
+    def _probe_page(self, ws: str) -> bool:
+        """这个 renderer 里是否挂着签到浮层（shadow DOM 内有 #go）。"""
+        if not ws or not self.node_bin or not self.cdp_js.exists():
+            return False
+        js = (
+            "(() => { for (const h of document.querySelectorAll('*')) {"
+            "  if (h.shadowRoot && h.shadowRoot.getElementById('go')) return '1'; }"
+            "  return '0'; })()"
+        )
+        try:
+            proc = subprocess.run(
+                [self.node_bin, str(self.cdp_js), ws, js, "4000"],
+                capture_output=True, text=True, timeout=6,
+            )
+            payload = json.loads((proc.stdout or "").strip() or "{}")
+            return payload.get("ok") and str(payload.get("value")) in ("1", "'1'", '"1"')
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return False
+
     def page_ws(self) -> str | None:
-        """主 renderer 的 ws（浮层在它里面，不是 iframe target）。"""
+        """挑出真正挂着签到浮层的主 renderer ws，而不是第一个 URL 匹配的页面。
+
+        2026-11-16 实测：客户端会同时开多个 app.asar 页面（主窗口、表格编辑器、
+        第二个 WorkBuddy 窗口），只有其中一个有浮层。旧实现取 /json/list 里第一个
+        匹配项，窗口顺序一变就连到没有浮层的页面，于是整夜报
+        `checkinData not found (slot not mounted)`，签到漏了一整天。
+        """
         try:
             data = self._http("/json/list")
         except Exception as exc:  # noqa: BLE001
             self.block = ("cdp_unavailable", f"CDP {self.port} unreachable: {exc}")
             return None
-        for t in data if isinstance(data, list) else []:
-            if t.get("type") != "page":
-                continue
-            url = (t.get("url") or "").lower()
-            if "app.asar" in url or "workbuddy" in url:
-                return t.get("webSocketDebuggerUrl")
-        return None
+        pages = [
+            t for t in (data if isinstance(data, list) else [])
+            if t.get("type") == "page"
+            and ("app.asar" in (t.get("url") or "").lower()
+                 or "workbuddy" in (t.get("url") or "").lower())
+            and t.get("webSocketDebuggerUrl")
+        ]
+        if not pages:
+            return None
+        candidates = [t["webSocketDebuggerUrl"] for t in pages]
+        if self._ws in candidates:
+            return self._ws
+        for t in pages:
+            ws = t["webSocketDebuggerUrl"]
+            if self._probe_page(ws):
+                self._ws = ws
+                return ws
+        # 浮层被客户端卸载时，回退页必须是主窗口：从用户菜单重新唤起浮层要
+        # 点在主 renderer 上，误落到表格编辑器之类的窗口会一直唤不起来。
+        for t in pages:
+            title = (t.get("title") or "").lower()
+            if "workbuddy" in title and "xlsx" not in title:
+                self._ws = t["webSocketDebuggerUrl"]
+                return self._ws
+        self._ws = candidates[0]
+        return self._ws
 
     def _eval(self, js: str, timeout: int = 20) -> tuple[bool, Any]:
         ws = self.page_ws()
@@ -123,15 +173,19 @@ class FuelCard:
                 capture_output=True, text=True, timeout=timeout + 5,
             )
         except subprocess.TimeoutExpired:
+            self.reset_page()
             return False, "cdp eval timeout"
         raw = (proc.stdout or "").strip()
         if not raw:
+            self.reset_page()
             return False, (proc.stderr or "empty output")[:300]
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
+            self.reset_page()
             return False, raw[:300]
         if not payload.get("ok"):
+            self.reset_page()
             return False, str(payload.get("error"))[:300]
         val = payload.get("value")
         if isinstance(val, str):
@@ -409,11 +463,25 @@ class FuelCard:
     def claim(self, wait_sec: float = 25.0) -> ActionResult:
         """点浮层「立即领取」完成今日签到，用服务端元数据确认。"""
         st = self.status(refresh=True)
+        reopen = "not_needed"
         if not st.get("ok"):
-            return ActionResult(
-                False, "checkin",
-                f"cannot read checkin status: {st.get('reason') or st.get('refresh_error')}",
-                {"confirmed": False, "source": "fuel-card"})
+            # 2026-11-16 实测教训：浮层被客户端卸载（或选到了没有浮层的窗口）时，
+            # 旧实现在这里直接返回失败，永远走不到下面的 ensure_visible()，
+            # 于是从 00:00 起每 10 分钟重试 69 次、整天漏签。必须先重新选页 +
+            # 重新唤起浮层，再读一次状态；读不到仍不下终态。
+            reason = str(st.get("reason") or st.get("refresh_error") or "")
+            if "slot not mounted" in reason and not st.get("host"):
+                self.reset_page()
+                visible, why_vis = self.ensure_visible()
+                reopen = "reopened" if visible else f"reopen_failed:{why_vis}"
+                if visible:
+                    time.sleep(0.8)
+                    st = self.status(refresh=True)
+            if not st.get("ok"):
+                return ActionResult(
+                    False, "checkin",
+                    f"cannot read checkin status: {st.get('reason') or st.get('refresh_error')}",
+                    {"confirmed": False, "source": "fuel-card", "reopen": reopen})
         done, why = self.judge_checked_today(st)
         if done:
             return self._already(st, why)

@@ -102,5 +102,41 @@
   误判只会让任务反复 `pending`，不会漏签。
 - 补登卡余额来自页面 `cardBalance`，不本地记账（避免与活动规则不同步）。
 
+## 5. 多窗口与浮层卸载（2026-11-16 漏签复盘）
+
+**现象**：daemon 从 00:00 到 10:58 每 10 分钟重试一次，共 69 次全部报
+`checkinData not found (slot not mounted)`，整天没签到；而人工跑 `inspect` 却能读到
+服务端状态。常驻进程本身一直在跑，登录项也是 `running`。
+
+**两个叠加的原因**：
+
+1. **选错 renderer**。客户端会同时开多个 `app.asar` 页面（主窗口、表格编辑器、
+   第二个 WorkBuddy 窗口），只有挂了浮层的那个 shadow DOM 里有 `#go`。旧的
+   `page_ws()` 取 `/json/list` 里第一个 URL 匹配项，窗口顺序一变就连到没有浮层的
+   页面，`checkinData` 自然读不到。
+2. **唤起顺序反了**。`claim()` 先读状态，读不到就立刻返回失败，而
+   `ensure_visible()` 排在后面 —— 浮层一旦没挂载，就陷入「读不到 → 不唤起 →
+   继续读不到」的循环，重试 69 次也不会自愈。
+
+**修复**（`adapters/fuel_card.py`）：
+
+- `page_ws()` 逐个探测候选页，选中真正含 `#go` 的 renderer 并缓存；CDP 层失败或
+  状态报 `slot not mounted` 时清缓存重新扫描。
+- 所有页面都没有浮层时，回退页优先取标题为 `WorkBuddy` 的主窗口（跳过表格窗口），
+  因为从用户菜单重新唤起浮层必须点在主 renderer 上。
+- `claim()` 读不到状态且 `host=false` 时，先重新选页 + `ensure_visible()` 唤起浮层，
+  再读一次状态；仍读不到才记 `pending`。失败证据里带 `reopen` 字段区分
+  `reopened` / `reopen_failed` / `not_needed`，便于从日志定位。
+
+**自检**（只读，不改任何状态）：
+
+```bash
+./run.sh inspect                       # 看「今日是否在 checkin_dates」
+PYTHONPATH=src python3 -c "
+from buddy_checkin.adapters.fuel_card import FuelCard
+fc = FuelCard({'growth': {'cdp_port': 9222}})
+print(fc.page_ws(), fc.status(refresh=False))"
+```
+
 实现见 [`adapters/fuel_card.py`](../src/buddy_checkin/adapters/fuel_card.py)（浮层签到）与
 [`adapters/growth_browser.py`](../src/buddy_checkin/adapters/growth_browser.py)（日历扫描与补签）。
