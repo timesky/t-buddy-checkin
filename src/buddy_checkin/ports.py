@@ -26,6 +26,7 @@ import re
 import socket
 import subprocess
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -178,23 +179,47 @@ def http_json(port: int, path: str, timeout: float = 0.5) -> Any:
 
 
 def probe(port: int, timeout: float = 0.5) -> dict:
-    """端口归类：owned（WorkBuddy CDP）/ foreign（别人）/ closed（没人听）。"""
+    """端口归类：owned（WorkBuddy CDP）/ foreign（别人）/ closed（没人听）。
+
+    三态判定看的是「有没有 HTTP 应答、应答是什么」：
+    - 连不上 / 超时                    → closed
+    - 有应答但 /json/version 非 200    → http_error（服务在，但不是 DevTools）
+    - 有 200 应答：UA 明确 → owned/foreign；无 UA → unknown（lsof 定归属）
+    """
     port = int(port)
     try:
-        ver = http_json(port, "/json/version", timeout)
-    except Exception as exc:  # noqa: BLE001 - 任何失败都等价于不可用
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{int(port)}/json/version", timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        # 有 HTTP 应答但不是 CDP 端点。
+        # 2026-11-18 本机实测：客户端内部服务监听的端口（18488）对
+        # /json/version 回 404，之前落进泛化 except 记为 closed，
+        # owner_state 再用 lsof 兜底误判成「WorkBuddy 的 CDP」，
+        # daemon 整轮任务全打 404。HTTP 有响应 ≠ DevTools 端口。
+        return {
+            "port": port, "state": "http_error", "ua": "", "browser": "",
+            "detail": f"HTTP {exc.code} (not a CDP endpoint)",
+        }
+    except Exception as exc:  # noqa: BLE001 - 连不上/超时等价于不可用
         return {
             "port": port, "state": "closed", "ua": "", "browser": "",
             "detail": f"{type(exc).__name__}: {exc}"[:140],
         }
-    data = ver if isinstance(ver, dict) else {}
+    data = {}
+    try:
+        parsed = json.loads(raw) if raw.strip() else {}
+        if isinstance(parsed, dict):
+            data = parsed
+    except ValueError:
+        data = {}
     ua = str(data.get("User-Agent") or "")
     browser = str(data.get("Browser") or "")
     if "workbuddy" in ua.lower():
         state = "owned"
         detail = ua[:80]
     elif not ua:
-        # 拿到响应但没有 UA：交给 lsof 的可执行路径定归属，不在这里下结论
+        # 有 200 应答但没有 UA：交给 lsof 的可执行路径定归属，不在这里下结论
         state = "unknown"
         detail = "no user-agent"
     else:
@@ -244,18 +269,23 @@ def listener(port: int) -> dict | None:
 def owner_state(port: int, prb: dict | None = None) -> tuple[str, str]:
     """综合 /json/version 与 lsof 给最终归属。
 
-    返回 (owned|foreign|closed, 说明)。UA 明确时以 UA 为准；UA 缺失时用
-    lsof 的可执行路径兜底（这正是「进程叫 Electron」误判的解法）。
+    返回 (owned|foreign|closed, 说明)。UA 明确时以 UA 为准；只有「拿到了
+    HTTP 响应但缺 UA」（state=unknown）才用 lsof 的可执行路径兜底（这正是
+    「进程叫 Electron」误判的解法）。有应答但明确不是 CDP（http_error，
+    2026-11-18 本机 18488 内部服务实测）即使 exe 属于 WorkBuddy 也绝不能
+    算 CDP——客户端很多内部端口都是它自己的进程在听。
     """
     prb = prb or probe(port)
     if prb["state"] == "owned":
         return "owned", prb["detail"]
     if prb["state"] == "foreign":
         return "foreign", prb["detail"]
+    if prb["state"] == "http_error":
+        return "foreign", prb["detail"]
     info = listener(port)
     if not info:
         return "closed", prb["detail"] or "no listener"
-    if info["owned"]:
+    if info["owned"] and prb["state"] == "unknown":
         return "owned", f"lsof exe={info['exe']} pid={info['pid']}"
     return "foreign", f"{info['cmd']} pid={info['pid']} exe={info['exe'] or '?'}"
 

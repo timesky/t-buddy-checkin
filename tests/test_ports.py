@@ -27,9 +27,10 @@ from buddy_checkin import launchd, ports  # noqa: E402
 
 
 class _FakeCDP(BaseHTTPRequestHandler):
-    """极简 /json/version，用来区分 owned / foreign。"""
+    """极简 /json/version，用来区分 owned / foreign / http_error。"""
 
     ua = "WorkBuddy/5.11.3 Chrome/140"
+    status = 200
 
     def do_GET(self):  # noqa: N802
         if self.path == "/json/list":
@@ -41,7 +42,7 @@ class _FakeCDP(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        self.send_response(200)
+        self.send_response(self.status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -51,8 +52,8 @@ class _FakeCDP(BaseHTTPRequestHandler):
         pass
 
 
-def _serve(ua: str) -> tuple[HTTPServer, int]:
-    handler = type("H", (_FakeCDP,), {"ua": ua})
+def _serve(ua: str, status: int = 200) -> tuple[HTTPServer, int]:
+    handler = type("H", (_FakeCDP,), {"ua": ua, "status": status})
     srv = HTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, srv.server_address[1]
@@ -100,6 +101,31 @@ class ProbeTests(unittest.TestCase):
                 fake["exe"] = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
                 fake["owned"] = False
                 self.assertEqual(ports.owner_state(port)[0], "foreign")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_http_404_is_never_owned_even_by_workbuddy(self):
+        """2026-11-18 本机事故：客户端内部端口对 /json/version 回 404，
+        lsof 兜底把它误判成 CDP，daemon 整轮打 404。非 200 绝不算 owned。"""
+        srv, port = _serve("", status=404)
+        fake = {"port": port, "pid": 1, "cmd": "Electron",
+                "exe": "/Applications/WorkBuddy.app/Contents/MacOS/Electron",
+                "owned": True}
+        try:
+            with patch.object(ports, "listener", return_value=fake):
+                prb = ports.probe(port)
+                self.assertEqual(prb["state"], "http_error")
+                self.assertEqual(ports.owner_state(port, prb)[0], "foreign")
+                # 候选链也不能被它命中。隔离真实环境：cache 清空、config/区间
+                # 换到无关端口（本机 9222 可能有活的 CDP，会污染断言）
+                with patch.object(ports, "read_active_port", lambda: {"port": port}), \
+                     patch.object(ports, "env_port", lambda: None), \
+                     patch.object(ports, "read_cache", lambda cfg=None: {}), \
+                     patch.object(ports, "port_range", lambda cfg=None: [19990, 19999]), \
+                     patch.object(ports, "client_pids", lambda: []):
+                    res = ports.resolve({"growth": {"cdp_port": 19999}})
+                self.assertFalse(res.ok)
         finally:
             srv.shutdown()
             srv.server_close()
