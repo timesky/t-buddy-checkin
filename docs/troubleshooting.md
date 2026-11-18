@@ -44,6 +44,7 @@ tail -30 ~/.local/share/buddy-web-checkin/daemon.log   # ④ 常驻进程日志
 | 重启电脑后端口没了 | 没装 `com.local.workbuddy-cdp-env` 登录项 → `./run.sh install-launchd` |
 | `Bootstrap failed: 5: Input/output error` | 同 label 已加载 / 被 disabled / 无权限 → 先 `bootout` 再 `bootstrap`，详见 [ports.md](ports.md#常见错误) |
 | 账本显示全 `done` 但今天明明没做 | 重启进程即可：启动会用真实状态复核，写错的 `done` 会被改回 `pending` 并补做 |
+| 所有任务报 `CDP 18488 unreachable: HTTP Error 404` | 端口探到了客户端**内部服务**端口（不是 CDP）。旧版归属判定会用「exe 属于 WorkBuddy」误判；且若曾在此状态下跑过 `negotiate --apply`，18488 已写进登录项/env/config。升级后 `grep setenv ~/Library/LaunchAgents/com.local.workbuddy-cdp-env.plist` 核对写的是不是真 CDP 端口，详见 [ports.md](ports.md#端口归属怎么判) |
 
 ## 跨机器排查
 
