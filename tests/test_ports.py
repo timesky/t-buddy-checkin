@@ -202,6 +202,51 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(res.source, "none")
         self.assertEqual(res.port, 9223)  # 下次启动最可能用的那个
 
+    def test_process_ports_found_via_lsof(self):
+        """进程级发现：WorkBuddy 进程在听的端口要进候选（2026-11-18 需求）。"""
+        fake_lsof = (
+            "COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME\n"
+            "Electron 87312  hy   40u  IPv4  0xdead  0t0  TCP 127.0.0.1:9317 (LISTEN)\n"
+            "Electron 87312  hy   41u  IPv6  0xdead  0t0  TCP [::1]:9317 (LISTEN)\n"
+        )
+        with patch.object(ports, "client_pids", lambda: [87312]), \
+             patch.object(ports, "_lsof", lambda args, timeout=4.0: fake_lsof):
+            found = ports.process_ports()
+        self.assertEqual(found, [9317], "同一端口的 IPv4/IPv6 只算一次")
+
+    def test_process_port_wins_over_stale_cache_and_config(self):
+        """客户端换到区间外的端口时，靠进程发现找到它，不后退到旧端口。"""
+        def fake_probe(port, timeout=0.5):
+            return {"port": port, "state": "owned" if port == 9317 else "closed",
+                    "ua": "WorkBuddy" if port == 9317 else "", "browser": "", "detail": ""}
+
+        def fake_owner(port, prb=None):
+            return ("owned" if port == 9317 else "closed",
+                    "ok" if port == 9317 else "no listener")
+
+        ports.write_cache(_cfg(), 9222, "cache")  # 旧缓存指向已死的端口
+        with patch.object(ports, "read_active_port", lambda: None), \
+             patch.object(ports, "env_port", lambda: None), \
+             patch.object(ports, "client_pids", lambda: [87312]), \
+             patch.object(ports, "_lsof",
+                          lambda args, timeout=4.0: "Electron 1 40u TCP 127.0.0.1:9317 (LISTEN)"), \
+             patch.object(ports, "probe", fake_probe), \
+             patch.object(ports, "owner_state", fake_owner), \
+             patch.object(ports, "listener", lambda p: None):
+            res = ports.resolve(_cfg())
+        self.assertTrue(res.ok)
+        self.assertEqual((res.port, res.source), (9317, "process"))
+        self.assertEqual(json.loads(self.cache.read_text())["port"], 9317,
+                         "进程发现命中的端口要写回缓存")
+
+    def test_candidates_order_process_before_cache(self):
+        """优先级：active_file → env → process → cache → config。"""
+        with patch.object(ports, "read_cache", lambda cfg=None: {"port": 9000}):
+            out = ports._candidates(None, {"port": 9001}, 9002, [9003])
+        self.assertEqual([(p, s) for p, s in out],
+                         [(9001, "active_file"), (9002, "env"), (9003, "process"),
+                          (9000, "cache"), (9222, "config")])
+
 
 class NegotiateTests(unittest.TestCase):
     def setUp(self):

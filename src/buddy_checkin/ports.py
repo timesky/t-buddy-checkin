@@ -329,6 +329,35 @@ class Resolution:
                 "detail": self.detail, "facts": self.facts}
 
 
+def process_ports() -> list[int]:
+    """直接问客户端进程：它现在在监听哪些 TCP 端口（进程级兜底发现）。
+
+    2026-11-18 需求：常驻任务找不到端口时，最可靠的来源是「WorkBuddy 进程
+    自己在听哪」——active_file 有滞后（客户端异常退出前写死）、区间扫描
+    只在配置区间内找，端口落在区间外或文件缺失时这两条路都会漏。
+    这里只负责把候选收窄到「进程确实在听」，每个候选仍要过 probe /
+    owner_state 校验，不在这里下归属结论。
+    """
+    pids = client_pids()
+    if not pids:
+        return []
+    out = _lsof(["-nP", "-a", "-p", ",".join(str(p) for p in pids),
+                 "-iTCP", "-sTCP:LISTEN"])
+    found: list[int] = []
+    seen: set[int] = set()
+    for line in out.splitlines():
+        if "TCP" not in line or "(LISTEN)" not in line:
+            continue
+        m = re.search(r"(?:127\.0\.0\.1|\[::1\]|\*):(\d+)", line)
+        if not m:
+            continue
+        port = int(m.group(1))
+        if port not in seen:
+            seen.add(port)
+            found.append(port)
+    return found
+
+
 def config_port(cfg: dict | None) -> int:
     raw = ((cfg or {}).get("growth") or {}).get("cdp_port", DEFAULT_PORT)
     try:
@@ -337,13 +366,22 @@ def config_port(cfg: dict | None) -> int:
         return DEFAULT_PORT
 
 
-def _candidates(cfg: dict | None, active: dict | None, env: int | None) -> list[tuple[int, str]]:
-    """优先级：自报文件 → 环境变量 → 缓存 → 配置 → 区间扫描。"""
+def _candidates(cfg: dict | None, active: dict | None, env: int | None,
+                process: list[int] | None = None) -> list[tuple[int, str]]:
+    """优先级：自报文件 → 环境变量 → 进程监听 → 缓存 → 配置。
+
+    进程监听排在缓存/配置之前：客户端重启换端口后，缓存和配置都可能指向
+    旧端口（旧客户端实例可能还占着）；「进程现在在听」才是运行中的事实。
+    每个候选最终都要过 probe/owner_state 校验，顺序只影响多个 owned 命中
+    时选哪个（例如新旧两个客户端实例同时存在）。
+    """
     out: list[tuple[int, str]] = []
     if active and active.get("port"):
         out.append((int(active["port"]), "active_file"))
     if env:
         out.append((int(env), "env"))
+    for port in (process or []):
+        out.append((int(port), "process"))
     cached = read_cache(cfg).get("port")
     if isinstance(cached, int):
         out.append((cached, "cache"))
@@ -366,8 +404,9 @@ def resolve(cfg: dict | None = None, timeout: float = 0.5) -> Resolution:
     """
     active = read_active_port()
     env = env_port()
+    process = process_ports()
     tried: dict[str, str] = {}
-    for port, src in _candidates(cfg, active, env):
+    for port, src in _candidates(cfg, active, env, process):
         prb = probe(port, timeout=timeout)
         state, detail = owner_state(port, prb)
         tried[f"{port}:{src}"] = f"{state} ({detail})"
@@ -375,10 +414,11 @@ def resolve(cfg: dict | None = None, timeout: float = 0.5) -> Resolution:
             write_cache(cfg, port, src)
             return Resolution(
                 port=port, ok=True, source=src, detail=detail,
-                facts={"active_file": active, "env": env, "tried": tried},
+                facts={"active_file": active, "env": env,
+                       "process": process, "tried": tried},
             )
     # 区间扫描：配置和环境都没命中时，兜底找「WorkBuddy 自己开着但我们不知道」的端口
-    known = {p for p, _ in _candidates(cfg, active, env)}
+    known = {p for p, _ in _candidates(cfg, active, env, process)}
     for port in port_range(cfg):
         if port in known:
             continue
@@ -397,8 +437,8 @@ def resolve(cfg: dict | None = None, timeout: float = 0.5) -> Resolution:
     return Resolution(
         port=preferred, ok=False, source="none",
         detail="未发现 WorkBuddy 的 CDP 端口（客户端未开调试端口或已退出）",
-        facts={"active_file": active, "env": env, "tried": tried,
-               "client_pids": client_pids()},
+        facts={"active_file": active, "env": env, "process": process,
+               "tried": tried, "client_pids": client_pids()},
     )
 
 

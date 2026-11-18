@@ -31,7 +31,11 @@
   `reset_all` 显式传调度器时钟的日期，避免依赖真实系统时间。
 - **顺带**：`test_unmounted_slot_is_reopened_before_giving_up` 的假数据
   硬编码 11-15/11-16 日期，两天后自然失效——改为按真实今天/昨天构造。
-- 单测 170 项全绿（新增跨天翻页守卫 1 项）。
+- **端口发现补强（同日）**：`ports.process_ports()` 直接问客户端进程在监听
+  哪些 TCP 端口（lsof 按 pid 过滤），作为候选源插入 `active_file → env →
+  process → cache → config`；端口落在配置区间外或 active_file 缺失时，
+  这是唯一可靠的兜底。候选仍要过 probe/owner_state 校验，不盲信。
+- 单测 173 项全绿（新增跨天翻页守卫 1 项、进程端口发现 3 项）。
 
 ## 2026-11-16 · 修复多窗口下签到整天漏签
 
