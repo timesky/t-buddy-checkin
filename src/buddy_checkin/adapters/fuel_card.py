@@ -32,6 +32,7 @@ React fiber 上 `AvatarTopComboSlot` 的 `checkinData` —— 那是宿主从
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import time
 from datetime import date
@@ -39,6 +40,8 @@ from pathlib import Path
 from typing import Any
 
 from .base import ActionResult
+
+logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -121,6 +124,30 @@ class FuelCard:
         except (OSError, subprocess.SubprocessError, ValueError):
             return False
 
+    def _heal(self) -> bool:
+        """端口对不上（客户端重启换了端口）时按真实状态重探一次。
+
+        2026-11-18 另一台机器实测：daemon 长驻，构造时取的 config_port 会过期
+        （客户端重启后换到 9223，daemon 仍打 9222），签到任务整夜报
+        `CDP 9222 unreachable`。growth_browser 每轮 ensure_page() 都会重解析，
+        fuel_card 也必须具备同样的自愈能力，否则端口一变签到先挂。
+        这里只换端口，不启动/重启客户端（那会打断用户正在用的会话）。
+        """
+        from .. import ports
+
+        try:
+            res = ports.resolve(self.cfg, timeout=0.4)
+        except Exception:  # noqa: BLE001 - 自愈失败按原错误上报
+            return False
+        if not res.ok or res.port == self.port:
+            return False
+        old = self.port
+        self.port = res.port
+        self._ws = None  # 旧端口的 renderer 缓存全部失效
+        self.block = None
+        logger.info("cdp: 端口自愈 %s → %s（%s）", old, res.port, res.source)
+        return True
+
     def page_ws(self) -> str | None:
         """挑出真正挂着签到浮层的主 renderer ws，而不是第一个 URL 匹配的页面。
 
@@ -129,11 +156,17 @@ class FuelCard:
         匹配项，窗口顺序一变就连到没有浮层的页面，于是整夜报
         `checkinData not found (slot not mounted)`，签到漏了一整天。
         """
-        try:
-            data = self._http("/json/list")
-        except Exception as exc:  # noqa: BLE001
-            self.block = ("cdp_unavailable", f"CDP {self.port} unreachable: {exc}")
-            return None
+        healed = False
+        while True:
+            try:
+                data = self._http("/json/list")
+            except Exception as exc:  # noqa: BLE001
+                if not healed and self._heal():
+                    healed = True
+                    continue
+                self.block = ("cdp_unavailable", f"CDP {self.port} unreachable: {exc}")
+                return None
+            break
         pages = [
             t for t in (data if isinstance(data, list) else [])
             if t.get("type") == "page"

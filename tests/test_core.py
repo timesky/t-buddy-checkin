@@ -449,9 +449,42 @@ class SchedulerTests(unittest.TestCase):
             self.actions.states[name] = "done"
         self.actions.states["travel"] = "pending"
         self.actions.travel_due_at = self.fixed_now + 600
-        executed = self.scheduler.run_forever(max_iterations=6)
+        # 账本日期必须与假时钟一致，否则跨天翻页守卫会立刻触发全量复核
+        progress = Progress(self.progress_path, day="2026-11-10")
+        executed = self._sched(progress).run_forever(max_iterations=6)
         self.assertEqual(executed, 6)
         self.assertEqual(self.actions.calls.count("travel"), 2)
+
+    def test_day_rolls_over_even_when_task_pending_overnight(self):
+        """跨天翻页守卫（2026-11-18 另一台机器实际事故）。
+
+        checkin 因端口失效整夜 pending → heap 永不为空 → 走不到
+        「全终态静默 → 午夜 reset」的翻页路径 → 账本日期停在昨天，
+        新的一天 makeup/exchange/lottery/travel 挂着昨天的 done 全天不跑。
+        日期一变必须立刻强制翻页并全量复核。
+        """
+        clock = {"t": datetime(2026, 11, 9, 23, 50, 0, tzinfo=CN_TZ).timestamp()}
+        progress = Progress(self.progress_path, day="2026-11-09")
+        # 昨天的账本：四个任务 done（旧值），checkin 整夜 pending
+        for name in ("makeup", "exchange", "lottery", "travel"):
+            progress.mark(name, "done", "昨天的旧值")
+        self.actions.states["checkin"] = "pending"
+        self.actions.states["makeup"] = "done"
+        self.actions.states["exchange"] = "done"
+        self.actions.states["lottery"] = "done"
+        self.actions.states["travel"] = "done"
+        sched = Scheduler(
+            self.cfg, self.state, self.actions, progress,
+            now=lambda: clock["t"],
+            # sleep 即真实时间流逝：让退避等待把时钟推过午夜
+            sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+        )
+        sched.run_forever(max_iterations=15)
+        self.assertEqual(progress.day, "2026-11-10", "账本必须翻到新的一天")
+        # startup verify 之后跨天触发 rollover verify，五个任务全部重跑
+        self.assertEqual(self.actions.calls.count("exchange"), 2)
+        self.assertEqual(self.actions.calls.count("travel"), 2)
+        self.assertEqual(self.actions.calls.count("makeup"), 2)
 
 
 class ProgressTests(unittest.TestCase):

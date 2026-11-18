@@ -215,18 +215,26 @@ class FuelClaimTests(unittest.TestCase):
         self.assertNotIn("dot", js)
 
     def test_unmounted_slot_is_reopened_before_giving_up(self):
-        """2026-11-16 漏签复现：读不到状态时必须先重新选页+唤起浮层再读一次。"""
+        """2026-11-16 漏签复现：读不到状态时必须先重新选页+唤起浮层再读一次。
+
+        日期一律取真实今天/昨天（2026-11-18 教训：硬编码 11-15/11-16 的用例
+        过了两天就自然失效，判定路径完全没变却开始报错）。
+        """
+        from datetime import date, timedelta
+
+        today = FuelCard.today_iso()
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
         seq = [
             {"ok": False, "reason": "checkinData not found (slot not mounted)",
              "host": False, "today_checked_in": None},
             {"ok": True, "today_checked_in": False, "today_credit": 0,
-             "checkin_dates": ["2026-11-15"]},
+             "checkin_dates": [yesterday]},
             {"ok": True, "today_checked_in": True, "today_credit": 100,
-             "streak_days": 38, "checkin_dates": ["2026-11-16"]},
+             "streak_days": 38, "checkin_dates": [yesterday, today]},
         ]
 
         seq_last = {"ok": True, "today_checked_in": True, "today_credit": 100,
-                    "checkin_dates": ["2026-11-16"]}
+                    "streak_days": 38, "checkin_dates": [yesterday, today]}
 
         def fake_status(refresh=True):
             return seq.pop(0) if seq else seq_last

@@ -236,6 +236,22 @@ class Scheduler:
                 continue
 
             job = heapq.heappop(heap)
+            # 跨天翻页：正常翻页走上面「全部终态→静默→午夜醒来 reset」的路径，
+            # 但只要有任务整夜 pending（heap 永不为空），那条路就永远走不到。
+            # 2026-11-18 另一台机器实测：checkin 因旧端口整夜失败 → 账本停在
+            # 昨天 → 新的一天 makeup/exchange/lottery/travel 仍挂着昨天的 done，
+            # 全天无人执行。所以日期一变必须在这里强制翻页并全量复核。
+            if day_key(self.now()) != self.progress.day:
+                self.progress.reset_all(day_key(self.now()))
+                self.state.kv_set("silent_until", None)
+                logger.info("day rolled over to %s with pending jobs: "
+                            "ledger reset, running full verify", self.progress.day)
+                states = self.verify_pass()
+                logger.info("rollover verify: %s", states)
+                executed += len(TASK_ORDER)
+                heap = self._pending_jobs()
+                heapq.heapify(heap)
+                continue
             wait = job.due_at - self.now()
             if wait > 0:
                 if not self._wait(wait, stop):
