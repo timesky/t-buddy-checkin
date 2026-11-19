@@ -28,6 +28,39 @@ def _cfg(**growth) -> dict:
     return {"growth": g}
 
 
+class IframeMatchTests(unittest.TestCase):
+    """_iframe_ws 只认 growth-center 路径（2026-11-19 文档页误认事故）。"""
+
+    def _gb(self):
+        p = patch("buddy_checkin.adapters.growth_browser.time.sleep", lambda s: None)
+        p.start()
+        self.addCleanup(p.stop)
+        gb = GrowthBrowser({"growth": {"open_labels": ["成长计划"]}})
+        return gb
+
+    def test_doc_page_iframe_is_never_mistaken_for_growth_center(self):
+        gb = self._gb()
+        gb.targets = lambda: [
+            {"type": "page", "url": "file:///Applications/WorkBuddy.app/...",
+             "webSocketDebuggerUrl": "ws://main"},
+            # 用户打开的文档页：workbuddy.cn 域但不是成长中心
+            {"type": "iframe", "url": "https://www.workbuddy.cn/space/d/VHGbO0BDbHY19ANxFkgwNA",
+             "webSocketDebuggerUrl": "ws://doc"},
+        ]
+        self.assertIsNone(gb._iframe_ws(),
+                          "文档页 iframe 绝不能被当成成长中心")
+
+    def test_growth_center_wins_over_doc_page(self):
+        gb = self._gb()
+        gb.targets = lambda: [
+            {"type": "iframe", "url": "https://www.workbuddy.cn/space/d/xxx",
+             "webSocketDebuggerUrl": "ws://doc"},
+            {"type": "iframe", "url": "https://www.workbuddy.cn/profile/growth-center?x=1",
+             "webSocketDebuggerUrl": "ws://growth"},
+        ]
+        self.assertEqual(gb._iframe_ws(), "ws://growth")
+
+
 class _Base(unittest.TestCase):
     def setUp(self):
         p = patch("buddy_checkin.adapters.growth_browser.time.sleep", lambda s: None)

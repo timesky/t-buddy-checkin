@@ -281,11 +281,20 @@ class GrowthBrowser:
         return bool(self.targets())
 
     def _iframe_ws(self) -> str | None:
+        """认成长中心 iframe，只认 URL 里的 growth-center 路径。
+
+        2026-11-19 事故：旧条件 `or "workbuddy.cn" in url` 把用户打开的
+        文档页 iframe（workbuddy.cn/space/d/...）误认成成长中心——主窗口
+        里挂着的任何 workbuddy.cn 页面都会中招，read_state 在文档页 DOM
+        里执行，全任务报 state=unknown。成长中心地址固定是
+        https://www.workbuddy.cn/profile/growth-center，按路径匹配即可；
+        匹配不到时 ensure_page() 会走重开入口的正常路径。
+        """
         for t in self.targets():
             if t.get("type") != "iframe":
                 continue
             url = t.get("url") or ""
-            if "growth-center" in url or "workbuddy.cn" in url:
+            if "growth-center" in url:
                 return t.get("webSocketDebuggerUrl")
         return None
 
