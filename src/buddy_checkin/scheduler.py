@@ -63,6 +63,13 @@ class Scheduler:
         self.retry_backoff = list(
             sched.get("retry_backoff_sec") or [60, 120, 300, 600])
         self.silent_at = sched.get("silent_at", "23:59")
+        # 夜检：全终态后不再一觉睡到次日 0 点，22:00 唤醒做一次全量复核。
+        # 2026-11-20 教训：凌晨 0 点浮层反馈 claimed/100 积分，服务端却没落库，
+        # 直到次日 0 点 makeup 才发现——补签卡消耗了、连签也断了。夜检以
+        # 服务端 checkin_dates 为准当天重签，还能赶在当天内补救。
+        # 设为 "" 关闭。
+        self.evening_check_at = sched.get("evening_check_at", "22:00")
+        self._evening_done_day: str | None = None
         self.fallback = float(cfg["travel"].get("fallback_interval_sec", 3600))
         self._next_at: dict[str, float] = {}
 
@@ -213,17 +220,36 @@ class Scheduler:
                 break
 
             if not heap:
-                # 全部终态：静默到今天 23:59（实际睡到次日 0 点再翻页）
+                # 全部终态：若今晚夜检未做且还没到点，先睡到夜检时刻；
+                # 否则静默到次日 0 点翻页。
+                evening = (self._today_at(self.evening_check_at)
+                           if self.evening_check_at else None)
+                need_evening = (
+                    evening is not None and evening > self.now()
+                    and self._evening_done_day != day_key(self.now()))
+                if need_evening:
+                    wake = evening
+                else:
+                    wake = self._wake_deadline()
                 deadline = self._silence_deadline()
-                wake = self._wake_deadline()
                 self.progress.mark_silent(deadline)
                 logger.info(
-                    "all tasks terminal for %s; silent until %s, wake at %s",
+                    "all tasks terminal for %s; silent until %s, wake at %s%s",
                     day_key(self.now()),
                     datetime.fromtimestamp(deadline, CN_TZ).strftime("%H:%M:%S"),
-                    datetime.fromtimestamp(wake, CN_TZ).strftime("%m-%d %H:%M:%S"))
+                    datetime.fromtimestamp(wake, CN_TZ).strftime("%m-%d %H:%M:%S"),
+                    " (evening check)" if need_evening else "")
                 if not self._wait(wake - self.now(), stop):
                     break
+                if need_evening:
+                    # 夜检：不翻页，只按服务端真实状态全量复核一遍。
+                    self._evening_done_day = day_key(self.now())
+                    states = self.verify_pass()
+                    logger.info("evening check: %s", states)
+                    executed += len(TASK_ORDER)
+                    heap = self._pending_jobs()
+                    heapq.heapify(heap)
+                    continue
                 self.progress.reset_all()
                 self.state.kv_set("silent_until", None)
                 logger.info("new day %s: ledger rolled over, running full verify",

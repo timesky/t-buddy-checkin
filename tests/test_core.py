@@ -486,6 +486,73 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.actions.calls.count("travel"), 2)
         self.assertEqual(self.actions.calls.count("makeup"), 2)
 
+    def test_evening_check_runs_once_before_midnight(self):
+        """夜检守卫（2026-11-20 本机实际事故）。
+
+        00:00 的 checkin 浮层反馈 claimed/100 积分，服务端却没落库；旧逻辑
+        全终态后一觉睡到次日 0 点，当晚永远不会复核，次日 makeup 才补救
+        （补签卡消耗 + 连签断）。夜检 22:00 唤醒做一次全量复核。
+        """
+        clock = {"t": datetime(2026, 11, 9, 21, 0, 0, tzinfo=CN_TZ).timestamp()}
+        progress = Progress(self.progress_path, day="2026-11-09")
+        for name in ("checkin", "makeup", "exchange", "lottery", "travel"):
+            progress.mark(name, "done", "账本里全 done（含假成功）")
+        self.actions.states["travel"] = "done"  # FakeActions.travel 默认 pending
+        sched = Scheduler(
+            self.cfg, self.state, self.actions, progress,
+            now=lambda: clock["t"],
+            sleep=lambda s: (self.slept.append(s),
+                             clock.__setitem__("t", clock["t"] + s)),
+        )
+        sched.run_forever(max_iterations=15)
+        # 21:00 → 第一段 sleep 必须只睡到 22:00 夜检，而不是直接到午夜
+        self.assertEqual(self.slept[0], 3600, "全终态后应先睡到 22:00 夜检")
+        # startup(5) + evening(5) + midnight(5)：夜检恰好发生一次，不多不少
+        self.assertEqual(self.actions.calls.count("exchange"), 3)
+        self.assertEqual(self.actions.calls.count("checkin"), 3)
+        self.assertEqual(sched._evening_done_day, "2026-11-09")
+
+    def test_evening_check_catches_false_positive_and_retries(self):
+        """夜检抓假成功：账本 done、服务端实际没记上 → 当天重排重试。"""
+        clock = {"t": datetime(2026, 11, 9, 21, 0, 0, tzinfo=CN_TZ).timestamp()}
+        progress = Progress(self.progress_path, day="2026-11-09")
+        for name in ("checkin", "makeup", "exchange", "lottery", "travel"):
+            progress.mark(name, "done", "账本里全 done")
+
+        class FlakyCheckin(FakeActions):
+            # FakeActions.travel 默认 pending；夜检场景需要五个任务全终态
+            def travel_tick(self, force: bool = False):
+                self.calls.append("travel")
+                return ActionResult(True, "travel", "fake",
+                                    {"due_at": None, "state": "done"})
+
+            """startup 时 claimed（浮层假象），夜检时服务端没有今天的日期。"""
+
+            def __init__(self):
+                super().__init__()
+                self.checkin_runs = 0
+
+            def daily_checkin(self):
+                self.calls.append("checkin")
+                self.checkin_runs += 1
+                state = "done" if self.checkin_runs <= 1 else "pending"
+                return ActionResult(state == "done", "checkin", "fake",
+                                    {"confirmed": state == "done", "state": state})
+
+        actions = FlakyCheckin()
+        sched = Scheduler(
+            self.cfg, self.state, actions, progress,
+            now=lambda: clock["t"],
+            sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+        )
+        sched.run_forever(max_iterations=12)
+        # 夜检时 checkin 被抓成 pending 并反复重试（不是 1 次假成功躺平到午夜）
+        self.assertGreaterEqual(actions.calls.count("checkin"), 2)
+        self.assertEqual(progress.get("checkin").state, "pending")
+        self.assertGreater(clock["t"] - datetime(
+            2026, 11, 9, 21, 0, 0, tzinfo=CN_TZ).timestamp(), 3600,
+            "夜检之后应还有退避重试，说明没有静默躺平")
+
 
 class ProgressTests(unittest.TestCase):
     def setUp(self):
