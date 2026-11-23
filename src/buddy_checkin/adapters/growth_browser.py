@@ -428,6 +428,44 @@ class GrowthBrowser:
             time.sleep(0.6)
         return False
 
+    # 跨天新鲜度探测：is-today 格子渲染的日号 vs 客户端真实日号。
+    # 页面正常时两者相等；SPA 停在昨天的旧渲染时不等。
+    FRESHNESS_JS = r"""
+(() => {
+  const tc = [...document.querySelectorAll('.gs-cal-cell')]
+    .find(c => String(c.className).indexOf('is-today') >= 0);
+  if (!tc) return JSON.stringify({stale: null, today_text: null});
+  const text = String(tc.textContent || '').replace(/\s+/g, '').trim();
+  return JSON.stringify({stale: text !== String(new Date().getDate()),
+                         today_text: text});
+})()
+"""
+
+    def _refresh_if_stale(self, timeout: float = 30.0) -> bool:
+        """前端日历停在昨天（跨天不自动刷新）时重载 iframe 重取数据。
+
+        2026-11-23 两台机器实际事故：成长中心 SPA 跨天后不会自动重取数据。
+        旧渲染下 makeup 的 is-today→day 映射把今天格子顶掉，整日报
+        `missing_days=[昨天]` 永远 pending；travel 读到昨天遗留的
+        「明天再来」误判派遣次数用完，全天没派出、没领奖。
+        唯一可靠的解法：发现 is-today 日号与真实日期不一致就
+        location.reload() 重载 iframe（只重载 iframe，不动客户端主窗口）。
+        返回是否执行了重载并恢复新鲜。
+        """
+        ok, val = self._eval(self.FRESHNESS_JS, timeout=10)
+        if not ok or not isinstance(val, dict) or val.get("stale") is not True:
+            return False
+        # reload 会让本次 eval 连接随导航中断，结果无需关心；失败也不阻塞，
+        # 下轮任务自检会再走一遍这个函数。
+        self._eval("location.reload(); 'reloading'", timeout=5)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(1.0)
+            ok, val = self._eval(self.FRESHNESS_JS, timeout=10)
+            if ok and isinstance(val, dict) and val.get("stale") is not True:
+                return True
+        return False
+
     def _open_via_labels(self, labels: list[str]) -> ActionResult | None:
         """依次点入口文案打开成长中心；全部失败返回 None 并记下原因。"""
         fails: list[str] = []
@@ -490,6 +528,7 @@ class GrowthBrowser:
     def ensure_page(self) -> ActionResult:
         """确保成长中心 iframe 存在且已渲染；不存在就从客户端入口打开。"""
         if self._iframe_ws():
+            self._refresh_if_stale()
             ready = self._wait_page_ready()
             return ActionResult(True, "growth_open", "page already open",
                                 {"opened": False, "ready": ready})
@@ -759,10 +798,15 @@ class GrowthBrowser:
 
   const todayCell = cells.find(c => c.today) || null;
   const todoCount = cells.filter(c => c.cls.indexOf('is-todo') >= 0).length;
+  // 跨天不刷新探测：is-today 格子渲染的日号 ≠ 客户端真实日号 → SPA 还停在昨天。
+  // 2026-11-23 实测：成长中心 SPA 跨天后不自动重取数据，旧渲染让 makeup
+  // 整日报 missing_days=[昨天]、travel 读到昨天的「明天再来」。
+  const stale = todayCell ? todayCell.text !== String(dim) : null;
   return JSON.stringify({
     ok: true,
     month, today: todayStr, day_of_month: dim,
     cells,
+    stale,
     card_text: dm ? dm[0] : '',
     card_balance: dm ? parseInt(dm[1], 10) : (cardFromCell ? cardFromCell.balance : null),
     streak_days: sm ? parseInt(sm[1], 10) : null,
@@ -794,6 +838,16 @@ class GrowthBrowser:
                     "card_text": "", "streak_days": None, "today_checked": None,
                     "render_ok": False, "render_reason": "eval_failed"}
         info = val if isinstance(val, dict) else {}
+        if info.get("ok") and info.get("stale") is True:
+            # 前端跨天未刷新：重载 iframe 重取数据后再扫一次（只重试一轮）
+            self._refresh_if_stale()
+            ok, val = self._eval(self.CALENDAR_SCAN_JS)
+            if not ok:
+                return {"ok": False, "detail": str(val), "cells": [], "items": [],
+                        "past_unchecked": [], "clickable": [], "card_balance": None,
+                        "card_text": "", "streak_days": None, "today_checked": None,
+                        "render_ok": False, "render_reason": "eval_failed"}
+            info = val if isinstance(val, dict) else {}
         if not info.get("ok"):
             return {"ok": False, "detail": "bad payload", "cells": [], "items": [],
                     "past_unchecked": [], "clickable": [], "card_balance": None,

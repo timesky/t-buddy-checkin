@@ -70,6 +70,9 @@ class _Base(unittest.TestCase):
         self.gb._iframe_ws = lambda: None
         self.gb.available = lambda: True
         self.gb._wait_page_ready = lambda timeout=10.0: True
+        # 默认不触发跨天刷新（由 FreshnessTests 单独覆盖）
+        self.reload_calls: list[str] = []
+        self.gb._refresh_if_stale = lambda timeout=30.0: False
         self.ab_calls: list[tuple] = []
 
     def fake_ab(self, *args, timeout=60):
@@ -196,6 +199,84 @@ class SelfHealTests(_Base):
         r = self.gb.ensure_page()
         self.assertTrue(r.ok)
         self.assertEqual(0, self.gb._stale_hits, "成功打开后失效计数必须清零")
+
+
+class FreshnessTests(_Base):
+    """跨天不刷新探测（2026-11-23 两机实际事故）。
+
+    成长中心 SPA 跨天后不自动重取数据：is-today 仍指昨天的格子，
+    makeup 整日报 missing_days=[昨天] 永远 pending，travel 读到昨天
+    的「明天再来」误判派遣用完。发现 is-today 日号与真实日期不一致
+    就必须 location.reload() 重载 iframe。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # 摘掉 _Base 的 stub，测真正的 _refresh_if_stale
+        del self.gb._refresh_if_stale
+
+    def _install_clock(self, *, stale_first: bool):
+        """FRESHNESS_JS 第一次返回 stale_first，reload 后返回 False。"""
+        self.reloaded = 0
+
+        def fake_eval(js, timeout=20):
+            if "location.reload" in js:
+                self.reloaded += 1
+                return True, "reloading"
+            if "is-today" in js:
+                stale = stale_first and self.reloaded == 0
+                return True, {"stale": stale, "today_text": "22" if stale else "23"}
+            return False, "unexpected js"
+
+        self.gb._eval = fake_eval
+
+    def test_refresh_if_stale_reloads_and_recovers(self):
+        self._install_clock(stale_first=True)
+        self.assertTrue(self.gb._refresh_if_stale())
+        self.assertEqual(1, self.reloaded, "发现旧渲染必须重载一次")
+
+    def test_fresh_page_never_reloaded(self):
+        self._install_clock(stale_first=False)
+        self.assertFalse(self.gb._refresh_if_stale())
+        self.assertEqual(0, self.reloaded, "页面新鲜时绝不能重载")
+
+    def test_ensure_page_refreshes_stale_page_before_ready(self):
+        """任务入口拿到旧渲染页面时必须先刷新再继续（travel/makeup 都走这里）。"""
+        self.gb._iframe_ws = lambda: "ws://growth"
+        self._install_clock(stale_first=True)
+        self.gb._wait_page_ready = lambda timeout=10.0: True
+        r = self.gb.ensure_page()
+        self.assertTrue(r.ok, r.detail)
+        self.assertEqual(1, self.reloaded, "ensure_page 应先刷新旧渲染")
+
+    def test_calendar_scan_rescans_after_stale_refresh(self):
+        """calendar_scan 探到 stale 后重载并重扫一轮。"""
+        stale_payload = {"ok": True, "month": "2026-11", "today": "2026-11-23",
+                         "day_of_month": 23, "stale": True, "cells": [],
+                         "card_text": "", "card_balance": None,
+                         "streak_days": 23, "today_cell": None,
+                         "render_ok": False, "render_reason": "no_today_cell"}
+        fresh_cells = [{"day": d, "date": f"2026-11-{d:02d}", "checked": True,
+                        "future": False, "clickable": False, "text": str(d)}
+                       for d in range(1, 24)]
+        fresh_payload = dict(stale_payload, stale=False,
+                             cells=fresh_cells, render_ok=True,
+                             render_reason="",
+                             today_cell={"date": "2026-11-23", "checked": True,
+                                         "day": 23, "alpha": 1.0})
+        payloads = [stale_payload, fresh_payload]
+
+        def fake_eval(js, timeout=20):
+            if "gs-cal-cell" in js:
+                return True, payloads.pop(0)
+            return True, None
+
+        self.gb._eval = fake_eval
+        self.gb._refresh_if_stale = lambda timeout=30.0: True
+        scan = self.gb.calendar_scan()
+        self.assertTrue(scan["ok"])
+        self.assertTrue(scan["render_ok"], "重扫后必须用新数据")
+        self.assertTrue(scan["today_checked"])
 
 
 if __name__ == "__main__":
