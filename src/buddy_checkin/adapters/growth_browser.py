@@ -432,12 +432,30 @@ class GrowthBrowser:
     # 页面正常时两者相等；SPA 停在昨天的旧渲染时不等。
     FRESHNESS_JS = r"""
 (() => {
-  const tc = [...document.querySelectorAll('.gs-cal-cell')]
-    .find(c => String(c.className).indexOf('is-today') >= 0);
+  const cells = [...document.querySelectorAll('.gs-cal-cell')];
+  const tc = cells.find(c => String(c.className).indexOf('is-today') >= 0);
   if (!tc) return JSON.stringify({stale: null, today_text: null});
-  const text = String(tc.textContent || '').replace(/\s+/g, '').trim();
-  return JSON.stringify({stale: text !== String(new Date().getDate()),
-                         today_text: text});
+  const norm = s => String(s || '').replace(/\s+/g, '').trim();
+  const text = norm(tc.textContent);
+  const aria = norm(tc.getAttribute('aria-label'));
+  const real = new Date().getDate();
+  // 5.11.3 实测：今日格文本是「今日」而非日号，直接拿 text 比 real 会
+  // 天天判 stale=True，导致每轮 ensure_page/calendar_scan 都白重载一次。
+  // 判据与 CHECKIN_JS 的切日守卫一致：今日格的前一个兄弟格子是昨天（日号），
+  // +1 即为页面认为的今天；aria-label 里带日号时也用它兜底。
+  const prev = norm(tc.previousElementSibling && tc.previousElementSibling.textContent);
+  const prevNum = /^\d{1,2}$/.test(prev) ? parseInt(prev, 10) : null;
+  let pageDay = null;
+  if (prevNum !== null) {
+    pageDay = (real >= 2 && prevNum === real - 1) ? real
+            : (real === 1 && prevNum >= 28 && prevNum <= 31) ? 1 : prevNum + 1;
+  } else {
+    const m = aria.match(/(\d{1,2})\s*日/) || text.match(/(\d{1,2})/);
+    if (m) pageDay = parseInt(m[1], 10);
+  }
+  if (pageDay === null) return JSON.stringify({stale: null, today_text: text});
+  return JSON.stringify({stale: pageDay !== real,
+                         today_text: text, page_day: pageDay, real_day: real});
 })()
 """
 
@@ -465,6 +483,31 @@ class GrowthBrowser:
             if ok and isinstance(val, dict) and val.get("stale") is not True:
                 return True
         return False
+
+    def refresh_display(self) -> bool:
+        """签到成功后主动重载成长中心 iframe，让顶部连登/日历即时刷新。
+
+        2026-11-25 实测：签到走左下角浮层（FuelCard），成功后成长中心 SPA
+        不会自动重取数据，顶部「当前连续登录 N 天」会一直停在签到前的数字，
+        用户看页面还以为没签成。这里只重载 growth-center iframe：
+        - 不动客户端主窗口、不切页、不抢焦点；
+        - iframe 没打开时直接跳过，不为了刷新而打开页面；
+        - reload 失败不抛异常，下轮自检会再校一次新鲜度。
+        返回是否实际执行了重载。
+        """
+        if not self._iframe_ws():
+            return False
+        ok, _ = self._eval("location.reload(); 'reloading'", timeout=5)
+        if not ok:
+            return False
+        # 等 iframe 回到可查询状态，最多 15s；此处只确认恢复，不改任何判定
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            time.sleep(1.0)
+            ok, val = self._eval(self.FRESHNESS_JS, timeout=10)
+            if ok and isinstance(val, dict) and val.get("stale") is not True:
+                return True
+        return True  # reload 已发出，恢复慢不阻塞签到主流程
 
     def _open_via_labels(self, labels: list[str]) -> ActionResult | None:
         """依次点入口文案打开成长中心；全部失败返回 None 并记下原因。"""
@@ -798,10 +841,25 @@ class GrowthBrowser:
 
   const todayCell = cells.find(c => c.today) || null;
   const todoCount = cells.filter(c => c.cls.indexOf('is-todo') >= 0).length;
-  // 跨天不刷新探测：is-today 格子渲染的日号 ≠ 客户端真实日号 → SPA 还停在昨天。
+  // 跨天不刷新探测：页面认为的日号 ≠ 客户端真实日号 → SPA 还停在昨天。
   // 2026-11-23 实测：成长中心 SPA 跨天后不自动重取数据，旧渲染让 makeup
   // 整日报 missing_days=[昨天]、travel 读到昨天的「明天再来」。
-  const stale = todayCell ? todayCell.text !== String(dim) : null;
+  // 2026-11-25 修正：今日格文本是「今日」不是日号，直接比会天天误判 stale，
+  // 每轮白重载。与 FRESHNESS_JS 同口径：用今日格前一兄弟的日号 +1。
+  let pageDay = null;
+  if (todayCell) {
+    const prevCell = document.querySelectorAll('.gs-cal-cell')[todayCell.idx - 1];
+    const prevTxt = prevCell ? norm(prevCell.textContent) : '';
+    const prevNum = /^\d{1,2}$/.test(prevTxt) ? parseInt(prevTxt, 10) : null;
+    if (prevNum !== null) {
+      pageDay = (dim >= 2 && prevNum === dim - 1) ? dim
+              : (dim === 1 && prevNum >= 28 && prevNum <= 31) ? 1 : prevNum + 1;
+    } else {
+      const m = norm(todayCell.text || '').match(/(\d{1,2})/);
+      if (m) pageDay = parseInt(m[1], 10);
+    }
+  }
+  const stale = pageDay === null ? null : pageDay !== dim;
   return JSON.stringify({
     ok: true,
     month, today: todayStr, day_of_month: dim,

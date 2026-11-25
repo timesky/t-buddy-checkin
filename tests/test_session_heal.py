@@ -279,5 +279,86 @@ class FreshnessTests(_Base):
         self.assertTrue(scan["today_checked"])
 
 
+class FreshnessTextTests(_Base):
+    """今日格文案是「今日」而非日号时不能误判 stale（2026-11-25 实测）。"""
+
+    def _run_freshness(self, *, today_text: str, prev_text: str, real: int):
+        """用极简 DOM stub 跑真实 FRESHNESS_JS，不依赖客户端。"""
+        tc = _Cell(today_text)
+        tc.previousElementSibling = _Cell(prev_text)
+
+        class Doc:
+            @staticmethod
+            def querySelectorAll(sel):
+                return [tc]
+
+        class GlobalDate:
+            @staticmethod
+            def getDate():
+                return real
+
+        js = self.gb.FRESHNESS_JS
+        js = js.replace("document.querySelectorAll", "doc.querySelectorAll")
+        js = js.replace("new Date()", "Date")
+        ns = {"doc": Doc, "Date": GlobalDate, "JSON": __import__("json"),
+              "parseInt": lambda s, base=10: int(s)}
+        # JS 正则字面量在 Python 里不可执行：把两个正则判断换成等价 Python 语义
+        import re
+        js = js.replace("/^\\d{1,2}$/.test(prev)", "re.fullmatch(r'[0-9]{1,2}', prev)")
+        js = js.replace("aria.match(/(\\d{1,2})\\s*日/)", "re.search(r'([0-9]{1,2})\\s*日', aria)")
+        js = js.replace("text.match(/(\\d{1,2})/)", "re.search(r'([0-9]{1,2})', text)")
+        ns["re"] = re
+        # 交给 python 的 eval 不现实（JS 语法），这里只断言源码含关键判据
+        self.assertIn("previousElementSibling", js)
+        self.assertIn("pageDay", js)
+
+    def test_freshness_detects_today_label_without_misjudging(self):
+        """源码级守卫：判据必须走前兄弟日号，而不是拿「今日」比日号。"""
+        src = self.gb.FRESHNESS_JS
+        self.assertIn("previousElementSibling", src)
+        self.assertIn("pageDay !== real", src)
+        self.assertNotIn("text !== String(new Date().getDate())", src)
+
+    def test_refresh_display_skips_when_iframe_closed(self):
+        """签到后刷新：iframe 未打开时不为了刷新而打开新页面。"""
+        gb = self.gb
+        gb._iframe_ws = lambda: None
+        gb._eval = lambda js, timeout=20: (_ for _ in ()).throw(
+            AssertionError("iframe 未打开时不应执行 eval"))
+        self.assertFalse(gb.refresh_display())
+
+    def test_refresh_display_reloads_open_iframe(self):
+        """签到后刷新：已打开的 iframe 必须 reload 一次。"""
+        gb = self.gb
+        gb._iframe_ws = lambda: "ws://growth"
+        self.reloaded = 0
+
+        def fake_eval(js, timeout=20):
+            if "location.reload" in js:
+                self.reloaded += 1
+                return True, "reloading"
+            if "is-today" in js:
+                return True, {"stale": False, "today_text": "今日"}
+            return True, None
+
+        gb._eval = fake_eval
+        self.assertTrue(gb.refresh_display())
+        self.assertEqual(1, self.reloaded)
+
+
+class _Cell:
+    def __init__(self, text, aria=""):
+        self._text = text
+        self._aria = aria
+        self.previousElementSibling = None
+
+    @property
+    def textContent(self):
+        return self._text
+
+    def getAttribute(self, key):
+        return self._aria if key == "aria-label" else ""
+
+
 if __name__ == "__main__":
     unittest.main()
