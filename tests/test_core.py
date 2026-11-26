@@ -308,6 +308,37 @@ class ActionsTests(unittest.TestCase):
         self.assertEqual(0, growth.checkin_calls, "签到不该再去读活跃地图")
         self.assertIsNone(self.state.kv_get("last_checkin_day"))
 
+    def test_checkin_success_refreshes_display_with_force(self):
+        """回归（2026-11-26）：签到成功后必须以 force=True 刷新成长中心展示。
+        00:00 签到时页面几乎总是关着的，非 force 版直接跳过 → 全天没人刷新，
+        用户一整天看到的都是昨天的连登数字（页面挂 25 而非 26 的事故）。"""
+        fuel = FakeFuel()
+        growth = FakeGrowth(time.time() + 1200)
+        calls: list[bool] = []
+        growth.refresh_display = lambda force=False: calls.append(force) or True
+        actions = Actions(self.cfg, self.state, None, growth=growth, fuel=fuel)
+        result = actions.daily_checkin()
+        self.assertTrue(result.ok)
+        self.assertEqual([True], calls)
+        self.assertTrue(result.data.get("display_refreshed"))
+
+    def test_checkin_already_checked_skips_display_refresh(self):
+        """已签到的复核轮不重复刷新展示（避免无意义打开页面）。"""
+
+        class _AlreadyFuel(FakeFuel):
+            def claim(self):
+                r = super().claim()
+                r.data["already"] = True
+                return r
+
+        growth = FakeGrowth(time.time() + 1200)
+        calls: list[bool] = []
+        growth.refresh_display = lambda force=False: calls.append(force) or True
+        actions = Actions(self.cfg, self.state, None, growth=growth,
+                          fuel=_AlreadyFuel())
+        actions.daily_checkin()
+        self.assertEqual([], calls)
+
     def test_force_claim_then_redispatch_records_due(self):
         due = time.time() + 3
         actions = Actions(self.cfg, self.state, None, growth=FakeGrowth(due))

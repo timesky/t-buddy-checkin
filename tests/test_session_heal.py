@@ -320,15 +320,49 @@ class FreshnessTextTests(_Base):
         self.assertNotIn("text !== String(new Date().getDate())", src)
 
     def test_refresh_display_skips_when_iframe_closed(self):
-        """签到后刷新：iframe 未打开时不为了刷新而打开新页面。"""
+        """非 force：iframe 未打开时不为了刷新而打开新页面。"""
         gb = self.gb
         gb._iframe_ws = lambda: None
         gb._eval = lambda js, timeout=20: (_ for _ in ()).throw(
             AssertionError("iframe 未打开时不应执行 eval"))
         self.assertFalse(gb.refresh_display())
 
+    def test_refresh_display_force_opens_closed_page(self):
+        """回归（2026-11-26）：00:00 签到时成长中心页几乎总是关着的，非 force
+        版直接跳过 → 全天没人刷新，用户看到昨天的连登数字。force=True 必须
+        从客户端入口打开一次页面。"""
+        gb = self.gb
+        gb._iframe_ws = lambda: None
+        opened = []
+        gb.ensure_page = lambda: (opened.append(True),
+                                  ActionResult(True, "growth_open", "opened")
+                                  )[1]
+        self.assertTrue(gb.refresh_display(force=True))
+        self.assertEqual([True], opened)
+
     def test_refresh_display_reloads_open_iframe(self):
-        """签到后刷新：已打开的 iframe 必须 reload 一次。"""
+        """已打开且过期：必须 reload 一次并恢复新鲜。"""
+        gb = self.gb
+        del gb._refresh_if_stale  # 摘掉 _Base 的 stub，测真正的刷新路径
+        gb._iframe_ws = lambda: "ws://growth"
+        self.reloaded = 0
+        state = {"fresh": False}
+
+        def fake_eval(js, timeout=20):
+            if "location.reload" in js:
+                self.reloaded += 1
+                state["fresh"] = True
+                return True, "reloading"
+            if "is-today" in js:
+                return True, {"stale": not state["fresh"]}
+            return True, None
+
+        gb._eval = fake_eval
+        self.assertTrue(gb.refresh_display())
+        self.assertEqual(1, self.reloaded)
+
+    def test_refresh_display_keeps_fresh_page_untouched(self):
+        """已打开且本就新鲜：不做无意义的整页 reload。"""
         gb = self.gb
         gb._iframe_ws = lambda: "ws://growth"
         self.reloaded = 0
@@ -338,12 +372,12 @@ class FreshnessTextTests(_Base):
                 self.reloaded += 1
                 return True, "reloading"
             if "is-today" in js:
-                return True, {"stale": False, "today_text": "今日"}
+                return True, {"stale": False}
             return True, None
 
         gb._eval = fake_eval
         self.assertTrue(gb.refresh_display())
-        self.assertEqual(1, self.reloaded)
+        self.assertEqual(0, self.reloaded)
 
 
 class _Cell:

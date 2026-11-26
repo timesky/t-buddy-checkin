@@ -484,30 +484,33 @@ class GrowthBrowser:
                 return True
         return False
 
-    def refresh_display(self) -> bool:
-        """签到成功后主动重载成长中心 iframe，让顶部连登/日历即时刷新。
+    def refresh_display(self, force: bool = False) -> bool:
+        """签到成功后让成长中心页面的展示与新的一天保持一致。
 
         2026-11-25 实测：签到走左下角浮层（FuelCard），成功后成长中心 SPA
         不会自动重取数据，顶部「当前连续登录 N 天」会一直停在签到前的数字，
-        用户看页面还以为没签成。这里只重载 growth-center iframe：
-        - 不动客户端主窗口、不切页、不抢焦点；
-        - iframe 没打开时直接跳过，不为了刷新而打开页面；
-        - reload 失败不抛异常，下轮自检会再校一次新鲜度。
-        返回是否实际执行了重载。
+        用户看页面还以为没签成。
+        2026-11-26 实测补刀：非 force 版「iframe 没打开就直接跳过」在真机上
+        每天都命中——00:00 签到时成长中心页几乎总是关着的，刷新被跳过，
+        之后全天终态静默没人再碰页面，用户一整天看到的都是昨天的数字。
+        行为：
+        - force=True：iframe 没开就从客户端入口打开一次（新加载的页面天然
+          渲染当天数据）；这是每天 00:00 签到成功后的固定动作，客户端此刻
+          通常无人操作。
+        - force=False：iframe 没开就跳过，绝不为刷新而打开页面。
+        - iframe 已开：只在新鲜度判定过期时才 reload（复用 _refresh_if_stale）。
+        - 失败不抛异常，不影响签到结果；下轮自检会再校一次新鲜度。
+        返回是否保证了页面新鲜（打开/重载成功，或本就新鲜）。
         """
         if not self._iframe_ws():
-            return False
-        ok, _ = self._eval("location.reload(); 'reloading'", timeout=5)
-        if not ok:
-            return False
-        # 等 iframe 回到可查询状态，最多 15s；此处只确认恢复，不改任何判定
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            time.sleep(1.0)
-            ok, val = self._eval(self.FRESHNESS_JS, timeout=10)
-            if ok and isinstance(val, dict) and val.get("stale") is not True:
-                return True
-        return True  # reload 已发出，恢复慢不阻塞签到主流程
+            if not force:
+                return False
+            r = self.ensure_page()
+            return bool(r.ok)
+        # 已打开：只在过期时重载，避免无意义的整页刷新
+        self._refresh_if_stale()
+        ok, val = self._eval(self.FRESHNESS_JS, timeout=10)
+        return bool(ok and isinstance(val, dict) and val.get("stale") is not True)
 
     def _open_via_labels(self, labels: list[str]) -> ActionResult | None:
         """依次点入口文案打开成长中心；全部失败返回 None 并记下原因。"""

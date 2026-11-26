@@ -93,13 +93,15 @@ class Actions:
             self.state.kv_set("last_checkin_day", day_key())
             self.state.kv_set("last_checkin_at", time.time())
             result.data["state"] = DONE
-            # 签到成功后成长中心 SPA 不会自己重取，顶部连登数字会停在签到前；
-            # 主动重载一次 iframe 让展示与服务端一致（只重载已打开的 iframe，
-            # 不打开新页面、不动主窗口；失败不影响签到结果）。
+            # 签到成功后成长中心 SPA 不会自己重取，顶部连登数字会停在签到前。
+            # 2026-11-26 教训：非 force 版在 iframe 未开时直接跳过，而 00:00
+            # 签到时页面几乎总是关着的 → 全天没人刷新，用户看到昨天的数字。
+            # 改用 force=True：没开就从客户端入口打开一次，保证当天展示新鲜；
+            # 打开失败不影响签到结果，下轮自检会再校新鲜度。
             if not result.data.get("already") and self.growth is not None:
                 try:
                     result.data["display_refreshed"] = bool(
-                        self.growth.refresh_display())
+                        self.growth.refresh_display(force=True))
                 except Exception:
                     result.data["display_refreshed"] = False
             if result.data.get("already"):
